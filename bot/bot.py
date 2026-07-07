@@ -318,6 +318,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _reply(update, message)
+    _stat("requests_ok")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +386,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _reply(update, format_search_results(product_name, offers))
+    _stat("requests_ok")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,6 +450,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _reply(update, response, parse_mode=None)
     _add_to_history(user_id, "assistant", response)
+    _stat("requests_ok")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

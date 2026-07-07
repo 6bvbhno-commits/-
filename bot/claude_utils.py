@@ -1,9 +1,13 @@
 """
-طبقة الذكاء الاصطناعي — DeepSeek أولاً، Claude احتياط تلقائي.
+راوتر الذكاء الاصطناعي — أربع طبقات بالترتيب:
 
-DeepSeek-V3 : extract_product_intent + chat_response  (سريع، عربي ممتاز)
-DeepSeek-R1 : price_advice                            (تفكير عميق لتحليل الأسعار)
-Claude Haiku : fallback لكل وظيفة إذا فشل DeepSeek   (موثوق، بلا مفتاح خاص)
+  🥇 DeepSeek-V3    — أسرع + أرخص + عربي ممتاز
+  🥈 GPT-4o-mini    — OpenAI عبر Replit Integration
+  🥉 Gemini-2.0     — Google عبر GEMINI_API_KEY
+  🔁 Claude Haiku   — احتياط أخير (Replit Anthropic Integration)
+
+كل طبقة تُجرَّب فقط إذا فشلت التي قبلها.
+bot.py يستورد من هنا — لا يعرف أي provider اشتغل.
 """
 import logging
 import os
@@ -12,11 +16,11 @@ import time
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════
-#  Claude client (lazy init + backoff)
+#  Claude client (lazy init + backoff) — الطبقة الأخيرة
 # ══════════════════════════════════════════════════════════════════
 
-_client: object | None      = None
-_client_error_until: float  = 0.0
+_client: object | None     = None
+_client_error_until: float = 0.0
 
 def _get_claude_client():
     global _client, _client_error_until
@@ -40,165 +44,204 @@ def _get_claude_client():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  System prompts (مشتركة بين DeepSeek و Claude)
+#  System prompts — مشتركة بين كل الـ providers
 # ══════════════════════════════════════════════════════════════════
 
 _SYSTEM_CHAT = """\
 أنت مساعد تسوق ذكي متخصص في أمازون السعودية، اسمك "بوت الأسعار".
 هدفك الأول: مساعدة المستخدم في إيجاد أفضل سعر لأي منتج.
-
 قواعد الرد:
 - الردود قصيرة ومباشرة (3 أسطر أو أقل).
 - اردّ دائماً بالعربية السعودية العامية أو الفصحى الخفيفة.
 - إذا ذكر المستخدم منتجاً → حثّه على إرسال الرابط أو الصورة.
-- إذا سأل سؤالاً عاماً → أجب باختصار ثم وجّهه لإرسال رابط/صورة.
-- لا تختلق أسعاراً من عندك — البوت هو الذي يجلب السعر الحقيقي.
+- لا تختلق أسعاراً — البوت هو الذي يجلب السعر الحقيقي.
 - لا تذكر منافسين لأمازون (نون، جرير، إلخ).\
 """
 
 _SYSTEM_EXTRACT = """\
 أنت نظام تصنيف نية الشراء. مهمتك محددة جداً:
-
 إذا كان النص يصف منتجاً يريد المستخدم شراءه أو معرفة سعره:
   → أعد اسم المنتج باللغة الأنسب للبحث في أمازون (عربي أو إنجليزي).
   → اذكر الاسم فقط، بدون شرح أو جمل إضافية.
-
-في كل الحالات الأخرى (تحية، شكر، سؤال عام، شكوى، إلخ):
+في كل الحالات الأخرى (تحية، شكر، سؤال عام):
   → أعد الكلمة NONE فقط.
-
 أمثلة:
   "أبي سماعات بلوتوث" → سماعات بلوتوث
   "كم سعر آيفون 15؟"  → iPhone 15
-  "مكيف سبليت 18000"  → مكيف سبليت 18000 وحدة
   "شكراً جزيلاً"      → NONE
-  "كيف الحال؟"        → NONE
-  "هل أنت بوت؟"       → NONE\
+  "كيف الحال؟"        → NONE\
 """
+
+_FALLBACK_CHAT = "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة وأجيبك بأفضل سعر فوراً."
+
+
+# ══════════════════════════════════════════════════════════════════
+#  دالة مساعدة: تحقق صحة intent
+# ══════════════════════════════════════════════════════════════════
+
+def _valid_intent(result: str | None) -> str | None:
+    if not result or result.upper().startswith("NONE"):
+        return None
+    return result if len(result) <= 100 else None
 
 
 # ══════════════════════════════════════════════════════════════════
 #  1. extract_product_intent
+#     DeepSeek → GPT → Gemini → Claude
 # ══════════════════════════════════════════════════════════════════
 
 def extract_product_intent(text: str) -> str | None:
     """
-    يستخرج اسم المنتج من نص حر.
-    DeepSeek-V3 أولاً → Claude Haiku احتياط.
+    قاعدة الـ fallback:
+      - RuntimeError من provider = فشل تقني → جرّب التالي
+      - None من provider          = لا نية شراء (semantic) → أوقف مباشرة
     """
-    # ── DeepSeek أولاً ───────────────────────────────────────────
+    # ── 🥇 DeepSeek ──────────────────────────────────────────────
     try:
-        from deepseek_utils import extract_product_intent as ds_extract
-        result = ds_extract(text)
-        if result is not None:
-            return result
-        # None يعني "لا نية شراء" — لا داعي لـ fallback
-        logger.debug("DeepSeek: لا نية شراء في النص")
-        return None
+        from deepseek_utils import extract_product_intent as _fn
+        return _fn(text)   # يُعيد str | None | يُطلق RuntimeError
+    except RuntimeError:
+        logger.warning("DeepSeek intent فشل → GPT")
     except Exception as e:
-        logger.warning("DeepSeek extract فشل، أنتقل لـ Claude: %s", e)
+        logger.warning("DeepSeek intent خطأ غير متوقع → GPT: %s", e)
 
-    # ── Claude احتياط ────────────────────────────────────────────
+    # ── 🥈 GPT-4o-mini ───────────────────────────────────────────
+    try:
+        from openai_text_utils import extract_product_intent as _fn
+        return _fn(text)
+    except RuntimeError:
+        logger.warning("GPT intent فشل → Gemini")
+    except Exception as e:
+        logger.warning("GPT intent خطأ → Gemini: %s", e)
+
+    # ── 🥉 Gemini ────────────────────────────────────────────────
+    try:
+        from gemini_text_utils import extract_product_intent as _fn
+        return _fn(text)
+    except RuntimeError:
+        logger.warning("Gemini intent فشل → Claude")
+    except Exception as e:
+        logger.warning("Gemini intent خطأ → Claude: %s", e)
+
+    # ── 🔁 Claude Haiku ──────────────────────────────────────────
     try:
         client = _get_claude_client()
-        msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=60,
+        msg    = client.messages.create(
+            model="claude-haiku-4-5", max_tokens=60,
             system=_SYSTEM_EXTRACT,
             messages=[{"role": "user", "content": text[:500]}],
         )
-        result = msg.content[0].text.strip()
-        if not result or result.upper().startswith("NONE"):
-            return None
-        if len(result) > 100:
-            return None
-        return result
+        return _valid_intent(msg.content[0].text.strip())
     except Exception as e:
-        logger.warning("Claude extract_product_intent فشل: %s", e)
+        logger.warning("Claude intent فشل: %s", e)
         return None
 
 
 # ══════════════════════════════════════════════════════════════════
 #  2. chat_response
+#     DeepSeek → GPT → Gemini → Claude
 # ══════════════════════════════════════════════════════════════════
 
 def chat_response(text: str, history: list[dict]) -> str:
     """
-    يُعيد ردّاً محادثياً.
-    DeepSeek-V3 أولاً → Claude Haiku احتياط.
+    كل provider يُعيد str (نجاح) أو None (فشل) — لا strings خاصة للفشل.
     """
-    _fallback = (
-        "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج "
-        "وأجيبك بأفضل سعر فوراً."
-    )
-
-    # ── DeepSeek أولاً ───────────────────────────────────────────
+    # ── 🥇 DeepSeek ──────────────────────────────────────────────
     try:
-        from deepseek_utils import chat_response as ds_chat
-        result = ds_chat(text, history)
-        # دالة deepseek_utils.chat_response تُعيد fallback نصي عند فشلها
-        # نتحقق: إذا رجعت نفس الـ fallback → جرب Claude
-        if result and result != _fallback:
+        from deepseek_utils import chat_response as _fn
+        result = _fn(text, history)
+        if result is not None:
             return result
+        logger.warning("DeepSeek chat أعاد None → GPT")
     except Exception as e:
-        logger.warning("DeepSeek chat فشل، أنتقل لـ Claude: %s", e)
+        logger.warning("DeepSeek chat فشل → GPT: %s", e)
 
-    # ── Claude احتياط ────────────────────────────────────────────
+    # ── 🥈 GPT-4o-mini ───────────────────────────────────────────
+    try:
+        from openai_text_utils import chat_response as _fn
+        result = _fn(text, history)
+        if result is not None:
+            return result
+        logger.warning("GPT chat أعاد None → Gemini")
+    except Exception as e:
+        logger.warning("GPT chat فشل → Gemini: %s", e)
+
+    # ── 🥉 Gemini ────────────────────────────────────────────────
+    try:
+        from gemini_text_utils import chat_response as _fn
+        result = _fn(text, history)
+        if result is not None:
+            return result
+        logger.warning("Gemini chat أعاد None → Claude")
+    except Exception as e:
+        logger.warning("Gemini chat فشل → Claude: %s", e)
+
+    # ── 🔁 Claude Haiku ──────────────────────────────────────────
     try:
         client   = _get_claude_client()
         messages = list(history[-8:]) + [{"role": "user", "content": text[:800]}]
         msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=250,
-            system=_SYSTEM_CHAT,
-            messages=messages,
+            model="claude-haiku-4-5", max_tokens=250,
+            system=_SYSTEM_CHAT, messages=messages,
         )
         return msg.content[0].text.strip()
     except Exception as e:
-        logger.warning("Claude chat_response فشل: %s", e)
-        return _fallback
+        logger.warning("Claude chat فشل: %s", e)
+        return _FALLBACK_CHAT
 
 
 # ══════════════════════════════════════════════════════════════════
 #  3. price_advice
+#     DeepSeek → GPT → Gemini → Claude
 # ══════════════════════════════════════════════════════════════════
 
 def price_advice(current_price: float, history_records: list[dict]) -> str:
-    """
-    توصية شراء — DeepSeek-R1 (تفكير عميق) أولاً → Claude احتياط.
-    """
     if len(history_records) < 3:
         return ""
 
-    # ── DeepSeek-R1 أولاً ────────────────────────────────────────
+    # ── 🥇 DeepSeek ──────────────────────────────────────────────
     try:
-        from deepseek_utils import price_advice as ds_advice
-        result = ds_advice(current_price, history_records)
+        from deepseek_utils import price_advice as _fn
+        result = _fn(current_price, history_records)
         if result:
             return result
     except Exception as e:
-        logger.warning("DeepSeek price_advice فشل، أنتقل لـ Claude: %s", e)
+        logger.warning("DeepSeek advice فشل → GPT: %s", e)
 
-    # ── Claude Haiku احتياط ──────────────────────────────────────
+    # ── 🥈 GPT-4o-mini ───────────────────────────────────────────
+    try:
+        from openai_text_utils import price_advice as _fn
+        result = _fn(current_price, history_records)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning("GPT advice فشل → Gemini: %s", e)
+
+    # ── 🥉 Gemini ────────────────────────────────────────────────
+    try:
+        from gemini_text_utils import price_advice as _fn
+        result = _fn(current_price, history_records)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning("Gemini advice فشل → Claude: %s", e)
+
+    # ── 🔁 Claude Haiku ──────────────────────────────────────────
     try:
         prices = [r["price_val"] for r in history_records]
-        lo     = min(prices)
-        hi     = max(prices)
-        avg    = sum(prices) / len(prices)
-        days   = max(1, (history_records[-1]["ts"] - history_records[0]["ts"]) // 86400)
-
-        prompt = (
-            f"منتج أمازون السعودية — بيانات سعرية:\n"
-            f"• السعر الحالي:  {current_price:.2f} ر.س\n"
-            f"• أدنى سعر ({days} يوم):  {lo:.2f} ر.س\n"
-            f"• أعلى سعر:  {hi:.2f} ر.س\n"
-            f"• المتوسط:  {avg:.2f} ر.س\n\n"
-            f"اكتب توصية شراء واحدة مختصرة (10-15 كلمة) تبدأ بـ 💡\n"
-            f"لا تذكر أرقاماً — فقط توصية واضحة."
+        lo, hi  = min(prices), max(prices)
+        avg     = sum(prices) / len(prices)
+        days    = max(1, (history_records[-1]["ts"] - history_records[0]["ts"]) // 86400)
+        pct     = (current_price - lo) / (hi - lo) * 100 if hi != lo else 50
+        prompt  = (
+            f"بيانات سعر منتج أمازون ({days} يوم):\n"
+            f"الحالي: {current_price:.2f} | الأدنى: {lo:.2f} | الأعلى: {hi:.2f} | المتوسط: {avg:.2f}\n"
+            f"السعر عند {pct:.0f}% من النطاق (0=أدنى، 100=أعلى)\n"
+            f"أجب بسطر واحد يبدأ بـ 💡 (10 كلمات أو أقل، بدون أرقام)."
         )
         client = _get_claude_client()
-        msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=80,
+        msg    = client.messages.create(
+            model="claude-haiku-4-5", max_tokens=80,
             messages=[{"role": "user", "content": prompt}],
         )
         advice = msg.content[0].text.strip().split("\n")[0]
@@ -206,5 +249,5 @@ def price_advice(current_price: float, history_records: list[dict]) -> str:
             advice = "💡 " + advice
         return advice[:130]
     except Exception as e:
-        logger.warning("Claude price_advice فشل: %s", e)
+        logger.warning("Claude advice فشل: %s", e)
         return ""

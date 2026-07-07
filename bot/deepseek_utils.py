@@ -135,7 +135,8 @@ def _call(model: str, messages: list[dict],
 def extract_product_intent(text: str) -> str | None:
     """
     يستخرج اسم المنتج من نص حر — DeepSeek-V3.
-    يُعيد None إذا لم يجد نية شراء واضحة.
+    يُعيد None إذا لم يجد نية شراء (semantic NONE).
+    يُطلق RuntimeError إذا فشل الـ provider (للراوتر يجرب التالي).
     """
     result = _call(
         model=_MODEL_CHAT,
@@ -143,17 +144,19 @@ def extract_product_intent(text: str) -> str | None:
         system=_SYSTEM_EXTRACT,
         max_tokens=60,
     )
-    if not result or result.upper().startswith("NONE"):
+    if result is None:
+        raise RuntimeError("DeepSeek provider failure")
+    if result.upper().startswith("NONE"):
         return None
     if len(result) > 100:
         return None
     return result
 
 
-def chat_response(text: str, history: list[dict]) -> str:
+def chat_response(text: str, history: list[dict]) -> str | None:
     """
     يُعيد ردّاً محادثياً من DeepSeek-V3.
-    history: قائمة {"role": "user"/"assistant", "content": "..."}
+    يُعيد None عند فشل الـ provider (للراوتر يجرب التالي).
     """
     messages = list(history[-8:]) + [{"role": "user", "content": text[:800]}]
     result = _call(
@@ -162,12 +165,7 @@ def chat_response(text: str, history: list[dict]) -> str:
         system=_SYSTEM_CHAT,
         max_tokens=250,
     )
-    if result:
-        return result
-    return (
-        "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج "
-        "وأجيبك بأفضل سعر فوراً."
-    )
+    return result or None
 
 
 def price_advice(current_price: float, history_records: list[dict]) -> str:
