@@ -1,43 +1,47 @@
 """
-Claude AI — ثلاث قدرات لتحسين تجربة البوت:
-  1. extract_product_intent  — يستخرج اسم المنتج من نص حر
-  2. chat_response           — ردّ محادثي ذكي للرسائل العامة
-  3. price_advice            — توصية شراء بناءً على تاريخ السعر
+طبقة الذكاء الاصطناعي — DeepSeek أولاً، Claude احتياط تلقائي.
+
+DeepSeek-V3 : extract_product_intent + chat_response  (سريع، عربي ممتاز)
+DeepSeek-R1 : price_advice                            (تفكير عميق لتحليل الأسعار)
+Claude Haiku : fallback لكل وظيفة إذا فشل DeepSeek   (موثوق، بلا مفتاح خاص)
 """
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
-# ── Client (lazy init) ────────────────────────────────────────────────────────
-_client = None
+# ══════════════════════════════════════════════════════════════════
+#  Claude client (lazy init + backoff)
+# ══════════════════════════════════════════════════════════════════
 
-_client_error_until: float = 0.0   # backoff: لا تعيد المحاولة قبل هذا الوقت
+_client: object | None      = None
+_client_error_until: float  = 0.0
 
-def _get_client():
-    """Lazy init مع backoff: إذا فشل التهيئة لا يعيد المحاولة 60 ثانية."""
+def _get_claude_client():
     global _client, _client_error_until
     if _client is not None:
         return _client
-    now = __import__("time").time()
-    if now < _client_error_until:
-        raise RuntimeError("Anthropic client في فترة backoff — انتظر")
+    if time.time() < _client_error_until:
+        raise RuntimeError("Anthropic client في فترة backoff")
     try:
         from anthropic import Anthropic
         base_url = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
         api_key  = os.getenv("AI_INTEGRATIONS_ANTHROPIC_API_KEY", "dummy")
-        kwargs   = {"api_key": api_key}
+        kwargs: dict = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
         _client = Anthropic(**kwargs)
         return _client
     except Exception as e:
-        _client_error_until = __import__("time").time() + 60
+        _client_error_until = time.time() + 60
         logger.error("Anthropic client init فشل (backoff 60s): %s", e)
         raise
 
 
-# ── System prompts ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  System prompts (مشتركة بين DeepSeek و Claude)
+# ══════════════════════════════════════════════════════════════════
 
 _SYSTEM_CHAT = """\
 أنت مساعد تسوق ذكي متخصص في أمازون السعودية، اسمك "بوت الأسعار".
@@ -64,24 +68,38 @@ _SYSTEM_EXTRACT = """\
 
 أمثلة:
   "أبي سماعات بلوتوث" → سماعات بلوتوث
-  "كم سعر آيفون 15؟" → iPhone 15
-  "مكيف سبليت 18000" → مكيف سبليت 18000 وحدة
-  "شكراً جزيلاً" → NONE
-  "كيف الحال؟" → NONE
-  "هل أنت بوت؟" → NONE\
+  "كم سعر آيفون 15؟"  → iPhone 15
+  "مكيف سبليت 18000"  → مكيف سبليت 18000 وحدة
+  "شكراً جزيلاً"      → NONE
+  "كيف الحال؟"        → NONE
+  "هل أنت بوت؟"       → NONE\
 """
 
 
-# ── الدوال العامة ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  1. extract_product_intent
+# ══════════════════════════════════════════════════════════════════
 
 def extract_product_intent(text: str) -> str | None:
     """
     يستخرج اسم المنتج من نص حر.
-    يُعيد None إذا لم يجد نية شراء واضحة.
-    سريع جداً — يستخدم Haiku.
+    DeepSeek-V3 أولاً → Claude Haiku احتياط.
     """
+    # ── DeepSeek أولاً ───────────────────────────────────────────
     try:
-        client = _get_client()
+        from deepseek_utils import extract_product_intent as ds_extract
+        result = ds_extract(text)
+        if result is not None:
+            return result
+        # None يعني "لا نية شراء" — لا داعي لـ fallback
+        logger.debug("DeepSeek: لا نية شراء في النص")
+        return None
+    except Exception as e:
+        logger.warning("DeepSeek extract فشل، أنتقل لـ Claude: %s", e)
+
+    # ── Claude احتياط ────────────────────────────────────────────
+    try:
+        client = _get_claude_client()
         msg = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=60,
@@ -91,7 +109,6 @@ def extract_product_intent(text: str) -> str | None:
         result = msg.content[0].text.strip()
         if not result or result.upper().startswith("NONE"):
             return None
-        # تجاهل الردود الطويلة جداً (ليست اسم منتج)
         if len(result) > 100:
             return None
         return result
@@ -100,13 +117,34 @@ def extract_product_intent(text: str) -> str | None:
         return None
 
 
+# ══════════════════════════════════════════════════════════════════
+#  2. chat_response
+# ══════════════════════════════════════════════════════════════════
+
 def chat_response(text: str, history: list[dict]) -> str:
     """
-    يُعيد ردّاً محادثياً من Claude.
-    history: قائمة من {"role": "user"/"assistant", "content": "..."}
+    يُعيد ردّاً محادثياً.
+    DeepSeek-V3 أولاً → Claude Haiku احتياط.
     """
+    _fallback = (
+        "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج "
+        "وأجيبك بأفضل سعر فوراً."
+    )
+
+    # ── DeepSeek أولاً ───────────────────────────────────────────
     try:
-        client   = _get_client()
+        from deepseek_utils import chat_response as ds_chat
+        result = ds_chat(text, history)
+        # دالة deepseek_utils.chat_response تُعيد fallback نصي عند فشلها
+        # نتحقق: إذا رجعت نفس الـ fallback → جرب Claude
+        if result and result != _fallback:
+            return result
+    except Exception as e:
+        logger.warning("DeepSeek chat فشل، أنتقل لـ Claude: %s", e)
+
+    # ── Claude احتياط ────────────────────────────────────────────
+    try:
+        client   = _get_claude_client()
         messages = list(history[-8:]) + [{"role": "user", "content": text[:800]}]
         msg = client.messages.create(
             model="claude-haiku-4-5",
@@ -117,19 +155,30 @@ def chat_response(text: str, history: list[dict]) -> str:
         return msg.content[0].text.strip()
     except Exception as e:
         logger.warning("Claude chat_response فشل: %s", e)
-        return (
-            "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج "
-            "وأجيبك بأفضل سعر فوراً."
-        )
+        return _fallback
 
+
+# ══════════════════════════════════════════════════════════════════
+#  3. price_advice
+# ══════════════════════════════════════════════════════════════════
 
 def price_advice(current_price: float, history_records: list[dict]) -> str:
     """
-    يُعيد توصية شراء في سطر واحد (💡 ...) بناءً على تاريخ السعر.
-    يُعيد نصاً فارغاً إذا كانت البيانات غير كافية.
+    توصية شراء — DeepSeek-R1 (تفكير عميق) أولاً → Claude احتياط.
     """
     if len(history_records) < 3:
         return ""
+
+    # ── DeepSeek-R1 أولاً ────────────────────────────────────────
+    try:
+        from deepseek_utils import price_advice as ds_advice
+        result = ds_advice(current_price, history_records)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning("DeepSeek price_advice فشل، أنتقل لـ Claude: %s", e)
+
+    # ── Claude Haiku احتياط ──────────────────────────────────────
     try:
         prices = [r["price_val"] for r in history_records]
         lo     = min(prices)
@@ -144,17 +193,15 @@ def price_advice(current_price: float, history_records: list[dict]) -> str:
             f"• أعلى سعر:  {hi:.2f} ر.س\n"
             f"• المتوسط:  {avg:.2f} ر.س\n\n"
             f"اكتب توصية شراء واحدة مختصرة (10-15 كلمة) تبدأ بـ 💡\n"
-            f"لا تذكر أرقاماً — فقط توصية واضحة (مثل: وقت مناسب للشراء، أو انتظر ينزل أكثر)."
+            f"لا تذكر أرقاماً — فقط توصية واضحة."
         )
-
-        client = _get_client()
+        client = _get_claude_client()
         msg = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=80,
             messages=[{"role": "user", "content": prompt}],
         )
         advice = msg.content[0].text.strip().split("\n")[0]
-        # تأكد أنها تبدأ بـ 💡
         if not advice.startswith("💡"):
             advice = "💡 " + advice
         return advice[:130]

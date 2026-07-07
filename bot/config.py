@@ -33,5 +33,8 @@ OPENAI_API_KEY  = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
 ANTHROPIC_BASE_URL = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
 ANTHROPIC_API_KEY  = os.getenv("AI_INTEGRATIONS_ANTHROPIC_API_KEY", "")
 
+# DeepSeek API — الطبقة الأولى للذكاء الاصطناعي (V3 للمحادثة، R1 لتحليل الأسعار)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False
