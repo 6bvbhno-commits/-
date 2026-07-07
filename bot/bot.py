@@ -139,8 +139,8 @@ async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if TELEGRAM_BOT_TOKEN == "ضع_توكن_البوت_هنا":
-        print("⚠️  لازم تحط توكن البوت الحقيقي في متغير البيئة TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠️  لازم تحط توكن البوت الحقيقي في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
         return
 
     # طباعة واضحة لحالة الإعدادات الحالية عشان تتأكد بسرعة بدون ما تدور بالملفات

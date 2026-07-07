@@ -140,7 +140,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     يرجع أقل سعر متاح لمنتج معين عبر PA API v5 الرسمي.
     يرجع إلى بيانات وهمية تلقائياً إذا كان MOCK_MODE مفعّلاً أو المفاتيح غير مدخلة.
     """
-    if MOCK_MODE or AMAZON_ACCESS_KEY == "ضع_مفتاح_Access_Key_هنا":
+    if MOCK_MODE or not AMAZON_ACCESS_KEY:
         base_price = random.randint(100, 500)
         currency = "SAR" if "sa" in domain else "USD"
         return {
