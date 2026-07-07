@@ -29,7 +29,7 @@ def resolve_short_link(url: str) -> str:
         )
         return response.url
     except requests.RequestException:
-        return url  # فشل الحل، نرجّع الأصلي ونخلي extract_asin يحاول عليه
+        return url  # فشل الحل، نرجّع الأصلي
 
 
 def extract_asin(url: str) -> str | None:
@@ -102,7 +102,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     #     "currency": lowest["currency"],
     #     "seller_name": lowest["seller_name"],
     #     "condition": lowest["condition"],
-    #     "affiliate_link": build_affiliate_link(asin, domain=domain),
+    #     "affiliate_link": build_affiliate_link(asin),
     # }
     # ============================================================
     return None
