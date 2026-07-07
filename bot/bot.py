@@ -13,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN, MOCK_MODE
+from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN
 from amazon_utils import (
     extract_asin,
     extract_domain,
@@ -109,6 +109,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
+        # URL الصورة من تيليجرام — يُمرَّر لـ Google Lens
+        image_url  = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{photo_file.file_path}"
         photo_bytes = await photo_file.download_as_bytearray()
     except Exception as e:
         logger.error("Failed to download photo: %s", e)
@@ -118,7 +120,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
         product_name = await loop.run_in_executor(
-            None, identify_product_from_image, bytes(photo_bytes)
+            None, identify_product_from_image, bytes(photo_bytes), image_url
         )
     except Exception as e:
         logger.error("Image analysis failed: %s", e)

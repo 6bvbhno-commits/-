@@ -1,13 +1,18 @@
 """
 دوال التعرف على المنتج من صورة، والبحث عنه داخل أمازون.
-يستخدم Gemini 1.5 Flash (مجاني) للتعرف على المنتج،
-ثم يقشط نتائج البحث المباشر من أمازون السعودية.
+الأولوية:
+  1. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY) — فوري وبلا حصة مجانية
+  2. Gemini API (fallback) — مجاني لكن محدود
 """
 import base64
 import logging
 import re
+import threading
 import requests
-from config import GEMINI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+from config import GEMINI_API_KEY, SERPAPI_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+
+# حد Gemini: طلب واحد في المرة — يمنع كل المستخدمين من ضرب الـ 429 بالتزامن
+_GEMINI_SEM = threading.Semaphore(1)
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +26,59 @@ _HEADERS = {
 }
 
 
+def _google_lens(image_url: str) -> str | None:
+    """
+    يستخدم SerpAPI Google Lens للتعرف على المنتج من URL الصورة.
+    يرجع اسم المنتج أو None.
+    """
+    if not SERPAPI_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://serpapi.com/search.json",
+            params={"engine": "google_lens", "url": image_url, "api_key": SERPAPI_KEY},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning("Google Lens HTTP %s", resp.status_code)
+            return None
+        data = resp.json()
+        if "error" in data:
+            logger.warning("Google Lens error: %s", data["error"])
+            return None
+
+        # أولاً: اسم المنتج من knowledge graph
+        kg = data.get("knowledge_graph", [])
+        if kg and isinstance(kg, list):
+            name = kg[0].get("title") or kg[0].get("name")
+            if name:
+                logger.info("Google Lens: عرف المنتج من knowledge_graph: %s", name)
+                return name
+
+        # ثانياً: أول تطابق بصري فيه عنوان
+        for match in data.get("visual_matches", [])[:5]:
+            title = match.get("title", "").strip()
+            if title and len(title) > 3:
+                logger.info("Google Lens: عرف المنتج من visual_matches: %s", title)
+                return title
+
+        logger.info("Google Lens: لا نتيجة واضحة")
+        return None
+    except Exception as exc:
+        logger.error("Google Lens exception: %s", exc)
+        return None
+
+
 def _call_gemini(image_bytes: bytes) -> str | None:
     """
-    استدعاء متزامن لـ Gemini — يجرّب عدة موديلات بالترتيب كـ fallback.
-    يُنفَّذ عبر run_in_executor.
+    استدعاء متزامن لـ Gemini — محاولة واحدة فقط لكل موديل بدون انتظار طويل.
+    يستخدم semaphore لمنع الطلبات المتزامنة التي تسبب 429.
     """
     if not GEMINI_API_KEY:
         return None
 
     import time
 
-    # قائمة الموديلات بالترتيب — إذا فشل الأول يجرّب الثاني وهكذا
     models = [
         "gemini-2.5-flash-lite",
         "gemini-2.5-flash",
@@ -41,60 +88,47 @@ def _call_gemini(image_bytes: bytes) -> str | None:
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            "ما هو هذا المنتج بدقة؟ "
-                            "أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية "
-                            "لكي أبحث عنه في موقع أمازون. "
-                            "لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
-                        )
-                    },
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": image_b64,
-                        }
-                    },
-                ]
-            }
-        ]
+        "contents": [{
+            "parts": [
+                {"text": (
+                    "ما هو هذا المنتج بدقة؟ "
+                    "أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية "
+                    "لكي أبحث عنه في موقع أمازون. "
+                    "لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
+                )},
+                {"inlineData": {"mimeType": "image/jpeg", "data": image_b64}},
+            ]
+        }]
     }
 
-    for model in models:
-        url = (
-            "https://generativelanguage.googleapis.com/v1/models/"
-            f"{model}:generateContent?key={GEMINI_API_KEY}"
-        )
-        for attempt in range(2):  # محاولتان لكل موديل
+    # semaphore: طلب واحد فقط في الوقت الواحد لتجنب 429 الجماعي
+    with _GEMINI_SEM:
+        for model in models:
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
             try:
                 response = requests.post(url, json=payload, timeout=20)
                 if response.status_code == 200:
-                    result = response.json()
                     text = (
-                        result.get("candidates", [{}])[0]
+                        response.json()
+                        .get("candidates", [{}])[0]
                         .get("content", {})
                         .get("parts", [{}])[0]
                         .get("text", "")
                         .strip()
                     )
                     if text:
-                        logger.info("Gemini نجح مع موديل: %s", model)
+                        logger.info("Gemini نجح: %s", model)
                         return text
-                    break  # رد فارغ — جرّب الموديل التالي
-                elif response.status_code in (429, 503):
-                    wait = 4 * (attempt + 1)
-                    logger.warning("Gemini %s (%s)، انتظار %ss", response.status_code, model, wait)
-                    time.sleep(wait)
-                    continue  # أعد المحاولة مع نفس الموديل
+                elif response.status_code == 429:
+                    logger.warning("Gemini 429 (%s) — تجربة الموديل التالي فوراً", model)
+                    time.sleep(1)   # ثانية واحدة فقط بين الموديلات
                 else:
-                    logger.warning("Gemini %s للموديل %s — تجربة التالي", response.status_code, model)
-                    break  # خطأ آخر — جرّب الموديل التالي
+                    logger.warning("Gemini %s للموديل %s", response.status_code, model)
             except Exception as e:
                 logger.error("خطأ في Gemini (%s): %s", model, e)
-                break
 
     logger.error("Gemini: فشلت جميع الموديلات")
     return None
@@ -191,12 +225,22 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
 # الدوال العامة (تُستدعى من bot.py)
 # =============================================================
 
-def identify_product_from_image(image_bytes: bytes) -> str | None:
+def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str | None:
     """
-    يستخدم Gemini 1.5 Flash لتحديد اسم المنتج من الصورة.
-    يرجع نص اسم المنتج، أو None إذا لم يُتعرف عليه.
+    يتعرف على المنتج من الصورة.
+    الأولوية:
+      1. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY + image_url)
+      2. Gemini API (fallback)
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
+    # ── Google Lens (الأسرع والأموثق) ────────────────────────────────────────
+    if image_url and SERPAPI_KEY:
+        result = _google_lens(image_url)
+        if result:
+            return result
+        logger.info("Google Lens لم يتعرف — أنتقل لـ Gemini")
+
+    # ── Gemini (fallback) ─────────────────────────────────────────────────────
     return _call_gemini(image_bytes)
 
 
