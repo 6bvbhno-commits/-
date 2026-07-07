@@ -272,7 +272,9 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
             if asin:
                 affiliate_link = f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
             elif link_el:
-                affiliate_link = f"https://www.{domain}" + link_el.get("href", "").split("?")[0]
+                # لا ASIN — نضيف التاق على الرابط الخام كي تُحسب العمولة دائماً
+                clean_path = link_el.get("href", "").split("?")[0]
+                affiliate_link = f"https://www.{domain}{clean_path}?tag={AFFILIATE_TAG}"
             else:
                 continue
 

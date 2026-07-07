@@ -67,18 +67,33 @@ def _parse_price(raw) -> tuple[float | None, str | None]:
 
 def _affiliate_link(asin: str | None, raw_link: str, domain: str) -> str:
     """
-    يبني رابط أفلييت:
-    - إذا كان ASIN موجوداً → /dp/ASIN?tag=TAG
-    - وإلا يضيف tag= للرابط الأصلي (إذا كان رابط أمازون)
+    يبني رابط أفلييت — التاق يُضاف دائماً بغض النظر عن مصدر الرابط:
+    - إذا كان ASIN موجوداً → /dp/ASIN?tag=TAG  (أفضل شكل)
+    - وإلا يبني رابط أمازون من raw_link ويضيف tag= (يستبدله لو موجود مسبقاً)
+    - إذا لم يكن هناك أي بيانات → رابط بحث أمازون مع التاق
     """
     if asin:
         return f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
 
-    if raw_link and "amazon." in raw_link:
-        sep = "&" if "?" in raw_link else "?"
-        return f"{raw_link}{sep}tag={AFFILIATE_TAG}"
+    if raw_link:
+        # نزيل tag= القديم إن وُجد ثم نضيف التاق الصحيح
+        from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+        try:
+            parsed = urlparse(raw_link)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            params.pop("tag", None)               # نحذف أي tag قديم
+            params["tag"] = [AFFILIATE_TAG]
+            new_query = urlencode({k: v[0] for k, v in params.items()})
+            tagged = urlunparse(parsed._replace(query=new_query))
+            # إذا كان الرابط لا يشير لأمازون نبني رابطاً نظيفاً بدلاً منه
+            if "amazon." not in (parsed.netloc or parsed.path):
+                return f"https://www.{domain}/s?k=&tag={AFFILIATE_TAG}"
+            return tagged
+        except Exception:
+            pass
 
-    return raw_link or ""
+    # fallback: صفحة بحث فارغة — الأفضل من رابط بدون تاق
+    return f"https://www.{domain}/?tag={AFFILIATE_TAG}"
 
 
 # ─── جلب بيانات منتج بـ ASIN ──────────────────────────────────────────────────
