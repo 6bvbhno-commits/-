@@ -38,7 +38,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب — تحتوي على إفصاح الأفلييت الإلزامي."""
     welcome_text = (
         "👋 أهلاً بك!\n\n"
-        "أرسل لي رابط أي منتج من أمازون، وبعطيك أقل سعر متاح له.\n"
+        "أرسل لي رابط أي منتج من أمازون، وبعطيك السعر الدقيق والمحدث له.\n"
         "أو أرسل صورة لمنتج، وبدور لك عليه في أمازون وأقولك إذا متوفر أو لا.\n\n"
         "ℹ️ روابط الشراء في هذا البوت تحتوي على رابط تسويق بالعمولة الخاص بي."
     )
@@ -61,7 +61,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # لو ما لقينا ASIN، غالبًا رابط مختصر — نحاول نفكه عبر إعادة التوجيه
     if not asin:
-        await update.message.reply_text("🔗 الرابط يبدو مختصراً أو من المشاركة.. جاري تتبعه واستخراج تفاصيل المنتج...")
+        await update.message.reply_text("🔗 جاري تتبع الرابط واستخراج التفاصيل...")
         try:
             loop = asyncio.get_event_loop()
             resolved_url = await loop.run_in_executor(None, resolve_short_link, text)
@@ -79,7 +79,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("🔎 تم العثور على المنتج! جاري جلب أفضل الأسعار والعروض...")
+    await update.message.reply_text("🔎 جاري حساب وفحص السعر الدقيق من السيرفر...")
 
     try:
         offer = get_lowest_offer(asin, domain=domain)
@@ -134,7 +134,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أي رسالة نصية ما فيها رابط أمازون واضح."""
     await update.message.reply_text(
-        "أرسل لي رابط منتج من أمازون 🔗 أو صورة 📸 عشان أساعدك."
+        "أرسل لي رابط منتج من أمازون 🔗 عشان أساعدك."
     )
 
 

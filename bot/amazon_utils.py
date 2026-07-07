@@ -141,13 +141,14 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     يرجع إلى بيانات وهمية تلقائياً إذا كان MOCK_MODE مفعّلاً أو المفاتيح غير مدخلة.
     """
     if MOCK_MODE or AMAZON_ACCESS_KEY == "ضع_مفتاح_Access_Key_هنا":
-        base_price = random.randint(50, 900)
+        base_price = random.randint(100, 500)
         currency = "SAR" if "sa" in domain else "USD"
         return {
             "asin": asin,
+            "title": "منتج تجريبي ذكي",
             "price": f"{base_price}.00",
             "currency": currency,
-            "seller_name": "بائع في أمازون (وضع تجريبي)",
+            "seller_name": "Amazon",
             "condition": "جديد",
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
@@ -158,6 +159,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     payload_dict = {
         "ItemIds": [asin],
         "Resources": [
+            "Offers.Findings.Price",        # BuyBox / أقل سعر إجمالي
             "Offers.Listings.Price",
             "Offers.Listings.MerchantInfo",
             "Offers.Listings.Condition",
@@ -174,7 +176,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             host, uri, payload_str, AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY
         )
         response = requests.post(
-            f"https://{host}{uri}", data=payload_str, headers=headers, timeout=10
+            f"https://{host}{uri}", data=payload_str, headers=headers, timeout=12
         )
 
         if response.status_code != 200:
@@ -187,20 +189,49 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             return None
 
         item = items[0]
+        currency = "SAR" if "sa" in domain else "USD"
+        lowest_price_amount = None
+        display_price = None
+
+        # 1. نجرّب BuyBox / Findings أولاً — أدق وأقرب للسعر الظاهر في المتجر
+        findings_price = (
+            item.get("Offers", {}).get("Findings", {}).get("LowestPrice", {})
+        )
+        if findings_price:
+            lowest_price_amount = findings_price.get("Amount")
+            currency = findings_price.get("Currency", currency)
+            display_price = findings_price.get("DisplayAmount")
+
+        # 2. نجرّب Listings كبديل
         listings = item.get("Offers", {}).get("Listings", [])
+        seller_name = "أمازون"
+        condition = "جديد"
         valid_listings = [l for l in listings if l.get("Price", {}).get("Amount")]
 
-        if not valid_listings:
+        if valid_listings:
+            lowest_listing = min(valid_listings, key=lambda x: x["Price"]["Amount"])
+            seller_name = lowest_listing.get("MerchantInfo", {}).get("Name", seller_name)
+            condition = lowest_listing.get("Condition", {}).get("DisplayValue", condition)
+            if not lowest_price_amount:
+                lowest_price_amount = lowest_listing["Price"]["Amount"]
+                currency = lowest_listing["Price"]["Currency"]
+                display_price = lowest_listing["Price"]["DisplayAmount"]
+
+        if not lowest_price_amount:
             return None
 
-        lowest = min(valid_listings, key=lambda x: x["Price"]["Amount"])
+        # تطبيق ضريبة القيمة المضافة 15% لنطاق السعودية إذا كان السعر صافياً
+        if "sa" in domain:
+            final_with_vat = float(lowest_price_amount) * 1.15
+            display_price = f"{final_with_vat:,.2f} {currency}"
+
         return {
             "asin": asin,
             "title": item.get("ItemInfo", {}).get("Title", {}).get("DisplayValue"),
-            "price": lowest["Price"]["DisplayAmount"],
-            "currency": lowest["Price"]["Currency"],
-            "seller_name": lowest.get("MerchantInfo", {}).get("Name", "أمازون"),
-            "condition": lowest.get("Condition", {}).get("DisplayValue", "جديد"),
+            "price": display_price,
+            "currency": currency,
+            "seller_name": seller_name,
+            "condition": condition,
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
     except Exception as e:
@@ -211,17 +242,17 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 def format_offer_message(offer: dict) -> str:
     """يبني رسالة جاهزة للإرسال في تيليجرام."""
     if not offer:
-        return "❌ ما قدرت ألقى عروض متاحة أو أسعار حقيقية لهذا المنتج حاليًا."
+        return "❌ ما قدرت ألقى عروض متاحة أو أسعار دقيقة لهذا المنتج حاليًا. تأكد من توفر السلعة في المتجر."
 
     title_part = (
         f"📦 *{offer['title'][:60]}...*\n\n" if offer.get("title") else ""
     )
     return (
         f"{title_part}"
-        f"💰 *أقل سعر حقيقي متاح حالياً:*\n"
-        f"• السعر: `{offer['price']}`\n"
+        f"💰 *السعر الفعلي الحالي:*\n"
+        f"• السعر الشامل: `{offer['price']}`\n"
         f"• البائع: {offer['seller_name']}\n"
         f"• الحالة: {offer['condition']}\n\n"
-        f"🛒 *رابط الشراء المباشر (الأفلييت الخاص بك):*\n{offer['affiliate_link']}\n\n"
+        f"🛒 *رابط الشراء المباشر:*\n{offer['affiliate_link']}\n\n"
         f"_(رابط تسويق بالعمولة)_"
     )
