@@ -42,9 +42,11 @@ logger = logging.getLogger(__name__)
 _RATE_WINDOW = 60
 _RATE_MAX    = 20
 _user_times: dict[int, list[float]] = defaultdict(list)
+_user_last_seen: dict[int, float]   = {}   # آخر نشاط — للتنظيف الدوري
 
 def _is_rate_limited(user_id: int) -> bool:
     now  = _time.monotonic()
+    _user_last_seen[user_id] = now
     buf  = _user_times[user_id]
     buf[:] = [t for t in buf if now - t < _RATE_WINDOW]
     if len(buf) >= _RATE_MAX:
@@ -61,6 +63,30 @@ def _add_to_history(user_id: int, role: str, content: str) -> None:
     h.append({"role": role, "content": content})
     if len(h) > _MAX_HISTORY:
         h[:] = h[-_MAX_HISTORY:]
+
+
+# ─── تنظيف دوري للذاكرة (يمنع تراكم بيانات المستخدمين غير النشطين) ──────────
+_USER_TTL = 2 * 3600   # 2 ساعة عدم نشاط → نحذف من الذاكرة
+
+async def _memory_cleanup_loop() -> None:
+    """يُنظّف بيانات المستخدمين غير النشطين كل 30 دقيقة."""
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            cutoff = _time.monotonic() - _USER_TTL
+            stale  = [uid for uid, t in _user_last_seen.items() if t < cutoff]
+            for uid in stale:
+                _user_times.pop(uid, None)
+                _user_history.pop(uid, None)
+                _user_last_seen.pop(uid, None)
+            if stale:
+                logger.info("memory_cleanup: حُذف %d مستخدم غير نشط", len(stale))
+            logger.info(
+                "memory_cleanup: %d مستخدم نشط في الذاكرة",
+                len(_user_last_seen),
+            )
+        except Exception as _ce:
+            logger.warning("memory_cleanup فشل: %s", _ce)
 
 # ─── ثوابت ───────────────────────────────────────────────────────────────────
 _MAX_MSG       = 4096
@@ -371,6 +397,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # نقطة الانطلاق
 # =============================================================================
 
+async def _post_init(application) -> None:
+    """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
+    asyncio.create_task(_memory_cleanup_loop())
+    logger.info("✅ مهمة تنظيف الذاكرة بدأت")
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("⚠️  حط توكن البوت في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
@@ -385,6 +417,7 @@ def main():
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(_post_init)
         .build()
     )
 

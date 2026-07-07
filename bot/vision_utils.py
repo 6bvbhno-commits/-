@@ -11,11 +11,11 @@ import threading
 import requests
 from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
 
-# حد Gemini: طلب واحد في المرة — يمنع كل المستخدمين من ضرب الـ 429 بالتزامن
-_GEMINI_SEM = threading.Semaphore(1)
+# حد Gemini: طلبان متزامنان — ضغط عالي يستحق 2 (429 تُعالج بالتجربة التالية)
+_GEMINI_SEM = threading.Semaphore(2)
 
-# حد OpenAI Vision: أقصى 3 طلبات متزامنة لتجنب الضغط على الـ proxy
-_OPENAI_SEM = threading.Semaphore(3)
+# حد OpenAI Vision: أقصى 5 طلبات متزامنة (رُفع من 3 لاستيعاب الضغط العالي)
+_OPENAI_SEM = threading.Semaphore(5)
 
 logger = logging.getLogger(__name__)
 

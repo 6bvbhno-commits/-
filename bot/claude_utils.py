@@ -12,9 +12,17 @@ logger = logging.getLogger(__name__)
 # ── Client (lazy init) ────────────────────────────────────────────────────────
 _client = None
 
+_client_error_until: float = 0.0   # backoff: لا تعيد المحاولة قبل هذا الوقت
+
 def _get_client():
-    global _client
-    if _client is None:
+    """Lazy init مع backoff: إذا فشل التهيئة لا يعيد المحاولة 60 ثانية."""
+    global _client, _client_error_until
+    if _client is not None:
+        return _client
+    now = __import__("time").time()
+    if now < _client_error_until:
+        raise RuntimeError("Anthropic client في فترة backoff — انتظر")
+    try:
         from anthropic import Anthropic
         base_url = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
         api_key  = os.getenv("AI_INTEGRATIONS_ANTHROPIC_API_KEY", "dummy")
@@ -22,7 +30,11 @@ def _get_client():
         if base_url:
             kwargs["base_url"] = base_url
         _client = Anthropic(**kwargs)
-    return _client
+        return _client
+    except Exception as e:
+        _client_error_until = __import__("time").time() + 60
+        logger.error("Anthropic client init فشل (backoff 60s): %s", e)
+        raise
 
 
 # ── System prompts ─────────────────────────────────────────────────────────────

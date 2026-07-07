@@ -22,7 +22,7 @@ _CACHE_MAX  = 500
 _CACHE_LOCK = threading.Lock()
 
 # ---- حد الطلبات المتزامنة لأمازون ----
-_SCRAPE_SEMAPHORE = threading.Semaphore(6)  # رُفع من 4 → 6 لاستيعاب الضغط
+_SCRAPE_SEMAPHORE = threading.Semaphore(10)  # رُفع من 6 → 10 لاستيعاب الضغط العالي
 
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")

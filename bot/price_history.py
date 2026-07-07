@@ -43,7 +43,10 @@ def _init_db() -> None:
         )
 
 
-_init_db()
+try:
+    _init_db()
+except Exception as _init_err:
+    logger.error("price_history: فشل إنشاء قاعدة البيانات — %s", _init_err)
 
 # آخر مرة نُنظّف كل قاعدة البيانات (نفعلها مرة كل 24 ساعة فقط)
 _last_global_cleanup: float = 0.0
