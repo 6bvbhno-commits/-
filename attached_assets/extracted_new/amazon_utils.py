@@ -76,7 +76,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     #     "currency": lowest["currency"],
     #     "seller_name": lowest["seller_name"],
     #     "condition": lowest["condition"],
-    #     "affiliate_link": build_affiliate_link(asin, domain=domain),
+    #     "affiliate_link": build_affiliate_link(asin),
     # }
     # ============================================================
     return None

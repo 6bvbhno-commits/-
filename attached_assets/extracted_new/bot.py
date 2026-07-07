@@ -43,9 +43,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي رسالة نصية فيها رابط منتج."""
-    if not update.message or not update.message.text:
-        return
-
     text = update.message.text
     asin = extract_asin(text)
     domain = extract_domain(text)  # نفس نطاق أمازون اللي أرسله المستخدم فعليًا
@@ -59,44 +56,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔎 جاري البحث عن أقل سعر...")
 
-    try:
-        offer = get_lowest_offer(asin, domain=domain)
-        message = format_offer_message(offer)
-    except Exception as e:
-        logger.error("Failed to fetch offer for ASIN %s: %s", asin, e)
-        await update.message.reply_text(
-            "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية."
-        )
-        return
-
+    offer = get_lowest_offer(asin, domain=domain)
+    message = format_offer_message(offer)
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي صورة يرسلها المستخدم (من الكاميرا أو المعرض — نفس المعالجة)."""
-    if not update.message or not update.message.photo:
-        return
-
     await update.message.reply_text("📸 جاري تحليل الصورة...")
 
-    try:
-        photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
-        photo_bytes = await photo_file.download_as_bytearray()
-    except Exception as e:
-        logger.error("Failed to download photo: %s", e)
-        await update.message.reply_text(
-            "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية."
-        )
-        return
+    photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
+    photo_bytes = await photo_file.download_as_bytearray()
 
-    try:
-        keywords = await identify_product_from_image(bytes(photo_bytes))
-    except Exception as e:
-        logger.error("Image analysis failed: %s", e)
-        await update.message.reply_text(
-            "❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية."
-        )
-        return
+    keywords = identify_product_from_image(bytes(photo_bytes))
 
     if not keywords:
         await update.message.reply_text(
@@ -118,7 +90,7 @@ async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if TELEGRAM_BOT_TOKEN == "ضع_توكن_البوت_هنا":
-        print("⚠️  لازم تحط توكن البوت الحقيقي في متغير البيئة TELEGRAM_BOT_TOKEN")
+        print("⚠️  لازم تحط توكن البوت الحقيقي في config.py أو متغير البيئة TELEGRAM_BOT_TOKEN")
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
