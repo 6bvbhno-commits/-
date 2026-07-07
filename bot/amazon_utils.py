@@ -424,7 +424,6 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
     with _SCRAPE_SEMAPHORE:
-        import time
 
         # --- المحاولة الأولى: سطح المكتب ---
         page_data = _scrape_desktop(asin, domain)
