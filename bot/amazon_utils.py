@@ -421,6 +421,16 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("Cache hit للـ ASIN %s", asin)
                 return cached
 
+    # ── دالة مساعدة: تسجيل + cache + إعادة ─────────────────────────────────
+    def _record_and_return(res: dict) -> dict:
+        _cache_set(cache_key, res)
+        try:
+            from price_history import record_price
+            record_price(asin, domain, res["price_val"], res.get("seller_name", ""))
+        except Exception as _ph:
+            logger.warning("price_history: فشل التسجيل — %s", _ph)
+        return res
+
     # ── SerpAPI (الأولوية الأولى) — يدعم أي domain ──────────────────────────────
     try:
         from serpapi_utils import get_item_by_asin as serp_get, serpapi_available
@@ -428,8 +438,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             logger.info("SerpAPI: أطلب ASIN %s", asin)
             result = serp_get(asin, domain=domain)
             if result:
-                _cache_set(cache_key, result)
-                return result
+                return _record_and_return(result)
             logger.info("SerpAPI: لا نتيجة، أنتقل للخطوة التالية — ASIN %s", asin)
     except Exception as e:
         logger.warning("SerpAPI exception: %s — أنتقل للخطوة التالية", e)
@@ -442,8 +451,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("PA API: أطلب ASIN %s", asin)
                 result = pa_get(asin)
                 if result:
-                    _cache_set(cache_key, result)
-                    return result
+                    return _record_and_return(result)
                 logger.info("PA API: لا نتيجة، أنتقل للكشط — ASIN %s", asin)
         except Exception as e:
             logger.warning("PA API exception: %s — أنتقل للكشط", e)
@@ -508,9 +516,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             "affiliate_link": affiliate_link,
         }
 
-        # خزّن في الـ cache
-        _cache_set(cache_key, result)
-        return result
+        return _record_and_return(result)
 
 
 def _esc(text: str) -> str:

@@ -162,6 +162,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
+
+        # أضف تاريخ السعر إن وُجد (يحتاج قراءتين على الأقل)
+        if offer and not offer.get("blocked"):
+            try:
+                from price_history import format_history_message
+                history = await loop.run_in_executor(None, format_history_message, asin, domain)
+                if history:
+                    message = message + "\n\n" + history
+            except Exception as _ph_err:
+                logger.warning("price_history: فشل عرض التاريخ — %s", _ph_err)
+
     except Exception as e:
         logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
         await _reply(update, "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية.", parse_mode=None)
