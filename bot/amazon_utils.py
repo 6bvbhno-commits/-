@@ -74,31 +74,41 @@ def resolve_short_link(url: str) -> str:
 
     مهم: أمازون يرفض أو يتجاهل الطلبات اللي ما تشبه متصفح حقيقي،
     فنرسل نفس ترويسة (User-Agent) اللي يرسلها متصفح حقيقي حتى
-    يكمّل التحويل بشكل طبيعي.
+    يكمّل التحويل بشكل طبيعي. نستخدم Session لدعم ملفات تعريف
+    الارتباط والتتبع التلقائي لكل التحويلات.
     """
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
     }
     try:
-        response = requests.get(
-            url, headers=headers, allow_redirects=True, timeout=10
+        session = requests.Session()
+        response = session.get(
+            url, headers=headers, allow_redirects=True, timeout=12
         )
         return response.url
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.error("فشل فك تتبع الرابط المختصر بسبب: %s", e)
         return url  # فشل الحل، نرجّع الأصلي ونخلي extract_asin يحاول عليه
 
 
 def extract_asin(url: str) -> str | None:
-    """يستخرج ASIN من أي شكل رابط أمازون شائع."""
+    """مستخرج ASIN ذكي يدعم كافة الأنماط الطويلة، المختصرة، وصيغ روابط مشاركة التطبيقات."""
+    # تنظيف الرابط من أي نصوص زائدة قد تأتي من نسخ التطبيق
+    url_match = re.search(r"https?://\S+", url)
+    if url_match:
+        url = url_match.group(0)
+
     patterns = [
         r"/dp/([A-Z0-9]{10})",
         r"/gp/product/([A-Z0-9]{10})",
         r"/product/([A-Z0-9]{10})",
         r"[?&]asin=([A-Z0-9]{10})",
+        r"/aw/d/([A-Z0-9]{10})",   # روابط تصفح الجوال
+        r"/d/([A-Z0-9]{10})",
     ]
     for pattern in patterns:
         match = re.search(pattern, url, re.IGNORECASE)
@@ -135,9 +145,9 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         currency = "SAR" if "sa" in domain else "USD"
         return {
             "asin": asin,
-            "price": f"{base_price} {currency}",
+            "price": f"{base_price}.00",
             "currency": currency,
-            "seller_name": "بائع في أمازون (⚠️ سعر تجريبي وهمي)",
+            "seller_name": "بائع في أمازون (وضع تجريبي)",
             "condition": "جديد",
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
@@ -212,6 +222,6 @@ def format_offer_message(offer: dict) -> str:
         f"• السعر: `{offer['price']}`\n"
         f"• البائع: {offer['seller_name']}\n"
         f"• الحالة: {offer['condition']}\n\n"
-        f"🛒 *رابط الشراء المباشر:*\n{offer['affiliate_link']}\n\n"
+        f"🛒 *رابط الشراء المباشر (الأفلييت الخاص بك):*\n{offer['affiliate_link']}\n\n"
         f"_(رابط تسويق بالعمولة)_"
     )

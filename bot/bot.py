@@ -61,7 +61,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # لو ما لقينا ASIN، غالبًا رابط مختصر — نحاول نفكه عبر إعادة التوجيه
     if not asin:
-        await update.message.reply_text("🔗 جاري فك الرابط المختصر...")
+        await update.message.reply_text("🔗 الرابط يبدو مختصراً أو من المشاركة.. جاري تتبعه واستخراج تفاصيل المنتج...")
         try:
             loop = asyncio.get_event_loop()
             resolved_url = await loop.run_in_executor(None, resolve_short_link, text)
@@ -79,7 +79,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("🔎 جاري البحث عن أقل سعر...")
+    await update.message.reply_text("🔎 تم العثور على المنتج! جاري جلب أفضل الأسعار والعروض...")
 
     try:
         offer = get_lowest_offer(asin, domain=domain)

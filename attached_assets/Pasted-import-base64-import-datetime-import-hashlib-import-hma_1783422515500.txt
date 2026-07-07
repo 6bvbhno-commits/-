@@ -1,0 +1,430 @@
+import base64
+import datetime
+import hashlib
+import hmac
+import logging
+import os
+import random
+import re
+import requests
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ==========================================
+# 1. الإعدادات والمفاتيح الرسمية (Config)
+# ==========================================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_البوت_هنا")
+AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "rashedalhano-21")
+AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY", "ضع_مفتاح_Access_Key_هنا")
+AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY", "ضع_مفتاح_Secret_Key_هنا")
+
+# تحويل الوضع التجريبي إلى False لجلب البيانات الحقيقية أو True للتجربة
+MOCK_MODE = False
+
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
+AMAZON_DOMAIN = os.getenv("AMAZON_DOMAIN", "www.amazon.sa")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# 2. نظام الاتصال الحقيقي بـ API أمازون (Amazon API Request Signer)
+# ==========================================
+
+
+def sign_amazon_request(
+    host: str, uri: str, payload: str, access_key: str, secret_key: str
+) -> dict:
+    now = datetime.datetime.utcnow()
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+
+    region = "eu-west-1" if "sa" in host or "ae" in host else "us-east-1"
+    service = "ProductAdvertisingAPI"
+
+    canonical_headers = (
+        f"content-type:application/json; charset=utf-8\nhost:{host}\n"
+        f"x-amz-date:{amz_date}\nx-amz-target:com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems\n"
+    )
+    signed_headers = "content-type;host;x-amz-date;x-amz-target"
+
+    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    canonical_request = f"POST\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+
+    def sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = sign(f"AWS4{secret_key}".encode("utf-8"), datestamp)
+    k_region = sign(k_date, region)
+    k_service = sign(k_region, service)
+    k_signing = sign(k_service, "aws4_request")
+
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    authorization_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": host,
+        "X-Amz-Date": amz_date,
+        "X-Amz-Target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems",
+        "Authorization": authorization_header,
+    }
+
+
+# ==========================================
+# 3. دوال خدمات أمازون المتقدمة والمحدثة (Amazon Utils)
+# ==========================================
+
+
+def resolve_short_link(url: str) -> str:
+    """يحل الروابط المختصرة ويتابع التحويلات مراراً حتى يحصل على الرابط النهائي الكامل."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    }
+    try:
+        # استخدام Session وتتبع الروابط بحد أقصى 5 تحويلات تلقائية
+        session = requests.Session()
+        response = session.get(
+            url, headers=headers, allow_redirects=True, timeout=12
+        )
+        return response.url
+    except requests.RequestException as e:
+        logger.error(f"فشل فك تتبع الرابط المختصر بسبب: {e}")
+        return url
+
+
+def extract_asin(url: str) -> str | None:
+    """مستخرج ASIN ذكي يدعم كافة الأنماط الطويلة، المختصرة، وصيغ روابط مشاركة التطبيقات."""
+    # تنظيف الرابط من أي نصوص زائدة قد تأتي من نسخ التطبيق
+    url_match = re.search(r"https?://\S+", url)
+    if url_match:
+        url = url_match.group(0)
+
+    patterns = [
+        r"/dp/([A-Z0-9]{10})",
+        r"/gp/product/([A-Z0-9]{10})",
+        r"/product/([A-Z0-9]{10})",
+        r"[?&]asin=([A-Z0-9]{10})",
+        r"/aw/d/([A-Z0-9]{10})",  # أنماط روابط تصفح الجوال
+        r"/d/([A-Z0-9]{10})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def extract_domain(url: str) -> str:
+    """يستخرج نطاق أمازون الفعلي لضمان بناء رابط أفلييت يعمل وبدون خطأ 404."""
+    match = re.search(r"://(?:www\.)?(amazon\.[a-z.]+)", url, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return "amazon.sa"
+
+
+def build_affiliate_link(asin: str, domain: str = "amazon.sa") -> str:
+    return f"https://{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+
+
+def get_lowest_offer(asin: str, domain: str = "amazon.sa") -> dict | None:
+    if MOCK_MODE or AMAZON_ACCESS_KEY == "ضع_مفتاح_Access_Key_هنا":
+        base_price = random.randint(50, 900)
+        return {
+            "asin": asin,
+            "price": f"{base_price}.00",
+            "currency": "SAR" if "sa" in domain else "USD",
+            "seller_name": "بائع في أمازون (وضع تجريبي)",
+            "condition": "جديد",
+            "affiliate_link": build_affiliate_link(asin, domain=domain),
+        }
+
+    host = f"paapi.{domain}"
+    uri = "/paapi5/v1/getitems"
+
+    payload = {
+        "ItemIds": [asin],
+        "Resources": [
+            "Offers.Listings.Price",
+            "Offers.Listings.MerchantInfo",
+            "Offers.Listings.Condition",
+            "ItemInfo.Title",
+        ],
+        "PartnerTag": AFFILIATE_TAG,
+        "PartnerType": "Associates",
+        "Marketplace": f"amazon.{domain.split('.')[-1]}",
+    }
+
+    import json
+
+    payload_str = json.dumps(payload)
+
+    try:
+        headers = sign_amazon_request(
+            host, uri, payload_str, AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY
+        )
+        url = f"https://{host}{uri}"
+        response = requests.post(
+            url, data=payload_str, headers=headers, timeout=12
+        )
+
+        if response.status_code == 200:
+            res_data = response.json()
+            items = res_data.get("ItemsResult", {}).get("Items", [])
+            if not items:
+                return None
+
+            item = items[0]
+            listings = item.get("Offers", {}).get("Listings", [])
+
+            if listings:
+                valid_listings = [
+                    l for l in listings if l.get("Price", {}).get("Amount")
+                ]
+                lowest_listing = min(
+                    valid_listings, key=lambda x: x["Price"]["Amount"]
+                )
+
+                return {
+                    "asin": asin,
+                    "title": item.get("ItemInfo", {})
+                    .get("Title", {})
+                    .get("DisplayValue", "منتج أمازون"),
+                    "price": lowest_listing["Price"]["DisplayAmount"],
+                    "currency": lowest_listing["Price"]["Currency"],
+                    "seller_name": lowest_listing.get("MerchantInfo", {})
+                    .get("Name", "أمازون"),
+                    "condition": lowest_listing.get("Condition", {}).get(
+                        "DisplayValue", "جديد"
+                    ),
+                    "affiliate_link": build_affiliate_link(asin, domain=domain),
+                }
+        return None
+    except Exception as e:
+        logger.error(f"خطأ أثناء جلب عروض أمازون الحقيقية: {e}")
+        return None
+
+
+def format_offer_message(offer: dict) -> str:
+    if not offer:
+        return "❌ ما قدرت ألقى عروض متاحة أو أسعار حقيقية لهذا المنتج حالياً. تأكد من توفر المنتج في المتجر الفعلي."
+
+    title_part = (
+        f"📦 *{offer['title'][:60]}...*\n\n" if "title" in offer else ""
+    )
+    return (
+        f"{title_part}"
+        f"💰 *أقل سعر حقيقي متاح حالياً:*\n"
+        f"• السعر: `{offer['price']}`\n"
+        f"• البائع: {offer['seller_name']}\n"
+        f"• الحالة: {offer['condition']}\n\n"
+        f"🛒 *رابط الشراء المباشر (الأفلييت الخاص بك):*\n{offer['affiliate_link']}\n\n"
+        f"_(رابط تسويق بالعمولة)_"
+    )
+
+
+# ==========================================
+# 4. دوال الرؤية والبحث بالصورة (Vision Utils)
+# ==========================================
+
+
+def identify_product_from_image(image_bytes: bytes) -> list[str]:
+    if not GOOGLE_VISION_API_KEY:
+        return ["حذاء رياضي", "أبيض", "sneaker"]
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+
+    payload = {
+        "requests": [
+            {
+                "image": {"content": image_b64},
+                "features": [
+                    {"type": "WEB_DETECTION", "maxResults": 5},
+                    {"type": "LABEL_DETECTION", "maxResults": 5},
+                ],
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        labels = []
+        result = data.get("responses", [{}])[0]
+
+        web_entities = result.get("webDetection", {}).get("webEntities", [])
+        for entity in web_entities:
+            if "description" in entity:
+                labels.append(entity["description"])
+
+        for label in result.get("labelAnnotations", []):
+            labels.append(label["description"])
+
+        return labels[:5] if labels else []
+    except Exception:
+        return []
+
+
+def search_amazon_by_keywords(keywords: list[str]) -> list[dict]:
+    query = " ".join(keywords[:2]) if keywords else "منتج"
+    return [
+        {
+            "title": f"{query} - نتيجة مطابقة 1",
+            "asin": "B0MOCK0001",
+            "available": True,
+            "affiliate_link": build_affiliate_link("B0MOCK0001"),
+        },
+        {
+            "title": f"{query} - نتيجة مطابقة 2",
+            "asin": "B0MOCK0002",
+            "available": False,
+            "affiliate_link": build_affiliate_link("B0MOCK0002"),
+        },
+    ]
+
+
+def format_search_results(results: list[dict]) -> str:
+    if not results:
+        return "❌ ما لقيت أي منتج مطابق. جرب صورة أوضح فيها شعار أو نص على المنتج."
+
+    lines = ["🔍 لقيت هذي النتائج المحتملة:\n"]
+    for i, item in enumerate(results, start=1):
+        status = "✅ متوفر" if item["available"] else "❌ غير متوفر حالياً"
+        lines.append(
+            f"{i}. {item['title']}\n"
+            f"   الحالة: {status}\n"
+            f"   الرابط: {item['affiliate_link']}\n"
+        )
+    lines.append("_(روابط تسويق بالعمولة)_")
+    return "\n".join(lines)
+
+
+# ==========================================
+# 5. معالجات تيليجرام (Telegram Handlers)
+# ==========================================
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "👋 أهلاً بك!\n\n"
+        "أرسل لي رابط أي منتج من أمازون، وبعطيك أقل سعر متاح له.\n"
+        "أرسل صورة لمنتج، وبدور لك عليه في أمازون وأقولك إذا متوفر أو لا.\n\n"
+        "ℹ️ روابط الشراء في هذا البوت تحتوي على رابط تسويق بالعمولة الخاص بي."
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    # محاولة فحص أولية
+    asin = extract_asin(text)
+    resolved_url = text
+
+    # إذا لم يجد ASIN من النص المنسوخ (الرابط المختصر)، يبدأ بتتبعه فوراً
+    if not asin:
+        await update.message.reply_text(
+            "🔗 الرابط يبدو مختصراً أو من المشاركة.. جاري تتبعه واستخراج تفاصيل المنتج..."
+        )
+        resolved_url = resolve_short_link(text)
+        asin = extract_asin(resolved_url)
+
+    domain = extract_domain(resolved_url)
+
+    # التحقق الأخير
+    if not asin:
+        await update.message.reply_text(
+            "⚠️ ما زلت غير قادر على العثور على رقم المنتج (ASIN).\n"
+            "تأكد أن الرابط يخص صفحة منتج محدد داخل أمازون وليس صفحة رئيسية أو سلة تسوق."
+        )
+        return
+
+    await update.message.reply_text(
+        "🔎 تم العثور على المنتج! جاري جلب أفضل الأسعار والعروض..."
+    )
+
+    offer = get_lowest_offer(asin, domain=domain)
+    message = format_offer_message(offer)
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📸 جاري تحليل الصورة والبحث...")
+
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    keywords = identify_product_from_image(bytes(photo_bytes))
+
+    if not keywords:
+        await update.message.reply_text(
+            "❌ ما قدرت أتعرف على محتوى الصورة. جرب صورة أوضح."
+        )
+        return
+
+    results = search_amazon_by_keywords(keywords)
+    message = format_search_results(results)
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أرسل لي رابط منتج من أمازون 🔗 أو صورة 📸 عشان أساعدك."
+    )
+
+
+# ==========================================
+# 6. التشغيل (Main)
+# ==========================================
+
+
+def main():
+    if TELEGRAM_BOT_TOKEN == "ضع_توكن_البوت_هنا":
+        print("⚠️ يرجى إدخال توكن البوت الحقيقي أولاً.")
+        return
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # التقاط أي رسالة تحتوي على رابط لتمريرها ومعالجتها فوراً
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"https?://\S+"), handle_link
+        )
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown)
+    )
+
+    print("🚀 البوت جاهز ومحدث لاستخراج كافة صيغ الروابط بدقة...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
