@@ -1,10 +1,70 @@
 """
 كل الدوال المتعلقة بأمازون: استخراج ASIN، بناء رابط أفلييت، وجلب أقل سعر.
 """
+import datetime
+import hashlib
+import hmac
+import json
+import logging
 import re
 import random
 import requests
-from config import AFFILIATE_TAG, AMAZON_DOMAIN, MOCK_MODE
+from config import AFFILIATE_TAG, AMAZON_DOMAIN, MOCK_MODE, AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY
+
+logger = logging.getLogger(__name__)
+
+
+def sign_amazon_request(
+    host: str, uri: str, payload: str, access_key: str, secret_key: str
+) -> dict:
+    """يوقّع الطلب رقمياً بـ AWS Signature V4 ويجهّز الترويسات للاتصال بـ PA API v5."""
+    now = datetime.datetime.utcnow()
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+
+    region = "eu-west-1" if "sa" in host or "ae" in host else "us-east-1"
+    service = "ProductAdvertisingAPI"
+
+    canonical_headers = (
+        f"content-type:application/json; charset=utf-8\nhost:{host}\n"
+        f"x-amz-date:{amz_date}\nx-amz-target:com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems\n"
+    )
+    signed_headers = "content-type;host;x-amz-date;x-amz-target"
+
+    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    canonical_request = (
+        f"POST\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+
+    def _sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _sign(f"AWS4{secret_key}".encode("utf-8"), datestamp)
+    k_region = _sign(k_date, region)
+    k_service = _sign(k_region, service)
+    k_signing = _sign(k_service, "aws4_request")
+
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    authorization_header = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": host,
+        "X-Amz-Date": amz_date,
+        "X-Amz-Target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.GetItems",
+        "Authorization": authorization_header,
+    }
 
 
 def resolve_short_link(url: str) -> str:
@@ -52,10 +112,11 @@ def extract_domain(url: str) -> str:
     يستخرج نطاق أمازون الفعلي من الرابط الأصلي (مثل amazon.sa أو amazon.com).
     هذا مهم جدًا: لو المنتج من amazon.com وبنينا رابط بنطاق amazon.sa،
     أمازون يطلع صفحة خطأ (404) لأن المنتج غير موجود بذاك النطاق.
+    يُرجع النطاق بدون www (مطلوب لصحة عنوان PAAPI: paapi.amazon.sa).
     """
     match = re.search(r"://(?:www\.)?(amazon\.[a-z.]+)", url, re.IGNORECASE)
     if match:
-        return f"www.{match.group(1).lower()}"
+        return match.group(1).lower()
     return AMAZON_DOMAIN  # احتياطي لو ما قدرنا نتعرف على النطاق
 
 
@@ -66,58 +127,91 @@ def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
 
 def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     """
-    يرجع أقل سعر متاح لمنتج معين بين كل البائعين.
-
-    ⚠️ حاليًا في وضع تجريبي (Mock) — السعر وهمي للاختبار فقط،
-    لكن الرابط حقيقي وشغّال لأنه يستخدم نفس ASIN ونفس نطاق أمازون
-    اللي أرسله المستخدم فعليًا (مو amazon.sa دايمًا بشكل ثابت).
-
-    لما تجهز وصولك لـ Creators API الرسمي، استبدل الكود بالداخل
-    بالاستدعاء الحقيقي لـ OffersV2 وارجع نفس شكل القاموس أدناه.
+    يرجع أقل سعر متاح لمنتج معين عبر PA API v5 الرسمي.
+    يرجع إلى بيانات وهمية تلقائياً إذا كان MOCK_MODE مفعّلاً أو المفاتيح غير مدخلة.
     """
-    if MOCK_MODE:
-        # السعر وهمي، لكن الرابط حقيقي 100% (نفس المنتج ونفس النطاق الصحيح)
+    if MOCK_MODE or AMAZON_ACCESS_KEY == "ضع_مفتاح_Access_Key_هنا":
         base_price = random.randint(50, 900)
+        currency = "SAR" if "sa" in domain else "USD"
         return {
             "asin": asin,
-            "price": base_price,
-            "currency": "SAR",
-            "seller_name": "(⚠️ سعر تجريبي وهمي)",
+            "price": f"{base_price} {currency}",
+            "currency": currency,
+            "seller_name": "بائع في أمازون (⚠️ سعر تجريبي وهمي)",
             "condition": "جديد",
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
 
-    # ============================================================
-    # TODO: استبدل هذا الجزء بالاتصال الحقيقي بـ Creators API
-    # مثال تقريبي (يحتاج مفاتيح ومصادقة حقيقية):
-    #
-    # response = creators_api_client.get_offers(asin=asin)
-    # offers = response["offers"]
-    # if not offers:
-    #     return None
-    # lowest = min(offers, key=lambda o: o["price"])
-    # return {
-    #     "asin": asin,
-    #     "price": lowest["price"],
-    #     "currency": lowest["currency"],
-    #     "seller_name": lowest["seller_name"],
-    #     "condition": lowest["condition"],
-    #     "affiliate_link": build_affiliate_link(asin, domain=domain),
-    # }
-    # ============================================================
-    return None
+    host = f"paapi5.{domain}"
+    uri = "/paapi5/getitems"
+
+    payload_dict = {
+        "ItemIds": [asin],
+        "Resources": [
+            "Offers.Listings.Price",
+            "Offers.Listings.MerchantInfo",
+            "Offers.Listings.Condition",
+            "ItemInfo.Title",
+        ],
+        "PartnerTag": AFFILIATE_TAG,
+        "PartnerType": "Associates",
+        "Marketplace": f"www.{domain}",
+    }
+    payload_str = json.dumps(payload_dict)
+
+    try:
+        headers = sign_amazon_request(
+            host, uri, payload_str, AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY
+        )
+        response = requests.post(
+            f"https://{host}{uri}", data=payload_str, headers=headers, timeout=10
+        )
+
+        if response.status_code != 200:
+            logger.error("PA API returned %s: %s", response.status_code, response.text)
+            return None
+
+        res_data = response.json()
+        items = res_data.get("ItemsResult", {}).get("Items", [])
+        if not items:
+            return None
+
+        item = items[0]
+        listings = item.get("Offers", {}).get("Listings", [])
+        valid_listings = [l for l in listings if l.get("Price", {}).get("Amount")]
+
+        if not valid_listings:
+            return None
+
+        lowest = min(valid_listings, key=lambda x: x["Price"]["Amount"])
+        return {
+            "asin": asin,
+            "title": item.get("ItemInfo", {}).get("Title", {}).get("DisplayValue"),
+            "price": lowest["Price"]["DisplayAmount"],
+            "currency": lowest["Price"]["Currency"],
+            "seller_name": lowest.get("MerchantInfo", {}).get("Name", "أمازون"),
+            "condition": lowest.get("Condition", {}).get("DisplayValue", "جديد"),
+            "affiliate_link": build_affiliate_link(asin, domain=domain),
+        }
+    except Exception as e:
+        logger.error("Error fetching PA API price for %s: %s", asin, e)
+        return None
 
 
 def format_offer_message(offer: dict) -> str:
     """يبني رسالة جاهزة للإرسال في تيليجرام."""
     if not offer:
-        return "❌ ما قدرت ألقى عروض متاحة لهذا المنتج حاليًا."
+        return "❌ ما قدرت ألقى عروض متاحة أو أسعار حقيقية لهذا المنتج حاليًا."
 
+    title_part = (
+        f"📦 *{offer['title'][:60]}...*\n\n" if offer.get("title") else ""
+    )
     return (
-        f"💰 أقل سعر متاح حاليًا:\n\n"
-        f"السعر: {offer['price']} {offer['currency']}\n"
-        f"البائع: {offer['seller_name']}\n"
-        f"الحالة: {offer['condition']}\n\n"
-        f"🛒 اشترِ الآن:\n{offer['affiliate_link']}\n\n"
+        f"{title_part}"
+        f"💰 *أقل سعر حقيقي متاح حالياً:*\n"
+        f"• السعر: `{offer['price']}`\n"
+        f"• البائع: {offer['seller_name']}\n"
+        f"• الحالة: {offer['condition']}\n\n"
+        f"🛒 *رابط الشراء المباشر:*\n{offer['affiliate_link']}\n\n"
         f"_(رابط تسويق بالعمولة)_"
     )
