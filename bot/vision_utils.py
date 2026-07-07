@@ -30,8 +30,8 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         return None
 
     url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        "https://generativelanguage.googleapis.com/v1/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     )
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
@@ -57,23 +57,33 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         ]
     }
 
-    try:
-        response = requests.post(url, json=payload, timeout=20)
-        if response.status_code == 200:
-            result = response.json()
-            text = (
-                result.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-                .strip()
-            )
-            return text or None
-        logger.error("Gemini API status %s: %s", response.status_code, response.text[:200])
-        return None
-    except Exception as e:
-        logger.error("خطأ في Gemini: %s", e)
-        return None
+    import time
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+            if response.status_code == 200:
+                result = response.json()
+                text = (
+                    result.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    .strip()
+                )
+                return text or None
+            elif response.status_code == 429:
+                wait = 5 * (attempt + 1)
+                logger.warning("Gemini rate limit (429)، انتظار %ss ثم إعادة المحاولة %s/3", wait, attempt + 1)
+                time.sleep(wait)
+                continue
+            else:
+                logger.error("Gemini API status %s: %s", response.status_code, response.text[:200])
+                return None
+        except Exception as e:
+            logger.error("خطأ في Gemini: %s", e)
+            return None
+    logger.error("Gemini: فشل بعد 3 محاولات بسبب rate limit")
+    return None
 
 
 def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]:
