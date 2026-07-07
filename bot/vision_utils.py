@@ -31,7 +31,7 @@ def _call_gemini(image_bytes: bytes) -> str | None:
 
     url = (
         "https://generativelanguage.googleapis.com/v1/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
     )
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
