@@ -327,10 +327,14 @@ _ALLOWED_HOSTS = {
     # نطاقات أمازون المباشرة
     "amazon.sa", "amazon.com", "amazon.ae", "amazon.com.sa",
     "www.amazon.sa", "www.amazon.com", "www.amazon.ae",
-    # روابط مختصرة معتمدة
+    # روابط أمازون المختصرة الرسمية
     "amzn.to", "amzn.eu",
     "a.co",
-    "ty.gl",           # روابط تويو (Toyou)
+    "link.amazon.com",   # روابط أمازون الرسمية المختصرة
+    "link.amazon.sa",    # روابط أمازون السعودية
+    "link.amazon.ae",
+    # روابط مختصرة خارجية معتمدة
+    "ty.gl",             # روابط تويو (Toyou)
     "bit.ly",
     "tinyurl.com",
     "t.co",
