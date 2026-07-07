@@ -16,7 +16,10 @@ AMAZON_DOMAIN = os.getenv("AMAZON_DOMAIN", "amazon.sa")
 AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY")
 
-# مفتاح Google Cloud Vision API (اختياري — بدونه يشتغل البوت بوضع تجريبي للصور)
+# مفتاح Gemini API (مجاني من Google AI Studio) — للتعرف على المنتجات في الصور
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# مفتاح Google Cloud Vision API (قديم — استُبدل بـ Gemini)
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 
 # وضع تجريبي: False = أسعار حقيقية من PA API

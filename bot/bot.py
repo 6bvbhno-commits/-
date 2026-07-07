@@ -26,6 +26,8 @@ from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
 )
+# ملاحظة: identify_product_from_image و search_amazon_by_keywords الآن متزامنتان
+# ويجب تشغيلهما عبر run_in_executor
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -100,36 +102,55 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.photo:
         return
 
-    await update.message.reply_text("📸 جاري تحليل الصورة...")
+    await update.message.reply_text("📸 جاري تحليل الصورة بالذكاء الاصطناعي...")
 
     try:
         photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
         photo_bytes = await photo_file.download_as_bytearray()
     except Exception as e:
         logger.error("Failed to download photo: %s", e)
-        await update.message.reply_text(
-            "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية."
-        )
+        await update.message.reply_text("❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.")
         return
 
     try:
-        keywords = await identify_product_from_image(bytes(photo_bytes))
+        loop = asyncio.get_event_loop()
+        product_name = await loop.run_in_executor(
+            None, identify_product_from_image, bytes(photo_bytes)
+        )
     except Exception as e:
         logger.error("Image analysis failed: %s", e)
+        await update.message.reply_text("❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية.")
+        return
+
+    if not product_name:
         await update.message.reply_text(
-            "❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية."
+            "❌ ما قدرت أتعرف على المنتج من الصورة.\n"
+            "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة."
         )
         return
 
-    if not keywords:
-        await update.message.reply_text(
-            "❌ ما قدرت أتعرف على محتوى الصورة. جرب صورة أوضح فيها المنتج بشكل مباشر."
+    await update.message.reply_text(
+        f"🔍 تم التعرف عليه: {product_name}\nجاري البحث في أمازون..."
+    )
+
+    try:
+        loop = asyncio.get_event_loop()
+        offers = await loop.run_in_executor(
+            None, search_amazon_by_keywords, product_name
         )
+    except Exception as e:
+        logger.error("Amazon search failed: %s", e)
+        await update.message.reply_text("❌ حصل خطأ أثناء البحث في أمازون. حاول مرة ثانية.")
         return
 
-    results = search_amazon_by_keywords(keywords)
-    message = format_search_results(results)
-    await update.message.reply_text(message, parse_mode="Markdown")
+    message = format_search_results(product_name, offers)
+    try:
+        await update.message.reply_text(message, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("Markdown send failed, retrying plain: %s", e)
+        # fallback: أرسل بدون تنسيق إذا فيه أحرف خاصة ما اتهربت
+        plain = message.replace("*", "").replace("`", "").replace("_", "").replace("\\", "")
+        await update.message.reply_text(plain)
 
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):

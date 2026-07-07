@@ -1,0 +1,282 @@
+import base64
+import logging
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ==========================================
+# 1. الإعدادات (التوكنات والتاق)
+# ==========================================
+
+# توكن البوت من BotFather
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_البوت_هنا")
+
+# مفتاح جيميناي المجاني للتعرف على الصور (تحصل عليه مجاناً من Google AI Studio)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# تاق الأفلييت الخاص بك
+AFFILIATE_TAG = "rashedalhano-21"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+}
+
+# ==========================================
+# 2. دوال المعالجة المباشرة (روابط وأسعار)
+# ==========================================
+
+
+def resolve_and_get_price(url: str) -> tuple[str, str, str] | None:
+    """تفتح الرابط وتقرأ السعر واسم المنتج مباشرة من الصفحة بدون API رسمي."""
+    try:
+        session = requests.Session()
+        response = session.get(
+            url, headers=HEADERS, allow_redirects=True, timeout=15
+        )
+        final_url = response.url
+
+        asin_match = re.search(r"/dp/([A-Z0-9]{10})", final_url, re.IGNORECASE)
+        if not asin_match:
+            asin_match = re.search(
+                r"/gp/product/([A-Z0-9]{10})", final_url, re.IGNORECASE
+            )
+
+        if not asin_match:
+            return None
+
+        asin = asin_match.group(1).upper()
+        domain_match = re.search(
+            r"://(?:www\.)?(amazon\.[a-z.]+)", final_url, re.IGNORECASE
+        )
+        domain = (
+            domain_match.group(1).lower() if domain_match else "amazon.sa"
+        )
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        title_element = soup.find(id="productTitle")
+        title = title_element.get_text().strip() if title_element else "منتج"
+
+        price = "راجع الرابط"
+        price_selectors = [
+            "span.a-price-whole",
+            "span.apexPriceToPay",
+            "span.a-offscreen",
+        ]
+        for selector in price_selectors:
+            el = soup.select_one(selector)
+            if el and el.get_text().strip():
+                price = el.get_text().strip()
+                break
+
+        return asin, domain, f"{price} (شامل)"
+    except Exception as e:
+        logger.error(f"خطأ قراءة الرابط: {e}")
+        return None
+
+
+# ==========================================
+# 3. دوال الذكاء الاصطناعي وقشط البحث بالصور
+# ==========================================
+
+
+def identify_product_via_gemini(image_bytes: bytes) -> str | None:
+    """تستخدم نموذج جيميناي المجاني للتعرف على المنتج وكتابة اسمه بدقة للبحث عنه."""
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": "ما هو هذا المنتج بدقة؟ أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية لكي أبحث عنه في موقع أمازون. لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
+                    },
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code == 200:
+            result = response.json()
+            text = (
+                result.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
+            return text
+        return None
+    except Exception as e:
+        logger.error(f"خطأ في جيميناي: {e}")
+        return None
+
+
+def search_amazon_by_scraping(query: str) -> list[dict]:
+    """تبحث في أمازون السعودية بالاسم مباشرة وتقشط أول نتائج مع أسعارها وروابطها."""
+    search_url = f"https://www.amazon.sa/s?k={requests.utils.quote(query)}"
+    results = []
+
+    try:
+        response = requests.get(search_url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # البحث عن كروت المنتجات في صفحة البحث
+        items = soup.select('[data-component-type="s-search-result"]')[:3]
+
+        for item in items:
+            title_el = item.select_one("h2 a span")
+            link_el = item.select_one("h2 a")
+            price_el = item.select_one("span.a-price-whole")
+
+            if title_el and link_el:
+                title = title_el.get_text().strip()
+                raw_link = "https://www.amazon.sa" + link_el["href"]
+
+                # استخراج الـ ASIN لتنظيف الرابط وحقن التاق الخاص بك
+                asin_match = re.search(r"/dp/([A-Z0-9]{10})", raw_link, re.IGNORECASE)
+                if asin_match:
+                    asin = asin_match.group(1).upper()
+                    affiliate_link = f"https://www.amazon.sa/dp/{asin}?tag={AFFILIATE_TAG}"
+                else:
+                    affiliate_link = raw_link
+
+                price = (
+                    price_el.get_text().strip() + " ريال"
+                    if price_el
+                    else "غير محدد"
+                )
+
+                results.append(
+                    {
+                        "title": title[:50] + "...",
+                        "price": price,
+                        "link": affiliate_link,
+                    }
+                )
+        return results
+    except Exception as e:
+        logger.error(f"خطأ أثناء كشط البحث: {e}")
+        return []
+
+
+# ==========================================
+# 4. معالجات تيليجرام (Handlers)
+# ==========================================
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 أهلاً بك!\n"
+        "• أرسل رابط منتج مباشر ليعطيك سعره الحالي مع تاقك.\n"
+        "• أو صور أي منتج كاميرا/معرض، وسيقوم البوت بالبحث عنه في أمازون السعودية وجلب أفضل الأسعار مع روابط الأفلييت الخاصة بك فوراً."
+    )
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    await update.message.reply_text("🔎 جاري الدخول للصفحة وقراءة السعر...")
+
+    result = resolve_and_get_price(text)
+    if not result:
+        await update.message.reply_text("⚠️ لم نتمكن من قراءة تفاصيل الرابط.")
+        return
+
+    asin, domain, price = result
+    affiliate_link = f"https://{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+
+    message = (
+        f"💰 *السعر الحالي في الموقع:*\n"
+        f"• السعر: `{price}`\n\n"
+        f"🛒 *رابط الأفلييت المباشر:*\n{affiliate_link}"
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📸 جاري تحليل الصورة بالذكاء الاصطناعي...")
+
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    # التعرف على المنتج بالذكاء الاصطناعي
+    product_name = identify_product_via_gemini(bytes(photo_bytes))
+
+    if not product_name:
+        await update.message.reply_text(
+            "❌ لم أستطع تحديد المنتج من الصورة، تأكد من وضوح الإضاءة أو الشعار."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔍 تم التعرف عليه كـ: *{product_name}*\nجاري البحث عن أفضل عروضه في أمازون..."
+    )
+
+    # البحث المباشر في أمازون وكشط العروض والأسعار الشغالة
+    offers = search_amazon_by_scraping(product_name)
+
+    if not offers:
+        await update.message.reply_text(
+            "❌ لم نجد نتائج مطابقة تماماً حالياً في المتجر."
+        )
+        return
+
+    lines = ["💰 *أفضل الأسعار والعروض المتاحة في أمازون:*\n"]
+    for i, offer in enumerate(offers, start=1):
+        lines.append(
+            f"{i}. *{offer['title']}*\n"
+            f"   • السعر: `{offer['price']}`\n"
+            f"   • الرابط: {offer['link']}\n"
+        )
+    lines.append("_(روابط تسويق بالعمولة مجهزة بتاقك)_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+def main():
+    if TELEGRAM_BOT_TOKEN == "ضع_توكن_البوت_هنا":
+        print("⚠️ يرجى ضبط التوكن.")
+        return
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"https?://\S+"), handle_link
+        )
+    )
+
+    print("🚀 البوت الشامل (أسعار + صور ذكية) شغال الآن بنجاح...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
