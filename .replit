@@ -1,8 +1,8 @@
 modules = ["nodejs-24", "python-base-3.13"]
 
 [deployment]
-router = "application"
-deploymentTarget = "autoscale"
+run = ["sh", "-c", "cd bot && python3 bot.py"]
+deploymentTarget = "vm"
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
