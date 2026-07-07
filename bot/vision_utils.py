@@ -88,53 +88,85 @@ def _call_gemini(image_bytes: bytes) -> str | None:
 
 def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]:
     """
-    يقشط أول 3 نتائج من صفحة البحث في أمازون ويرجع قائمة بالعروض مع روابط أفلييت.
+    يقشط أول 3 نتائج من صفحة البحث في أمازون.
+    يستخدم session مع كوكيز وزيارة الصفحة الرئيسية أولاً لتجاوز الحجب.
     """
-    search_url = f"https://www.{domain}/s?k={requests.utils.quote(query)}"
-    results = []
+    import time
+    from bs4 import BeautifulSoup
 
+    results = []
     try:
-        from bs4 import BeautifulSoup
-        response = requests.get(search_url, headers=_HEADERS, timeout=15)
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        session.cookies.set("i18n-prefs", "SAR", domain=f".{domain}")
+        session.cookies.set("lc-acbsa", "ar_SA", domain=f".{domain}")
+
+        # زيارة الصفحة الرئيسية أولاً للحصول على كوكيز طبيعية
+        session.get(f"https://www.{domain}", timeout=10, allow_redirects=True)
+        time.sleep(0.8)
+
+        search_url = f"https://www.{domain}/s?k={requests.utils.quote(query)}"
+        response = session.get(search_url, timeout=15)
+
         if response.status_code != 200:
-            logger.warning("Search returned status %s for query: %s", response.status_code, query)
+            logger.warning("Search status %s للاستعلام: %s", response.status_code, query)
             return results
 
         html = response.text
-        # كشف الحجب / CAPTCHA
         if any(kw in html.lower() for kw in ("captcha", "robot check", "automated access", "captchacharacters")):
-            logger.warning("Search page blocked (CAPTCHA) for query: %s", query)
+            logger.warning("صفحة البحث محجوبة (CAPTCHA) للاستعلام: %s", query)
             return results
 
         soup = BeautifulSoup(html, "html.parser")
         items = soup.select('[data-component-type="s-search-result"]')[:3]
+
         for item in items:
-            title_el = item.select_one("h2 a span")
+            # العنوان: h2 span أكثر موثوقية من h2 a span
+            title_el = item.select_one("h2 span") or item.select_one("h2 a span")
             link_el  = item.select_one("h2 a")
             price_el = item.select_one("span.a-price-whole")
 
-            if not (title_el and link_el):
+            if not title_el:
                 continue
 
-            title    = title_el.get_text(strip=True)
-            raw_link = f"https://www.{domain}" + link_el.get("href", "")
+            title = title_el.get_text(strip=True)
+            if not title:
+                continue
 
-            asin_match = re.search(r"/dp/([A-Z0-9]{10})", raw_link, re.IGNORECASE)
-            if asin_match:
-                asin = asin_match.group(1).upper()
+            # استخراج ASIN من href أو data-asin
+            asin = item.get("data-asin", "")
+            if not asin and link_el:
+                raw_href = link_el.get("href", "")
+                m = re.search(r"/dp/([A-Z0-9]{10})", raw_href, re.IGNORECASE)
+                if m:
+                    asin = m.group(1).upper()
+
+            if asin:
                 affiliate_link = f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+            elif link_el:
+                affiliate_link = f"https://www.{domain}" + link_el.get("href", "").split("?")[0]
             else:
-                affiliate_link = raw_link
+                continue
 
-            price = (price_el.get_text(strip=True) + " ريال") if price_el else "غير محدد"
+            price_text = price_el.get_text(strip=True) if price_el else ""
+            # تنظيف السعر من الأحرف الزائدة وإضافة الوحدة
+            price_clean = re.sub(r"[^\d.,٠-٩]", "", price_text)
+            price = f"{price_clean} ريال" if price_clean else "غير محدد"
 
-            results.append(
-                {
-                    "title": title[:60] + ("..." if len(title) > 60 else ""),
-                    "price": price,
-                    "link": affiliate_link,
-                }
-            )
+            results.append({
+                "title": title[:60] + ("..." if len(title) > 60 else ""),
+                "price": price,
+                "link": affiliate_link,
+            })
+
     except Exception as e:
         logger.error("خطأ أثناء كشط البحث: %s", e)
 
