@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # ─── حماية من الفيضان: 5 طلبات / 60 ثانية لكل مستخدم ───────────────────────
 _RATE_WINDOW   = 60    # ثانية
-_RATE_MAX      = 5     # أقصى طلبات في النافذة
+_RATE_MAX      = 10    # أقصى طلبات في النافذة
 _user_times: dict[int, list[float]] = defaultdict(list)
 
 def _is_rate_limited(user_id: int) -> bool:
@@ -157,7 +157,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
     except Exception as e:
-        logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e)
+        logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
         await _reply(update, "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية.", parse_mode=None)
         return
 

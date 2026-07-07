@@ -433,10 +433,9 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             logger.info("تجربة نسخة الجوال للـ ASIN %s", asin)
             page_data = _scrape_mobile(asin, domain)
 
-        # --- كلاهما محجوب ---
-        if not page_data:
-            return None
-        if page_data.get("blocked"):
+        # --- كلاهما محجوب أو فشل الاتصال ---
+        if not page_data or page_data.get("blocked"):
+            logger.warning("كلا الوضعين محجوبان للـ ASIN %s — إرجاع رابط الأفلييت", asin)
             return {"blocked": True, "affiliate_link": affiliate_link}
 
         title           = page_data.get("title")
