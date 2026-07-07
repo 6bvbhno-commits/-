@@ -82,7 +82,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔎 جاري حساب وفحص السعر الدقيق من السيرفر...")
 
     try:
-        offer = get_lowest_offer(asin, domain=domain)
+        loop = asyncio.get_event_loop()
+        offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
     except Exception as e:
         logger.error("Failed to fetch offer for ASIN %s: %s", asin, e)
