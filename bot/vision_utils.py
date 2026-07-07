@@ -9,7 +9,7 @@ import logging
 import re
 import threading
 import requests
-from config import GEMINI_API_KEY, SERPAPI_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
 
 # حد Gemini: طلب واحد في المرة — يمنع كل المستخدمين من ضرب الـ 429 بالتزامن
 _GEMINI_SEM = threading.Semaphore(1)
@@ -24,6 +24,61 @@ _HEADERS = {
     ),
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
+
+
+def _call_openai_vision(image_bytes: bytes) -> str | None:
+    """
+    يستخدم GPT-4o-mini عبر Replit OpenAI Integration للتعرف على المنتج.
+    لا يحتاج مفتاح خاص — مدار عبر Replit.
+    """
+    if not OPENAI_BASE_URL or not OPENAI_API_KEY:
+        return None
+    try:
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": (
+                        "ما هو هذا المنتج بدقة؟ "
+                        "أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية "
+                        "لكي أبحث عنه في موقع أمازون. "
+                        "لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
+                    )},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_b64}",
+                        "detail": "low",
+                    }},
+                ],
+            }],
+            "max_tokens": 100,
+        }
+        resp = requests.post(
+            f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.warning("OpenAI vision HTTP %s: %s", resp.status_code, resp.text[:200])
+            return None
+        text = (
+            resp.json()
+            .get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+        if text:
+            logger.info("OpenAI vision نجح: %s", text[:60])
+        return text or None
+    except Exception as exc:
+        logger.error("OpenAI vision exception: %s", exc)
+        return None
 
 
 def _google_lens(image_url: str) -> str | None:
@@ -229,18 +284,25 @@ def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str 
     """
     يتعرف على المنتج من الصورة.
     الأولوية:
-      1. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY + image_url)
-      2. Gemini API (fallback)
+      1. OpenAI GPT-4o-mini vision (Replit integration — موثوق وسريع)
+      2. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY + image_url)
+      3. Gemini API (fallback أخير)
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
-    # ── Google Lens (الأسرع والأموثق) ────────────────────────────────────────
+    # ── OpenAI Vision (الأولوية الأولى) ──────────────────────────────────────
+    result = _call_openai_vision(image_bytes)
+    if result:
+        return result
+    logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل للخطوة التالية")
+
+    # ── Google Lens (الأولوية الثانية) ───────────────────────────────────────
     if image_url and SERPAPI_KEY:
         result = _google_lens(image_url)
         if result:
             return result
         logger.info("Google Lens لم يتعرف — أنتقل لـ Gemini")
 
-    # ── Gemini (fallback) ─────────────────────────────────────────────────────
+    # ── Gemini (fallback أخير) ────────────────────────────────────────────────
     return _call_gemini(image_bytes)
 
 

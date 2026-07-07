@@ -25,5 +25,9 @@ GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 # مفتاح SerpAPI — البديل الجذري للكشط (serpapi.com)
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
+# Replit OpenAI Integration — vision عبر GPT-4o بدون مفتاح خاص
+OPENAI_BASE_URL = os.getenv("AI_INTEGRATIONS_OPENAI_BASE_URL", "")
+OPENAI_API_KEY  = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
+
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False
