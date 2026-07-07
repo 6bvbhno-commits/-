@@ -1,7 +1,8 @@
 """
 كل الدوال المتعلقة بأمازون: استخراج ASIN، بناء رابط أفلييت، وجلب أقل سعر.
-الأسعار تُجلب مباشرة من صفحات أمازون (بدون PA API).
-استراتيجية مزدوجة: نسخة سطح المكتب أولاً ثم نسخة الجوال كـ fallback.
+استراتيجية الأسعار:
+  1. PA API الرسمي (إذا وُجدت المفاتيح) — أسرع وأدق وبدون حجب
+  2. كشط مباشر (fallback) — Desktop → Mobile → offer-listing
 """
 import json
 import logging
@@ -365,14 +366,15 @@ def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
 def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
-    - يتحقق من الـ cache أولاً (90 دقيقة TTL)
-    - يستخدم semaphore لتقييد الطلبات المتزامنة لأمازون
-    - الترتيب: Desktop → Mobile (fallback) → offer-listing للمقارنة
+    الأولوية:
+      1. PA API الرسمي (إذا وُجدت المفاتيح) — بلا حجب
+      2. كشط Desktop → Mobile → offer-listing (fallback)
+    نتيجة ناجحة تُخزَّن 90 دقيقة في الـ cache.
     """
     import time
     cache_key = f"{domain}:{asin}"
 
-    # تحقق من الـ cache
+    # ── تحقق من الـ cache ─────────────────────────────────────────────────────
     with _CACHE_LOCK:
         if cache_key in _CACHE:
             ts, cached = _CACHE[cache_key]
@@ -380,9 +382,26 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("Cache hit للـ ASIN %s", asin)
                 return cached
 
+    # ── PA API (المسار الرئيسي) — فقط لأمازون السعودية ─────────────────────────
+    if domain == "amazon.sa":
+        try:
+            from paapi_utils import get_item_by_asin, paapi_available
+            if paapi_available():
+                logger.info("PA API: أطلب ASIN %s", asin)
+                result = get_item_by_asin(asin)
+                if result:
+                    with _CACHE_LOCK:
+                        _CACHE[cache_key] = (time.time(), result)
+                    return result
+                logger.info("PA API: لا نتيجة، أنتقل للكشط — ASIN %s", asin)
+        except Exception as e:
+            logger.warning("PA API exception: %s — أنتقل للكشط", e)
+    else:
+        logger.info("Domain %s ≠ amazon.sa — أتجاوز PA API وأكشط مباشرة", domain)
+
     affiliate_link = build_affiliate_link(asin, domain)
 
-    # الـ semaphore يمنع أكثر من 4 طلبات متزامنة لأمازون
+    # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
     with _SCRAPE_SEMAPHORE:
         import time
 

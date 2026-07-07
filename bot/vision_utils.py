@@ -203,10 +203,33 @@ def identify_product_from_image(image_bytes: bytes) -> str | None:
 def search_amazon_by_keywords(product_name: str, domain: str = AMAZON_DOMAIN) -> list[dict]:
     """
     يبحث في أمازون بالاسم ويرجع قائمة عروض حقيقية مع أسعار وروابط أفلييت.
+    الأولوية: PA API (إذا وُجدت المفاتيح) → كشط مباشر (fallback).
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
     if not product_name:
         return []
+
+    # ── PA API (المسار الرئيسي) ───────────────────────────────────────────────
+    try:
+        from paapi_utils import search_items, paapi_available
+        if paapi_available():
+            logger.info("PA API SearchItems: %s", product_name)
+            pa_results = search_items(product_name, max_results=5)
+            if pa_results:
+                # حوّل إلى شكل موحّد يتعامل معه format_search_results
+                return [
+                    {
+                        "title": r.get("title") or product_name,
+                        "price": r.get("price") or "غير محدد",
+                        "link":  r.get("affiliate_link", ""),
+                    }
+                    for r in pa_results
+                ]
+            logger.info("PA API: لا نتائج للبحث، أنتقل للكشط")
+    except Exception as e:
+        logger.warning("PA API search exception: %s — أنتقل للكشط", e)
+
+    # ── كشط مباشر (fallback) ─────────────────────────────────────────────────
     return _scrape_amazon_search(product_name, domain=domain)
 
 
