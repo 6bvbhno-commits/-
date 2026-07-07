@@ -323,8 +323,31 @@ def _scrape_offer_listing(asin: str, domain: str) -> list[dict]:
 # الدوال العامة
 # =============================================================
 
+_ALLOWED_HOSTS = {
+    # نطاقات أمازون المباشرة
+    "amazon.sa", "amazon.com", "amazon.ae", "amazon.com.sa",
+    "www.amazon.sa", "www.amazon.com", "www.amazon.ae",
+    # روابط مختصرة معتمدة
+    "amzn.to", "amzn.eu",
+    "a.co",
+    "ty.gl",           # روابط تويو (Toyou)
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "rb.gy",
+}
+
 def resolve_short_link(url: str) -> str:
-    """يحل أي رابط مختصر عبر متابعة إعادة التوجيه."""
+    """
+    يحل أي رابط مختصر عبر متابعة إعادة التوجيه.
+    مقيّد بقائمة نطاقات مسموح بها لمنع SSRF.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().lstrip("www.")
+    if host not in _ALLOWED_HOSTS:
+        logger.warning("resolve_short_link: نطاق غير مسموح به '%s' — تم الرفض", host)
+        return url
     try:
         session = _make_session()
         response = session.get(url, allow_redirects=True, timeout=12)
@@ -334,11 +357,16 @@ def resolve_short_link(url: str) -> str:
         return url
 
 
+def _clean_url(raw: str) -> str:
+    """يُزيل الترقيم الزائد من نهاية الرابط (كالأقواس والنقاط)."""
+    return raw.rstrip(".,;:!?)\"']}")
+
+
 def extract_asin(url: str) -> str | None:
     """يستخرج ASIN من الرابط — يدعم كل الأنماط."""
     url_match = re.search(r"https?://\S+", url)
     if url_match:
-        url = url_match.group(0)
+        url = _clean_url(url_match.group(0))
     patterns = [
         r"/dp/([A-Z0-9]{10})",
         r"/gp/product/([A-Z0-9]{10})",

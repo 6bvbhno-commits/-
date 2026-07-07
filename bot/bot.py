@@ -130,13 +130,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # لو ما لقينا ASIN، غالبًا رابط مختصر — نحاول نفكه عبر إعادة التوجيه
     if not asin:
+        # استخرج الرابط فقط من النص (قد يحتوي النص على كلام + رابط)
+        # وأزل الترقيم الزائد من نهاية الرابط
+        import re as _re
+        _url_match = _re.search(r"https?://\S+", text)
+        url_only = _url_match.group(0).rstrip(".,;:!?)\"']}") if _url_match else text
+
         await _reply(update, "🔗 جاري تتبع الرابط واستخراج التفاصيل...", parse_mode=None)
         try:
             loop = asyncio.get_running_loop()
-            resolved_url = await loop.run_in_executor(None, resolve_short_link, text)
+            resolved_url = await loop.run_in_executor(None, resolve_short_link, url_only)
         except Exception as e:
             logger.error("فشل فك الرابط المختصر: %s", e)
-            resolved_url = text
+            resolved_url = url_only
         asin = extract_asin(resolved_url)
 
     domain = extract_domain(resolved_url)

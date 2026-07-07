@@ -229,6 +229,13 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
         search_url = f"https://www.{domain}/s?k={requests.utils.quote(query)}"
         response = session.get(search_url, timeout=15)
 
+        # إعادة المحاولة مرة واحدة بعد تأخير لو جاء 503 أو 429
+        if response.status_code in (503, 429):
+            logger.warning("Search status %s — إعادة المحاولة بعد 2 ثانية للاستعلام: %s",
+                           response.status_code, query)
+            time.sleep(2)
+            response = session.get(search_url, timeout=15)
+
         if response.status_code != 200:
             logger.warning("Search status %s للاستعلام: %s", response.status_code, query)
             return results
