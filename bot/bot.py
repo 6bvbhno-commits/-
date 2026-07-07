@@ -1,6 +1,6 @@
 """
 البوت الرئيسي — يستقبل روابط منتجات وصور، ويرد بأقل سعر أو حالة التوفر.
-يستخدم مكتبة python-telegram-bot (الإصدار 20+).
+يستخدم مكتبة python-telegram-bot (الإصدار 20+) + Claude AI.
 """
 import asyncio
 import logging
@@ -38,9 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── حماية من الفيضان ────────────────────────────────────────────────────────
+# ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
-_RATE_MAX    = 20   # رُفع من 10 → 20 لاستيعاب الضغط
+_RATE_MAX    = 20
 _user_times: dict[int, list[float]] = defaultdict(list)
 
 def _is_rate_limited(user_id: int) -> bool:
@@ -52,10 +52,18 @@ def _is_rate_limited(user_id: int) -> bool:
     buf.append(now)
     return False
 
-# ─── حد تيليجرام للرسائل ────────────────────────────────────────────────────
-_MAX_MSG = 4096
+# ─── سجل المحادثات لكل مستخدم (آخر 8 رسائل للسياق) ─────────────────────────
+_MAX_HISTORY = 8
+_user_history: dict[int, list[dict]] = defaultdict(list)
 
-# ─── أنماط الروابط المختصرة (تحتاج resolve) ─────────────────────────────────
+def _add_to_history(user_id: int, role: str, content: str) -> None:
+    h = _user_history[user_id]
+    h.append({"role": role, "content": content})
+    if len(h) > _MAX_HISTORY:
+        h[:] = h[-_MAX_HISTORY:]
+
+# ─── ثوابت ───────────────────────────────────────────────────────────────────
+_MAX_MSG       = 4096
 _SHORT_LINK_RE = _re.compile(
     r"https?://(?:amzn\.to|amzn\.eu|a\.co|link\.amazon|ty\.gl|bit\.ly|tinyurl\.com|t\.co|rb\.gy)/",
     _re.IGNORECASE,
@@ -66,7 +74,7 @@ _SHORT_LINK_RE = _re.compile(
 # =============================================================================
 
 async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يُرسل مؤشر "يكتب..." لإشعار المستخدم بأن البوت يعمل."""
+    """يُرسل مؤشر "يكتب..." لإشعار المستخدم فوراً."""
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
@@ -91,8 +99,6 @@ async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown")
                 await update.message.reply_text(plain[:_MAX_MSG])
             except TelegramError as e2:
                 logger.error("فشل إرسال الرسالة: %s", e2)
-        else:
-            pass
 
 
 # =============================================================================
@@ -101,14 +107,18 @@ async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
+    user_id = update.effective_user.id if update.effective_user else 0
+    _user_history[user_id].clear()   # بداية محادثة جديدة
+
     welcome_text = (
         "👋 *أهلاً بك!*\n\n"
         "🏷️ *وش يسوي هذا البوت؟*\n"
         "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين.\n\n"
         "📌 *كيف تستخدمه؟*\n"
         "• 🔗 أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر فوراً\n"
-        "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n\n"
-        "📊 يتذكر البوت تاريخ الأسعار تلقائياً ويبيّن لك اتجاه السعر.\n\n"
+        "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n"
+        "• 💬 اكتب اسم أي منتج ← يبحث عنه مباشرة\n\n"
+        "📊 البوت يحفظ تاريخ الأسعار ويعطيك توصية شراء ذكية.\n\n"
         "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
     )
     if MOCK_MODE:
@@ -120,12 +130,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🆘 *المساعدة*\n\n"
         "• أرسل *رابط منتج أمازون* ← أرد بأرخص سعر ورابط شراء\n"
-        "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n\n"
+        "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n"
+        "• اكتب *اسم أي منتج* ← أبحث عنه مباشرة في أمازون\n"
+        "• اسألني أي سؤال عن التسوق ← أساعدك\n\n"
         "💡 *نصائح للصور:*\n"
-        "  - وضّح الاسم التجاري\n"
-        "  - إضاءة جيدة والجهة الأمامية أفضل\n\n"
+        "  - وضّح الاسم التجاري، إضاءة جيدة، الجهة الأمامية\n\n"
         "📋 *الأوامر:*\n"
-        "/start — رسالة الترحيب\n"
+        "/start — بداية جديدة\n"
         "/help — هذه الرسالة\n\n"
         "⚠️ _الأسعار حية وقد تتغير — تحقق من صفحة المنتج قبل الشراء._"
     )
@@ -133,33 +144,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعالج أي رسالة نصية فيها رابط منتج (طويل أو مختصر بأي نطاق)."""
+    """يعالج أي رسالة نصية فيها رابط منتج أمازون."""
     if not update.message or not update.message.text:
         return
 
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
-        await _reply(
-            update,
-            "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول مجدداً.",
-            parse_mode=None,
-        )
+        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
         return
 
-    # أرسل "يكتب..." فوراً لإشعار المستخدم
     await _typing(update, context)
 
     text = update.message.text.strip()
-
-    # استخراج الرابط من النص (قد يحتوي على كلام + رابط)
     _url_match = _re.search(r"https?://\S+", text)
     url_only   = _url_match.group(0).rstrip(".,;:!?)\"']}") if _url_match else text
 
-    # المحاولة الأولى: ASIN مباشر من الرابط
-    asin        = extract_asin(url_only)
+    asin         = extract_asin(url_only)
     resolved_url = url_only
 
-    # لو ما لقينا ASIN ← غالباً رابط مختصر
     if not asin:
         is_short = bool(_SHORT_LINK_RE.match(url_only))
         if is_short:
@@ -168,7 +170,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             resolved_url = await loop.run_in_executor(None, resolve_short_link, url_only)
         except Exception as e:
-            logger.error("فشل فك الرابط المختصر: %s", e)
+            logger.error("فشل فك الرابط: %s", e)
             resolved_url = url_only
         asin = extract_asin(resolved_url)
 
@@ -183,30 +185,42 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # أرسل "يكتب..." مجدداً قبل جلب السعر (عملية قد تأخذ 3-8 ثوانٍ)
     await _typing(update, context)
     await _reply(update, "🔎 جاري فحص أفضل سعر...", parse_mode=None)
 
     try:
-        loop = asyncio.get_running_loop()
+        loop  = asyncio.get_running_loop()
         offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
 
-        # أضف تاريخ السعر إن وُجد
+        # تاريخ السعر + توصية Claude
         if offer and not offer.get("blocked"):
             try:
-                from price_history import format_history_message
-                history = await loop.run_in_executor(
-                    None, format_history_message, asin, domain
-                )
-                if history:
-                    message = message + "\n\n" + history
+                from price_history import format_history_message, get_history
+                from claude_utils   import price_advice
+
+                history_task  = loop.run_in_executor(None, format_history_message, asin, domain)
+                records_task  = loop.run_in_executor(None, get_history, asin, domain, 30)
+
+                history_msg, records = await asyncio.gather(history_task, records_task)
+
+                if history_msg:
+                    message = message + "\n\n" + history_msg
+
+                # توصية Claude إذا كان عندنا بيانات كافية
+                if records and len(records) >= 3 and offer.get("price_val"):
+                    advice = await loop.run_in_executor(
+                        None, price_advice, offer["price_val"], records
+                    )
+                    if advice:
+                        message = message + "\n" + advice
+
             except Exception as _ph_err:
-                logger.warning("price_history: فشل عرض التاريخ — %s", _ph_err)
+                logger.warning("price/claude block فشل: %s", _ph_err)
 
     except Exception as e:
         logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
-        await _reply(update, "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية.", parse_mode=None)
+        await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
         return
 
     await _reply(update, message)
@@ -219,14 +233,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
-        await _reply(
-            update,
-            "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول مجدداً.",
-            parse_mode=None,
-        )
+        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
         return
 
-    # أرسل "يكتب..." فوراً
     await _typing(update, context)
     await _reply(update, "📸 جاري تحليل الصورة...", parse_mode=None)
 
@@ -242,7 +251,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         photo_bytes = await photo_file.download_as_bytearray()
-
         if len(photo_bytes) > 8 * 1024 * 1024:
             await _reply(update, "⚠️ الصورة كبيرة جداً (أكثر من 8 MB).", parse_mode=None)
             return
@@ -253,7 +261,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        loop = asyncio.get_running_loop()
+        loop         = asyncio.get_running_loop()
         product_name = await loop.run_in_executor(
             None, identify_product_from_image, bytes(photo_bytes), ""
         )
@@ -272,37 +280,83 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _typing(update, context)
-    await _reply(
-        update,
-        f"✅ تم التعرف على المنتج:\n*{product_name}*\n\nجاري البحث في أمازون...",
-    )
+    await _reply(update, f"✅ تم التعرف على المنتج:\n*{product_name}*\n\nجاري البحث في أمازون...", )
 
     try:
-        loop = asyncio.get_running_loop()
+        loop   = asyncio.get_running_loop()
         offers = await loop.run_in_executor(None, search_amazon_by_keywords, product_name)
     except Exception as e:
         logger.error("فشل البحث في أمازون: %s", e)
         await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
         return
 
-    message = format_search_results(product_name, offers)
-    await _reply(update, message)
+    await _reply(update, format_search_results(product_name, offers))
 
 
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي رسالة نصية بدون رابط أمازون."""
-    if not update.message:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يعالج أي نص ليس رابطاً.
+    - إذا كان اسم/وصف منتج → Claude يستخرجه ويبحث عنه في أمازون.
+    - غير ذلك → Claude يرد محادثياً.
+    """
+    if not update.message or not update.message.text:
         return
-    await _reply(
-        update,
-        "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج وأنا أجيبك بأفضل سعر.\n"
-        "اكتب /help لمزيد من التفاصيل.",
-        parse_mode=None,
-    )
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _is_rate_limited(user_id):
+        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
+        return
+
+    await _typing(update, context)
+
+    text = update.message.text.strip()
+    _add_to_history(user_id, "user", text)
+
+    loop = asyncio.get_running_loop()
+
+    # ── هل النص يحتوي على نية شراء؟ ─────────────────────────────────────────
+    try:
+        from claude_utils import extract_product_intent, chat_response
+        product_query = await loop.run_in_executor(None, extract_product_intent, text)
+    except Exception as e:
+        logger.warning("Claude intent فشل: %s", e)
+        product_query = None
+
+    if product_query:
+        # ← مستخدم يريد منتجاً: ابحث عنه في أمازون
+        await _typing(update, context)
+        await _reply(
+            update,
+            f"🔍 جاري البحث عن: *{product_query}*",
+        )
+        try:
+            offers  = await loop.run_in_executor(None, search_amazon_by_keywords, product_query)
+            message = format_search_results(product_query, offers)
+        except Exception as e:
+            logger.error("فشل البحث عن '%s': %s", product_query, e)
+            message = "❌ حصل خطأ أثناء البحث. حاول مرة ثانية."
+
+        await _reply(update, message)
+        _add_to_history(user_id, "assistant", message[:300])
+        return
+
+    # ← رسالة عامة: Claude يرد محادثياً
+    try:
+        from claude_utils import chat_response
+        history  = _user_history[user_id][:-1]   # بدون الرسالة الحالية (مضافة سابقاً)
+        response = await loop.run_in_executor(None, chat_response, text, history)
+    except Exception as e:
+        logger.warning("Claude chat فشل: %s", e)
+        response = (
+            "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة أو 💬 اسم منتج "
+            "وأجيبك بأفضل سعر فوراً."
+        )
+
+    await _reply(update, response, parse_mode=None)
+    _add_to_history(user_id, "assistant", response)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعترض كل استثناء لم يُعالَج."""
     logger.error("استثناء غير متوقع:", exc_info=context.error)
     if isinstance(update, Update) and update.message:
         try:
@@ -336,20 +390,27 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help",  help_command))
+
+    # صور وملفات صور
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
+
+    # روابط أمازون
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
             handle_link,
         )
     )
+
+    # أي نص آخر (اسم منتج، سؤال، محادثة) → Claude
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
-            handle_unknown,
+            handle_text,
         )
     )
+
     app.add_error_handler(error_handler)
 
     print("🚀 البوت شغّال الآن...")

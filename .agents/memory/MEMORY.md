@@ -1,0 +1,2 @@
+- [Amazon link TLD allowlist](amazon-link-tld.md) — `link.amazon` (no TLD) is Amazon's own gTLD; use regex not a fixed set for host checking.
+- [Claude integration](claude-integration.md) — Haiku-4-5 for intent/chat/advice; Anthropic keys via AI_INTEGRATIONS_ANTHROPIC_BASE_URL + AI_INTEGRATIONS_ANTHROPIC_API_KEY.

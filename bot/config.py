@@ -29,5 +29,9 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 OPENAI_BASE_URL = os.getenv("AI_INTEGRATIONS_OPENAI_BASE_URL", "")
 OPENAI_API_KEY  = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
 
+# Replit Anthropic Integration — Claude للمحادثة وتحليل الأسعار
+ANTHROPIC_BASE_URL = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
+ANTHROPIC_API_KEY  = os.getenv("AI_INTEGRATIONS_ANTHROPIC_API_KEY", "")
+
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False
