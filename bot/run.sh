@@ -1,14 +1,52 @@
 #!/bin/bash
-# Watchdog: يُشغّل البوت ويُعيد تشغيله تلقائياً عند أي تعطّل — بعد ثانية واحدة
+# ══════════════════════════════════════════════════════════════
+#  Watchdog — مراقبة البوت كل ثانية وإعادة التشغيل الفوري
+# ══════════════════════════════════════════════════════════════
 cd "$(dirname "$0")"
 
+LOG_FILE="/tmp/bot_watchdog.log"
 RESTART_COUNT=0
+ERROR_COUNT=0
+BOT_PID=""
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE"
+}
+
+start_bot() {
+    python3 bot.py &
+    BOT_PID=$!
+    log "▶️  تشغيل البوت — PID=$BOT_PID (محاولة رقم $((RESTART_COUNT + 1)))"
+}
+
+log "═══════════════════════════════════════"
+log "🚀 Watchdog بدأ المراقبة"
+log "═══════════════════════════════════════"
+
+start_bot
 
 while true; do
-    echo "▶️  [$(date '+%H:%M:%S')] تشغيل البوت (محاولة رقم $((RESTART_COUNT + 1)))..."
-    python3 bot.py
-    EXIT_CODE=$?
-    RESTART_COUNT=$((RESTART_COUNT + 1))
-    echo "⚠️  [$(date '+%H:%M:%S')] البوت توقف (كود الخروج: $EXIT_CODE) — إعادة التشغيل بعد ثانية..."
     sleep 1
+
+    # تحقق إذا كان البوت لا يزال شغّالاً
+    if ! kill -0 "$BOT_PID" 2>/dev/null; then
+        wait "$BOT_PID" 2>/dev/null
+        EXIT_CODE=$?
+        RESTART_COUNT=$((RESTART_COUNT + 1))
+        ERROR_COUNT=$((ERROR_COUNT + 1))
+
+        log "⚠️  البوت توقف — كود الخروج: $EXIT_CODE | إجمالي إعادة التشغيل: $RESTART_COUNT"
+
+        # إذا تعطّل أكثر من 5 مرات في أقل من 30 ثانية → انتظر 10 ثوانٍ منعاً للحلقة اللانهائية
+        if [ "$ERROR_COUNT" -ge 5 ]; then
+            log "🔴 تعطّلات متكررة ($ERROR_COUNT) — انتظار 10 ثوانٍ قبل إعادة المحاولة..."
+            sleep 10
+            ERROR_COUNT=0
+        fi
+
+        log "🔄 إعادة تشغيل البوت..."
+        start_bot
+    fi
 done
