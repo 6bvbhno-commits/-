@@ -1,0 +1,166 @@
+import logging
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ==========================================
+# 1. الإعدادات (التوكن والتاق فقط)
+# ==========================================
+
+# توكن البوت من BotFather
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ضع_توكن_البوت_هنا")
+
+# تاق الأفلييت الخاص بك
+AFFILIATE_TAG = "rashedalhano-21"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# 2. دوال استخراج وقراءة البيانات مباشرة من الصفحة
+# ==========================================
+
+
+def resolve_and_get_price(url: str) -> tuple[str, str, str] | None:
+    """تفتح الرابط كمتصفح حقيقي وتقرأ السعر واسم المنتج مباشرة من الصفحة بدون API."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    }
+    try:
+        # تتبع الرابط إذا كان مختصراً وجلب الصفحة
+        session = requests.Session()
+        response = session.get(
+            url, headers=headers, allow_redirects=True, timeout=15
+        )
+        final_url = response.url
+
+        # استخراج ASIN والنطاق من الرابط النهائي
+        asin_match = re.search(r"/dp/([A-Z0-9]{10})", final_url, re.IGNORECASE)
+        if not asin_match:
+            asin_match = re.search(
+                r"/gp/product/([A-Z0-9]{10})", final_url, re.IGNORECASE
+            )
+
+        if not asin_match:
+            return None
+
+        asin = asin_match.group(1).upper()
+
+        domain_match = re.search(
+            r"://(?:www\.)?(amazon\.[a-z.]+)", final_url, re.IGNORECASE
+        )
+        domain = (
+            domain_match.group(1).lower() if domain_match else "amazon.sa"
+        )
+
+        # قراءة محتوى الصفحة لاستخراج السعر والعنوان
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # محاولة جلب عنوان المنتج
+        title_element = soup.find(id="productTitle")
+        title = title_element.get_text().strip() if title_element else "منتج أمازون"
+
+        # محاولة جلب السعر الفعلي الظاهر للمستخدم (تغطية أشهر أكواد أمازون للأسعار)
+        price = None
+        price_selectors = [
+            "span.a-price-whole",
+            "span.apexPriceToPay",
+            "span.a-offscreen",
+            "#priceblock_ourprice",
+            "#price_inside_buybox",
+        ]
+
+        for selector in price_selectors:
+            price_element = soup.select_one(selector)
+            if price_element:
+                price_text = price_element.get_text().strip()
+                # تنظيف النص ليبقى السعر فقط
+                if price_text:
+                    price = price_text
+                    break
+
+        if not price:
+            price = "راجع الرابط (متغير)"
+
+        return asin, domain, f"{price} (شامل)"
+
+    except Exception as e:
+        logger.error(f"خطأ أثناء قراءة الصفحة: {e}")
+        return None
+
+
+# ==========================================
+# 3. معالجات تيليجرام
+# ==========================================
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 أهلاً بك الراشد!\n"
+        "أرسل لي أي رابط منتج من أمازون (طويل أو من المشاركة)، وبعطيك السعر المكتوب في الموقع مع رابط الأفلييت الخاص بك فوراً."
+    )
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    await update.message.reply_text("🔎 جاري الدخول إلى الصفحة وقراءة السعر الحالي...")
+
+    result = resolve_and_get_price(text)
+
+    if not result:
+        await update.message.reply_text(
+            "⚠️ ما قدرت أستخرج تفاصيل المنتج. تأكد أنه رابط منتج صحيح وشغال في المتصفح."
+        )
+        return
+
+    asin, domain, price = result
+
+    # بناء رابط الأفلييت الخاص بك بالنطاق الصحيح تلقائياً
+    affiliate_link = f"https://{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+
+    message = (
+        f"💰 *السعر الحالي في الموقع:*\n"
+        f"• السعر: `{price}`\n\n"
+        f"🛒 *رابط الشراء المباشر (الأفلييت الخاص بك):*\n"
+        f"{affiliate_link}\n\n"
+        f"_(رابط تسويق بالعمولة)_"
+    )
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+def main():
+    if TELEGRAM_BOT_TOKEN == "ضع_توكن_البوت_هنا":
+        print("⚠️ يرجى وضع توكن التيليجرام في السطر رقم 20 أولاً.")
+        return
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"https?://\S+"), handle_link
+        )
+    )
+
+    print("🚀 البوت المبسط شغال الآن بسحب مباشر من الصفحات...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
