@@ -47,3 +47,11 @@ packages = ["xcodebuild", "zlib"]
 
 [userenv.shared]
 MOCK_MODE = "false"
+
+[[ports]]
+localPort = 8080
+externalPort = 8080
+
+[[ports]]
+localPort = 8081
+externalPort = 80
