@@ -13,6 +13,17 @@ from config import AFFILIATE_TAG, AMAZON_DOMAIN
 
 logger = logging.getLogger(__name__)
 
+# ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
+# يخزن النتائج 90 دقيقة لتجنب طلبات متكررة لأمازون
+import threading
+_CACHE: dict[str, tuple[float, dict]] = {}
+_CACHE_TTL = 90 * 60  # 90 دقيقة بالثواني
+_CACHE_LOCK = threading.Lock()
+
+# ---- حد الطلبات المتزامنة لأمازون ----
+# يمنع إرسال عشرات الطلبات في نفس الوقت للـ IP الواحد
+_SCRAPE_SEMAPHORE = threading.Semaphore(4)  # أقصى 4 طلبات متزامنة
+
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
 
@@ -354,65 +365,88 @@ def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
 def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
-    الترتيب: Desktop → Mobile (fallback) → offer-listing للمقارنة.
+    - يتحقق من الـ cache أولاً (90 دقيقة TTL)
+    - يستخدم semaphore لتقييد الطلبات المتزامنة لأمازون
+    - الترتيب: Desktop → Mobile (fallback) → offer-listing للمقارنة
     """
+    import time
+    cache_key = f"{domain}:{asin}"
+
+    # تحقق من الـ cache
+    with _CACHE_LOCK:
+        if cache_key in _CACHE:
+            ts, cached = _CACHE[cache_key]
+            if time.time() - ts < _CACHE_TTL:
+                logger.info("Cache hit للـ ASIN %s", asin)
+                return cached
+
     affiliate_link = build_affiliate_link(asin, domain)
 
-    # --- المحاولة الأولى: سطح المكتب ---
-    page_data = _scrape_desktop(asin, domain)
+    # الـ semaphore يمنع أكثر من 4 طلبات متزامنة لأمازون
+    with _SCRAPE_SEMAPHORE:
+        import time
 
-    # --- المحاولة الثانية: الجوال إذا تم الحجب ---
-    if not page_data or page_data.get("blocked"):
-        logger.info("تجربة نسخة الجوال للـ ASIN %s", asin)
-        page_data = _scrape_mobile(asin, domain)
+        # --- المحاولة الأولى: سطح المكتب ---
+        page_data = _scrape_desktop(asin, domain)
 
-    # --- كلاهما محجوب ---
-    if not page_data:
-        return None
-    if page_data.get("blocked"):
-        return {"blocked": True, "affiliate_link": affiliate_link}
+        # --- المحاولة الثانية: الجوال إذا تم الحجب ---
+        if not page_data or page_data.get("blocked"):
+            logger.info("تجربة نسخة الجوال للـ ASIN %s", asin)
+            page_data = _scrape_mobile(asin, domain)
 
-    title           = page_data.get("title")
-    main_price_val  = page_data.get("price_val")
-    main_price_text = page_data.get("price_text", "")
-    main_seller     = page_data.get("seller_name", "Amazon.sa")
-    main_is_prime   = page_data.get("is_prime", False)
+        # --- كلاهما محجوب ---
+        if not page_data:
+            return None
+        if page_data.get("blocked"):
+            return {"blocked": True, "affiliate_link": affiliate_link}
 
-    # --- قائمة البائعين للمقارنة ---
-    offers      = _scrape_offer_listing(asin, domain)
-    offer_count = len(offers) if offers else 1
+        title           = page_data.get("title")
+        main_price_val  = page_data.get("price_val")
+        main_price_text = page_data.get("price_text", "")
+        main_seller     = page_data.get("seller_name", "Amazon.sa")
+        main_is_prime   = page_data.get("is_prime", False)
 
-    if offers and offers[0]["price_val"] < (main_price_val or float("inf")):
-        best = offers[0]
-        best_price_val  = best["price_val"]
-        best_price_text = best["price_text"]
-        best_seller     = best["seller_name"]
-        best_is_prime   = best["is_prime"]
-    elif main_price_val:
-        best_price_val  = main_price_val
-        best_price_text = main_price_text
-        best_seller     = main_seller
-        best_is_prime   = main_is_prime
-    else:
-        logger.warning("ما لقينا سعراً للـ ASIN %s", asin)
-        return None
+        # --- قائمة البائعين للمقارنة ---
+        offers      = _scrape_offer_listing(asin, domain)
+        offer_count = len(offers) if offers else 1
 
-    display_price = best_price_text.strip()
-    if display_price and "SAR" not in display_price and "ر.س" not in display_price:
-        display_price = f"{display_price} SAR"
+        if offers and offers[0]["price_val"] < (main_price_val or float("inf")):
+            best = offers[0]
+            best_price_val  = best["price_val"]
+            best_price_text = best["price_text"]
+            best_seller     = best["seller_name"]
+            best_is_prime   = best["is_prime"]
+        elif main_price_val:
+            best_price_val  = main_price_val
+            best_price_text = main_price_text
+            best_seller     = main_seller
+            best_is_prime   = main_is_prime
+        else:
+            logger.warning("ما لقينا سعراً للـ ASIN %s", asin)
+            return None
 
-    return {
-        "asin":        asin,
-        "title":       title,
-        "price":       display_price,
-        "price_val":   best_price_val,
-        "currency":    "SAR",
-        "seller_name": best_seller,
-        "condition":   "جديد",
-        "is_prime":    best_is_prime,
-        "offer_count": offer_count,
-        "affiliate_link": affiliate_link,
-    }
+        display_price = best_price_text.strip()
+        if display_price and "SAR" not in display_price and "ر.س" not in display_price:
+            display_price = f"{display_price} SAR"
+
+        result = {
+            "asin":        asin,
+            "title":       title,
+            "price":       display_price,
+            "price_val":   best_price_val,
+            "currency":    "SAR",
+            "seller_name": best_seller,
+            "condition":   "جديد",
+            "is_prime":    best_is_prime,
+            "offer_count": offer_count,
+            "affiliate_link": affiliate_link,
+        }
+
+        # خزّن في الـ cache
+        with _CACHE_LOCK:
+            _CACHE[cache_key] = (time.time(), result)
+
+        return result
 
 
 def format_offer_message(offer: dict) -> str:
