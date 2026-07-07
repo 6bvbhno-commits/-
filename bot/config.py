@@ -22,5 +22,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # مفتاح Google Cloud Vision API (قديم — استُبدل بـ Gemini)
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 
+# مفتاح SerpAPI — البديل الجذري للكشط (serpapi.com)
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False

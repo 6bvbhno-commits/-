@@ -382,13 +382,27 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("Cache hit للـ ASIN %s", asin)
                 return cached
 
-    # ── PA API (المسار الرئيسي) — فقط لأمازون السعودية ─────────────────────────
+    # ── SerpAPI (الأولوية الأولى) — يدعم أي domain ──────────────────────────────
+    try:
+        from serpapi_utils import get_item_by_asin as serp_get, serpapi_available
+        if serpapi_available():
+            logger.info("SerpAPI: أطلب ASIN %s", asin)
+            result = serp_get(asin, domain=domain)
+            if result:
+                with _CACHE_LOCK:
+                    _CACHE[cache_key] = (time.time(), result)
+                return result
+            logger.info("SerpAPI: لا نتيجة، أنتقل للخطوة التالية — ASIN %s", asin)
+    except Exception as e:
+        logger.warning("SerpAPI exception: %s — أنتقل للخطوة التالية", e)
+
+    # ── PA API (الأولوية الثانية) — فقط لأمازون السعودية ────────────────────
     if domain == "amazon.sa":
         try:
-            from paapi_utils import get_item_by_asin, paapi_available
+            from paapi_utils import get_item_by_asin as pa_get, paapi_available
             if paapi_available():
                 logger.info("PA API: أطلب ASIN %s", asin)
-                result = get_item_by_asin(asin)
+                result = pa_get(asin)
                 if result:
                     with _CACHE_LOCK:
                         _CACHE[cache_key] = (time.time(), result)
@@ -396,8 +410,6 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("PA API: لا نتيجة، أنتقل للكشط — ASIN %s", asin)
         except Exception as e:
             logger.warning("PA API exception: %s — أنتقل للكشط", e)
-    else:
-        logger.info("Domain %s ≠ amazon.sa — أتجاوز PA API وأكشط مباشرة", domain)
 
     affiliate_link = build_affiliate_link(asin, domain)
 

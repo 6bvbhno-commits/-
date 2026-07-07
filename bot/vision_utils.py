@@ -209,14 +209,25 @@ def search_amazon_by_keywords(product_name: str, domain: str = AMAZON_DOMAIN) ->
     if not product_name:
         return []
 
-    # ── PA API (المسار الرئيسي) ───────────────────────────────────────────────
+    # ── SerpAPI (الأولوية الأولى) ────────────────────────────────────────────
     try:
-        from paapi_utils import search_items, paapi_available
+        from serpapi_utils import search_items as serp_search, serpapi_available
+        if serpapi_available():
+            logger.info("SerpAPI search: %s", product_name)
+            results = serp_search(product_name, domain=domain, max_results=5)
+            if results:
+                return results
+            logger.info("SerpAPI: لا نتائج، أنتقل للخطوة التالية")
+    except Exception as e:
+        logger.warning("SerpAPI search exception: %s — أنتقل للخطوة التالية", e)
+
+    # ── PA API (الأولوية الثانية) ─────────────────────────────────────────────
+    try:
+        from paapi_utils import search_items as pa_search, paapi_available
         if paapi_available():
             logger.info("PA API SearchItems: %s", product_name)
-            pa_results = search_items(product_name, max_results=5)
+            pa_results = pa_search(product_name, max_results=5)
             if pa_results:
-                # حوّل إلى شكل موحّد يتعامل معه format_search_results
                 return [
                     {
                         "title": r.get("title") or product_name,
@@ -229,7 +240,7 @@ def search_amazon_by_keywords(product_name: str, domain: str = AMAZON_DOMAIN) ->
     except Exception as e:
         logger.warning("PA API search exception: %s — أنتقل للكشط", e)
 
-    # ── كشط مباشر (fallback) ─────────────────────────────────────────────────
+    # ── كشط مباشر (fallback أخير) ────────────────────────────────────────────
     return _scrape_amazon_search(product_name, domain=domain)
 
 
