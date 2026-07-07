@@ -323,33 +323,31 @@ def _scrape_offer_listing(asin: str, domain: str) -> list[dict]:
 # الدوال العامة
 # =============================================================
 
-_ALLOWED_HOSTS = {
-    # نطاقات أمازون المباشرة
-    "amazon.sa", "amazon.com", "amazon.ae", "amazon.com.sa",
-    "www.amazon.sa", "www.amazon.com", "www.amazon.ae",
-    # روابط أمازون المختصرة الرسمية
-    "amzn.to", "amzn.eu",
-    "a.co",
-    "link.amazon.com",   # روابط أمازون الرسمية المختصرة
-    "link.amazon.sa",    # روابط أمازون السعودية
-    "link.amazon.ae",
-    # روابط مختصرة خارجية معتمدة
-    "ty.gl",             # روابط تويو (Toyou)
-    "bit.ly",
-    "tinyurl.com",
-    "t.co",
-    "rb.gy",
+_SHORTENER_HOSTS = {
+    "amzn.to", "amzn.eu", "a.co",
+    "ty.gl", "bit.ly", "tinyurl.com", "t.co", "rb.gy",
 }
+
+# regex: يقبل أي نطاق أمازون بكل أشكاله (amazon.sa / link.amazon.com / link.amazon / ...)
+_AMAZON_HOST_RE = re.compile(
+    r"(?:^|\.)amazon(?:\.[a-z]{2,6}(?:\.[a-z]{2,3})?)?$"
+)
+
+
+def _is_allowed_host(host: str) -> bool:
+    """يتحقق إذا كان النطاق مسموحاً به (أمازون أو مختصر معروف)."""
+    h = host.lower().removeprefix("www.")
+    return h in _SHORTENER_HOSTS or bool(_AMAZON_HOST_RE.search(h))
+
 
 def resolve_short_link(url: str) -> str:
     """
     يحل أي رابط مختصر عبر متابعة إعادة التوجيه.
-    مقيّد بقائمة نطاقات مسموح بها لمنع SSRF.
+    مقيّد بنطاقات أمازون + روابط مختصرة معتمدة فقط (SSRF protection).
     """
     from urllib.parse import urlparse
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().lstrip("www.")
-    if host not in _ALLOWED_HOSTS:
+    host = urlparse(url).netloc.lower()
+    if not _is_allowed_host(host):
         logger.warning("resolve_short_link: نطاق غير مسموح به '%s' — تم الرفض", host)
         return url
     try:
