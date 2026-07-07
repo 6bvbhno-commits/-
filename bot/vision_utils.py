@@ -23,16 +23,22 @@ _HEADERS = {
 
 def _call_gemini(image_bytes: bytes) -> str | None:
     """
-    استدعاء متزامن لـ Gemini 1.5 Flash — يُنفَّذ عبر run_in_executor.
-    يرجع اسم المنتج للبحث، أو None إذا فشل.
+    استدعاء متزامن لـ Gemini — يجرّب عدة موديلات بالترتيب كـ fallback.
+    يُنفَّذ عبر run_in_executor.
     """
     if not GEMINI_API_KEY:
         return None
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1/models/"
-        f"gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
-    )
+    import time
+
+    # قائمة الموديلات بالترتيب — إذا فشل الأول يجرّب الثاني وهكذا
+    models = [
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    ]
+
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "contents": [
@@ -57,32 +63,40 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         ]
     }
 
-    import time
-    for attempt in range(3):
-        try:
-            response = requests.post(url, json=payload, timeout=20)
-            if response.status_code == 200:
-                result = response.json()
-                text = (
-                    result.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                    .strip()
-                )
-                return text or None
-            elif response.status_code == 429:
-                wait = 5 * (attempt + 1)
-                logger.warning("Gemini rate limit (429)، انتظار %ss ثم إعادة المحاولة %s/3", wait, attempt + 1)
-                time.sleep(wait)
-                continue
-            else:
-                logger.error("Gemini API status %s: %s", response.status_code, response.text[:200])
-                return None
-        except Exception as e:
-            logger.error("خطأ في Gemini: %s", e)
-            return None
-    logger.error("Gemini: فشل بعد 3 محاولات بسبب rate limit")
+    for model in models:
+        url = (
+            "https://generativelanguage.googleapis.com/v1/models/"
+            f"{model}:generateContent?key={GEMINI_API_KEY}"
+        )
+        for attempt in range(2):  # محاولتان لكل موديل
+            try:
+                response = requests.post(url, json=payload, timeout=20)
+                if response.status_code == 200:
+                    result = response.json()
+                    text = (
+                        result.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                        .strip()
+                    )
+                    if text:
+                        logger.info("Gemini نجح مع موديل: %s", model)
+                        return text
+                    break  # رد فارغ — جرّب الموديل التالي
+                elif response.status_code in (429, 503):
+                    wait = 4 * (attempt + 1)
+                    logger.warning("Gemini %s (%s)، انتظار %ss", response.status_code, model, wait)
+                    time.sleep(wait)
+                    continue  # أعد المحاولة مع نفس الموديل
+                else:
+                    logger.warning("Gemini %s للموديل %s — تجربة التالي", response.status_code, model)
+                    break  # خطأ آخر — جرّب الموديل التالي
+            except Exception as e:
+                logger.error("خطأ في Gemini (%s): %s", model, e)
+                break
+
+    logger.error("Gemini: فشلت جميع الموديلات")
     return None
 
 
