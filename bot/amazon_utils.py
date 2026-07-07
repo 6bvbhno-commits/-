@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+import threading
 import requests
 from bs4 import BeautifulSoup
 from config import AFFILIATE_TAG, AMAZON_DOMAIN
@@ -15,10 +16,10 @@ from config import AFFILIATE_TAG, AMAZON_DOMAIN
 logger = logging.getLogger(__name__)
 
 # ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
-# يخزن النتائج 90 دقيقة لتجنب طلبات متكررة لأمازون
-import threading
+# يخزن النتائج 90 دقيقة؛ الحد الأقصى 500 إدخال لمنع التضخم في الذاكرة
 _CACHE: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL = 90 * 60  # 90 دقيقة بالثواني
+_CACHE_TTL  = 90 * 60   # 90 دقيقة بالثواني
+_CACHE_MAX  = 500        # أقصى عدد إدخالات قبل الحذف
 _CACHE_LOCK = threading.Lock()
 
 # ---- حد الطلبات المتزامنة لأمازون ----
@@ -363,15 +364,25 @@ def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
     return f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
 
 
+def _cache_set(key: str, value: dict) -> None:
+    """يُخزّن في الـ cache مع حذف الإدخالات القديمة إذا تجاوز الحد الأقصى."""
+    with _CACHE_LOCK:
+        if len(_CACHE) >= _CACHE_MAX:
+            # احذف أقدم 10% من الإدخالات (الأقدم بالوقت)
+            to_delete = sorted(_CACHE, key=lambda k: _CACHE[k][0])[: _CACHE_MAX // 10]
+            for k in to_delete:
+                del _CACHE[k]
+        _CACHE[key] = (time.time(), value)
+
+
 def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
     الأولوية:
       1. PA API الرسمي (إذا وُجدت المفاتيح) — بلا حجب
       2. كشط Desktop → Mobile → offer-listing (fallback)
-    نتيجة ناجحة تُخزَّن 90 دقيقة في الـ cache.
+    نتيجة ناجحة تُخزَّن 90 دقيقة في الـ cache (حد أقصى 500 إدخال).
     """
-    import time
     cache_key = f"{domain}:{asin}"
 
     # ── تحقق من الـ cache ─────────────────────────────────────────────────────
@@ -389,8 +400,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             logger.info("SerpAPI: أطلب ASIN %s", asin)
             result = serp_get(asin, domain=domain)
             if result:
-                with _CACHE_LOCK:
-                    _CACHE[cache_key] = (time.time(), result)
+                _cache_set(cache_key, result)
                 return result
             logger.info("SerpAPI: لا نتيجة، أنتقل للخطوة التالية — ASIN %s", asin)
     except Exception as e:
@@ -404,8 +414,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 logger.info("PA API: أطلب ASIN %s", asin)
                 result = pa_get(asin)
                 if result:
-                    with _CACHE_LOCK:
-                        _CACHE[cache_key] = (time.time(), result)
+                    _cache_set(cache_key, result)
                     return result
                 logger.info("PA API: لا نتيجة، أنتقل للكشط — ASIN %s", asin)
         except Exception as e:
@@ -474,10 +483,15 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         }
 
         # خزّن في الـ cache
-        with _CACHE_LOCK:
-            _CACHE[cache_key] = (time.time(), result)
-
+        _cache_set(cache_key, result)
         return result
+
+
+def _esc(text: str) -> str:
+    """يهرّب أحرف Markdown v1 الخاصة في النص الديناميكي."""
+    for ch in r"_*`[":
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 def format_offer_message(offer: dict) -> str:
@@ -494,17 +508,21 @@ def format_offer_message(offer: dict) -> str:
             f"شوف السعر مباشرة:\n{offer['affiliate_link']}"
         )
 
-    title_part   = f"📦 *{offer['title'][:70]}*\n\n" if offer.get("title") else ""
+    raw_title    = (offer.get("title") or "")[:70]
+    title_part   = f"📦 *{_esc(raw_title)}*\n\n" if raw_title else ""
     prime_badge  = " 🔵 Prime" if offer.get("is_prime") else ""
     offer_count  = offer.get("offer_count", 1)
     sellers_note = f"_(من بين {offer_count} بائع متاح)_\n" if offer_count > 1 else ""
+    safe_price   = _esc(str(offer.get("price", "")))
+    safe_seller  = _esc(str(offer.get("seller_name", "Amazon.sa")))
+    safe_cond    = _esc(str(offer.get("condition", "جديد")))
 
     return (
         f"{title_part}"
         f"🏷️ *أرخص سعر متاح الآن:*\n"
-        f"• السعر: `{offer['price']}`\n"
-        f"• البائع: {offer['seller_name']}{prime_badge}\n"
-        f"• الحالة: {offer['condition']}\n"
+        f"• السعر: `{safe_price}`\n"
+        f"• البائع: {safe_seller}{prime_badge}\n"
+        f"• الحالة: {safe_cond}\n"
         f"{sellers_note}\n"
         f"🛒 *رابط الشراء:*\n{offer['affiliate_link']}\n\n"
         f"_(رابط تسويق بالعمولة)_"

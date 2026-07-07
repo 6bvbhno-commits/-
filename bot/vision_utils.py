@@ -14,6 +14,9 @@ from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY,
 # حد Gemini: طلب واحد في المرة — يمنع كل المستخدمين من ضرب الـ 429 بالتزامن
 _GEMINI_SEM = threading.Semaphore(1)
 
+# حد OpenAI Vision: أقصى 3 طلبات متزامنة لتجنب الضغط على الـ proxy
+_OPENAI_SEM = threading.Semaphore(3)
+
 logger = logging.getLogger(__name__)
 
 _HEADERS = {
@@ -33,6 +36,13 @@ def _call_openai_vision(image_bytes: bytes) -> str | None:
     """
     if not OPENAI_BASE_URL or not OPENAI_API_KEY:
         return None
+    # حد الطلبات المتزامنة — يمنع إغراق الـ proxy
+    with _OPENAI_SEM:
+        return _call_openai_vision_inner(image_bytes)
+
+
+def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
+    """الجسم الفعلي لطلب OpenAI — يُستدعى داخل السيمافور فقط."""
     try:
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         payload = {

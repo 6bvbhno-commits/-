@@ -4,7 +4,10 @@
 """
 import asyncio
 import logging
+import time as _time
+from collections import defaultdict
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,8 +29,6 @@ from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
 )
-# ملاحظة: identify_product_from_image و search_amazon_by_keywords الآن متزامنتان
-# ويجب تشغيلهما عبر run_in_executor
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,6 +36,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── حماية من الفيضان: 5 طلبات / 60 ثانية لكل مستخدم ───────────────────────
+_RATE_WINDOW   = 60    # ثانية
+_RATE_MAX      = 5     # أقصى طلبات في النافذة
+_user_times: dict[int, list[float]] = defaultdict(list)
+
+def _is_rate_limited(user_id: int) -> bool:
+    now  = _time.monotonic()
+    buf  = _user_times[user_id]
+    buf[:] = [t for t in buf if now - t < _RATE_WINDOW]
+    if len(buf) >= _RATE_MAX:
+        return True
+    buf.append(now)
+    return False
+
+# ─── حد تيليجرام للرسائل ────────────────────────────────────────────────────
+_MAX_MSG = 4096
+
+async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown") -> None:
+    """يرسل رسالة مع تقليم تلقائي إذا تجاوزت حد تيليجرام."""
+    if not update.message:
+        return
+    if len(text) > _MAX_MSG:
+        text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة لطولها)_"
+    try:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+    except TelegramError as e:
+        # إذا فشل Markdown، أعد الإرسال نصاً عادياً
+        if parse_mode:
+            plain = text.replace("*", "").replace("`", "").replace("_", "").replace("\\", "")
+            try:
+                await update.message.reply_text(plain[:_MAX_MSG])
+            except TelegramError as e2:
+                logger.error("فشل إرسال الرسالة حتى بدون Markdown: %s", e2)
+        else:
+            logger.error("فشل إرسال الرسالة: %s", e)
+
+
+# ─── المعالجات ───────────────────────────────────────────────────────────────
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب — تحتوي على إفصاح الأفلييت الإلزامي."""
@@ -49,13 +88,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if MOCK_MODE:
         welcome_text += "\n\n⚠️ *وضع تجريبي مفعّل حاليًا* — الأسعار والنتائج وهمية للاختبار فقط."
+    await _reply(update, welcome_text)
 
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "🆘 *المساعدة*\n\n"
+        "• أرسل *رابط منتج أمازون* (طويل أو مختصر) ← أرد بأرخص سعر ورابط شراء\n"
+        "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n\n"
+        "💡 *نصائح للصور:*\n"
+        "  - وضّح الاسم التجاري في الصورة\n"
+        "  - تأكد من الإضاءة الجيدة\n"
+        "  - الجهة الأمامية من العبوة أفضل\n\n"
+        "📋 *الأوامر:*\n"
+        "/start — رسالة الترحيب\n"
+        "/help — هذه الرسالة\n\n"
+        "⚠️ الأسعار حية وقد تتغير، تحقق دائماً من صفحة المنتج قبل الشراء."
+    )
+    await _reply(update, help_text)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي رسالة نصية فيها رابط منتج (طويل أو مختصر بأي نطاق)."""
     if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _is_rate_limited(user_id):
+        await _reply(
+            update,
+            "⏳ أرسلت طلبات كثيرة بسرعة. انتظر دقيقة واحدة ثم حاول مجدداً.",
+            parse_mode=None,
+        )
         return
 
     text = update.message.text.strip()
@@ -66,127 +130,200 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # لو ما لقينا ASIN، غالبًا رابط مختصر — نحاول نفكه عبر إعادة التوجيه
     if not asin:
-        await update.message.reply_text("🔗 جاري تتبع الرابط واستخراج التفاصيل...")
+        await _reply(update, "🔗 جاري تتبع الرابط واستخراج التفاصيل...", parse_mode=None)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             resolved_url = await loop.run_in_executor(None, resolve_short_link, text)
         except Exception as e:
-            logger.error("Failed to resolve short link: %s", e)
+            logger.error("فشل فك الرابط المختصر: %s", e)
             resolved_url = text
         asin = extract_asin(resolved_url)
 
     domain = extract_domain(resolved_url)
 
     if not asin:
-        await update.message.reply_text(
-            "⚠️ حتى بعد محاولة فك الرابط، ما قدرت ألقى رقم منتج (ASIN) واضح.\n"
-            "جرب تفتح الرابط بالمتصفح وتنسخه من شريط العنوان مباشرة بدل زر المشاركة."
+        await _reply(
+            update,
+            "⚠️ حتى بعد محاولة فك الرابط، ما قدرت ألقى رقم منتج (ASIN).\n"
+            "جرب تفتح الرابط بالمتصفح وتنسخه من شريط العنوان مباشرة.",
+            parse_mode=None,
         )
         return
 
-    await update.message.reply_text("🔎 جاري حساب وفحص السعر الدقيق من السيرفر...")
+    await _reply(update, "🔎 جاري حساب وفحص السعر الدقيق...", parse_mode=None)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
     except Exception as e:
-        logger.error("Failed to fetch offer for ASIN %s: %s", asin, e)
-        await update.message.reply_text(
-            "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية."
-        )
+        logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e)
+        await _reply(update, "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية.", parse_mode=None)
         return
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await _reply(update, message)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعالج أي صورة يرسلها المستخدم (من الكاميرا أو المعرض — نفس المعالجة)."""
-    if not update.message or not update.message.photo:
+    """يعالج أي صورة يرسلها المستخدم (من الكاميرا أو المعرض أو ملف)."""
+    if not update.message:
         return
 
-    await update.message.reply_text("📸 جاري تحليل الصورة بالذكاء الاصطناعي...")
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _is_rate_limited(user_id):
+        await _reply(
+            update,
+            "⏳ أرسلت طلبات كثيرة بسرعة. انتظر دقيقة واحدة ثم حاول مجدداً.",
+            parse_mode=None,
+        )
+        return
+
+    await _reply(update, "📸 جاري تحليل الصورة بالذكاء الاصطناعي...", parse_mode=None)
 
     try:
-        photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
-        # URL الصورة من تيليجرام — يُمرَّر لـ Google Lens
-        image_url  = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{photo_file.file_path}"
+        # صورة عادية
+        if update.message.photo:
+            photo_file = await update.message.photo[-1].get_file()
+        # ملف صورة (document)
+        elif update.message.document and update.message.document.mime_type and \
+                update.message.document.mime_type.startswith("image/"):
+            photo_file = await update.message.document.get_file()
+        else:
+            await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
+            return
+
+        # لا نُمرّر URL التيليجرام لأي خدمة خارجية — يحتوي على التوكن
+        # Google Lens تحتاج URL عام؛ نتجنبها بتمرير سلسلة فارغة
         photo_bytes = await photo_file.download_as_bytearray()
+
+        # حد الحجم: 8 MB — صور أكبر من هذا نادرة ونرفضها لتوفير الوقت
+        if len(photo_bytes) > 8 * 1024 * 1024:
+            await _reply(
+                update,
+                "⚠️ الصورة كبيرة جداً. أرسل صورة أصغر من 8 MB.",
+                parse_mode=None,
+            )
+            return
+
     except Exception as e:
-        logger.error("Failed to download photo: %s", e)
-        await update.message.reply_text("❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.")
+        logger.error("فشل تحميل الصورة: %s", e)
+        await _reply(update, "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.", parse_mode=None)
         return
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         product_name = await loop.run_in_executor(
-            None, identify_product_from_image, bytes(photo_bytes), image_url
+            None, identify_product_from_image, bytes(photo_bytes), ""
         )
     except Exception as e:
-        logger.error("Image analysis failed: %s", e)
-        await update.message.reply_text("❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية.")
+        logger.error("فشل تحليل الصورة: %s", e)
+        await _reply(update, "❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية.", parse_mode=None)
         return
 
     if not product_name:
-        await update.message.reply_text(
+        await _reply(
+            update,
             "❌ ما قدرت أتعرف على المنتج من الصورة.\n"
-            "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة."
+            "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة.",
+            parse_mode=None,
         )
         return
 
-    await update.message.reply_text(
-        f"🔍 تم التعرف عليه: {product_name}\nجاري البحث في أمازون..."
+    await _reply(
+        update,
+        f"🔍 تم التعرف عليه: {product_name}\nجاري البحث في أمازون...",
+        parse_mode=None,
     )
 
     try:
-        loop = asyncio.get_event_loop()
-        offers = await loop.run_in_executor(
-            None, search_amazon_by_keywords, product_name
-        )
+        loop = asyncio.get_running_loop()
+        offers = await loop.run_in_executor(None, search_amazon_by_keywords, product_name)
     except Exception as e:
-        logger.error("Amazon search failed: %s", e)
-        await update.message.reply_text("❌ حصل خطأ أثناء البحث في أمازون. حاول مرة ثانية.")
+        logger.error("فشل البحث في أمازون: %s", e)
+        await _reply(update, "❌ حصل خطأ أثناء البحث في أمازون. حاول مرة ثانية.", parse_mode=None)
         return
 
     message = format_search_results(product_name, offers)
-    try:
-        await update.message.reply_text(message, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning("Markdown send failed, retrying plain: %s", e)
-        # fallback: أرسل بدون تنسيق إذا فيه أحرف خاصة ما اتهربت
-        plain = message.replace("*", "").replace("`", "").replace("_", "").replace("\\", "")
-        await update.message.reply_text(plain)
+    await _reply(update, message)
 
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي رسالة نصية ما فيها رابط أمازون واضح."""
-    await update.message.reply_text(
-        "أرسل لي رابط منتج من أمازون 🔗 عشان أساعدك."
+    """أي رسالة نصية ما فيها رابط أمازون."""
+    if not update.message:
+        return
+    await _reply(
+        update,
+        "أرسل لي رابط منتج من أمازون 🔗 أو صورة منتج 📸 عشان أساعدك.\n"
+        "اكتب /help لمزيد من التفاصيل.",
+        parse_mode=None,
     )
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعترض كل استثناء لم يُعالَج ويسجّله، ثم يُبلّغ المستخدم بهدوء."""
+    logger.error("استثناء غير متوقع:", exc_info=context.error)
+    if isinstance(update, Update) and update.message:
+        try:
+            await update.message.reply_text(
+                "⚠️ حصل خطأ غير متوقع. حاول مرة أخرى أو أرسل /start."
+            )
+        except Exception:
+            pass
+
+
+# ─── نقطة الانطلاق ───────────────────────────────────────────────────────────
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("⚠️  لازم تحط توكن البوت الحقيقي في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
+        print("⚠️  لازم تحط توكن البوت في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
         return
 
-    # طباعة واضحة لحالة الإعدادات الحالية عشان تتأكد بسرعة بدون ما تدور بالملفات
     print("=" * 50)
-    print(f"📊 MOCK_MODE (وضع الأسعار التجريبي): {MOCK_MODE}")
-    print(f"   {'⚠️  الأسعار وهمية للاختبار' if MOCK_MODE else '🔴 يحاول يجيب أسعار حقيقية (يحتاج API معتمد)'}")
+    print(f"📊 MOCK_MODE: {MOCK_MODE}")
+    print(f"   {'⚠️  الأسعار وهمية للاختبار' if MOCK_MODE else '🔴 أسعار حقيقية'}")
     print("=" * 50)
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)   # معالجة متزامنة لمستخدمين مختلفين
+        .build()
+    )
 
+    # الأوامر
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help",  help_command))
+
+    # الصور والملفات
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(
-        MessageHandler(filters.TEXT & filters.Regex(r"https?://\S+"), handle_link)
+        MessageHandler(
+            filters.Document.IMAGE,
+            handle_photo,
+        )
     )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
 
-    print("🚀 البوت شغّال الآن... اضغط Ctrl+C للإيقاف")
-    app.run_polling(drop_pending_updates=True)
+    # الروابط النصية — فلتر الرسائل المحرَّرة حتى لا تُعالَج مرتين
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
+            handle_link,
+        )
+    )
+
+    # النصوص العادية
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
+            handle_unknown,
+        )
+    )
+
+    # معالج الأخطاء العام
+    app.add_error_handler(error_handler)
+
+    print("🚀 البوت شغّال الآن...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
