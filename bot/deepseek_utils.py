@@ -79,16 +79,36 @@ def _call(model: str, messages: list[dict],
         "stream":     False,
     }
 
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+
+    resp = None
+    for attempt in range(2):   # محاولتان عند ConnectionReset
+        try:
+            resp = requests.post(
+                _BASE_URL, headers=headers, json=payload, timeout=_TIMEOUT,
+            )
+            break   # نجح
+        except requests.Timeout:
+            logger.warning("DeepSeek: timeout بعد %ds", _TIMEOUT)
+            return None
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if attempt == 0:
+                import time as _t; _t.sleep(1)
+                continue
+            logger.error("DeepSeek exception (retry فشل): %s", e)
+            return None
+        except Exception as e:
+            logger.error("DeepSeek exception: %s", e)
+            return None
+
+    if resp is None:
+        return None
+
     try:
-        resp = requests.post(
-            _BASE_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type":  "application/json",
-            },
-            json=payload,
-            timeout=_TIMEOUT,
-        )
         if resp.status_code == 402:
             logger.warning("DeepSeek: رصيد منتهٍ (402)")
             return None
@@ -99,8 +119,7 @@ def _call(model: str, messages: list[dict],
             logger.warning("DeepSeek HTTP %s: %s", resp.status_code, resp.text[:150])
             return None
 
-        data = resp.json()
-
+        data    = resp.json()
         choice  = data.get("choices", [{}])[0]
         message = choice.get("message", {})
         text    = message.get("content", "").strip()
@@ -109,11 +128,10 @@ def _call(model: str, messages: list[dict],
         if not text:
             reasoning = message.get("reasoning_content", "").strip()
             if reasoning:
-                # آخر جملة غير فارغة هي الاستنتاج النهائي
                 lines = [l.strip() for l in reasoning.split("\n") if l.strip()]
                 text  = lines[-1] if lines else ""
                 if text:
-                    logger.info("DeepSeek R1: استُخرج الجواب من reasoning_content")
+                    logger.info("DeepSeek R1: استُخرج من reasoning_content")
 
         if not text:
             logger.warning("DeepSeek: رد فارغ")
@@ -122,11 +140,8 @@ def _call(model: str, messages: list[dict],
         logger.info("DeepSeek (%s): نجح (%d حرف)", model, len(text))
         return text
 
-    except requests.Timeout:
-        logger.warning("DeepSeek: timeout بعد %ds", _TIMEOUT)
-        return None
     except Exception as e:
-        logger.error("DeepSeek exception: %s", e)
+        logger.error("DeepSeek parse exception: %s", e)
         return None
 
 

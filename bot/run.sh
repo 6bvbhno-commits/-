@@ -25,6 +25,12 @@ log "═════════════════════════
 log "🚀 Watchdog بدأ المراقبة"
 log "═══════════════════════════════════════"
 
+# شغّل Auto-Healer في الخلفية
+if [ -f "auto_healer.sh" ]; then
+    bash auto_healer.sh &
+    log "🛡️  Auto-Healer شغّال في الخلفية (PID=$!)"
+fi
+
 start_bot
 
 while true; do

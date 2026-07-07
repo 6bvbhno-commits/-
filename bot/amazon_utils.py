@@ -27,39 +27,32 @@ _SCRAPE_SEMAPHORE = threading.Semaphore(10)  # رُفع من 6 → 10 لاستي
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
 
-# ---- User-Agents متنوعة ----
-_UA_DESKTOP = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-_UA_MOBILE = (
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Mobile Safari/537.36"
-)
+# ---- User-Agents مُدوَّرة — تتغير لكل طلب لتقليل الحجب ----
+import random as _random
 
-_HEADERS_DESKTOP = {
-    "User-Agent": _UA_DESKTOP,
-    "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
-    "sec-fetch-user": "?1",
-}
+_UA_POOL_DESKTOP = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
 
-_HEADERS_MOBILE = {
-    "User-Agent": _UA_MOBILE,
-    "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-}
+_UA_POOL_MOBILE = [
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1",
+]
+
+_ACCEPT_LANGS = [
+    "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ar-SA,ar;q=0.9,en;q=0.8",
+    "ar,en-US;q=0.9,en;q=0.8",
+]
 
 
 # =============================================================
@@ -67,11 +60,33 @@ _HEADERS_MOBILE = {
 # =============================================================
 
 def _make_session(mobile: bool = False, domain: str = "amazon.sa") -> requests.Session:
-    """يُنشئ جلسة HTTP بترويسات مناسبة وكوكيز أمازون."""
+    """يُنشئ جلسة HTTP بترويسات مُدوَّرة عشوائياً لتجنب الحجب."""
+    ua   = _random.choice(_UA_POOL_MOBILE if mobile else _UA_POOL_DESKTOP)
+    lang = _random.choice(_ACCEPT_LANGS)
     s = requests.Session()
-    s.headers.update(_HEADERS_MOBILE if mobile else _HEADERS_DESKTOP)
-    s.cookies.set("i18n-prefs", "SAR", domain=f".{domain}")
-    s.cookies.set("lc-acbsa", "ar_SA",  domain=f".{domain}")
+    base = {
+        "User-Agent":              ua,
+        "Accept-Language":         lang,
+        "Accept":                  "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Encoding":         "gzip, deflate, br",
+        "Connection":              "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "DNT": "1",
+    }
+    if not mobile:
+        base.update({
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        })
+    s.headers.update(base)
+    s.cookies.set("i18n-prefs", "SAR",   domain=f".{domain}")
+    s.cookies.set("lc-acbsa",   "ar_SA", domain=f".{domain}")
+    s.cookies.set("sp-cdn",     '"L5Z9:SA"', domain=f".{domain}")
     return s
 
 
@@ -477,7 +492,23 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         # --- المحاولة الثانية: الجوال إذا تم الحجب ---
         if not page_data or page_data.get("blocked"):
             logger.info("تجربة نسخة الجوال للـ ASIN %s", asin)
+            time.sleep(_random.uniform(1.5, 3.5))   # تأخير عشوائي لتقليل الحجب
             page_data = _scrape_mobile(asin, domain)
+
+        # --- المحاولة الثالثة: offer-listing مباشرة ---
+        if not page_data or page_data.get("blocked"):
+            logger.info("تجربة offer-listing مباشرة للـ ASIN %s", asin)
+            time.sleep(_random.uniform(2.0, 4.0))
+            offers_direct = _scrape_offer_listing(asin, domain)
+            if offers_direct:
+                best_direct = offers_direct[0]
+                page_data = {
+                    "title":       None,
+                    "price_val":   best_direct["price_val"],
+                    "price_text":  best_direct["price_text"],
+                    "seller_name": best_direct["seller_name"],
+                    "is_prime":    best_direct["is_prime"],
+                }
 
         # --- كلاهما محجوب أو فشل الاتصال ---
         if not page_data or page_data.get("blocked"):

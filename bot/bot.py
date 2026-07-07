@@ -345,7 +345,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
             return
 
-        photo_bytes = await photo_file.download_as_bytearray()
+        # retry عند timeout — مرتان
+        photo_bytes = None
+        for _attempt in range(2):
+            try:
+                photo_bytes = await photo_file.download_as_bytearray()
+                break
+            except Exception as _dl_e:
+                if _attempt == 0:
+                    logger.warning("تحميل الصورة timeout — إعادة محاولة: %s", _dl_e)
+                    await asyncio.sleep(1)
+                else:
+                    raise _dl_e
+
+        if photo_bytes is None or len(photo_bytes) == 0:
+            await _reply(update, "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.", parse_mode=None)
+            return
         if len(photo_bytes) > 8 * 1024 * 1024:
             await _reply(update, "⚠️ الصورة كبيرة جداً (أكثر من 8 MB).", parse_mode=None)
             return
