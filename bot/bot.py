@@ -43,6 +43,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي رسالة نصية فيها رابط منتج."""
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text
     asin = extract_asin(text)
 
@@ -55,19 +58,44 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔎 جاري البحث عن أقل سعر...")
 
-    offer = get_lowest_offer(asin)
-    message = format_offer_message(offer)
+    try:
+        offer = get_lowest_offer(asin)
+        message = format_offer_message(offer)
+    except Exception as e:
+        logger.error("Failed to fetch offer for ASIN %s: %s", asin, e)
+        await update.message.reply_text(
+            "❌ حصل خطأ أثناء البحث عن السعر. حاول مرة ثانية."
+        )
+        return
+
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي صورة يرسلها المستخدم (من الكاميرا أو المعرض — نفس المعالجة)."""
+    if not update.message or not update.message.photo:
+        return
+
     await update.message.reply_text("📸 جاري تحليل الصورة...")
 
-    photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
-    photo_bytes = await photo_file.download_as_bytearray()
+    try:
+        photo_file = await update.message.photo[-1].get_file()  # أعلى دقة متاحة
+        photo_bytes = await photo_file.download_as_bytearray()
+    except Exception as e:
+        logger.error("Failed to download photo: %s", e)
+        await update.message.reply_text(
+            "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية."
+        )
+        return
 
-    keywords = identify_product_from_image(bytes(photo_bytes))
+    try:
+        keywords = await identify_product_from_image(bytes(photo_bytes))
+    except Exception as e:
+        logger.error("Image analysis failed: %s", e)
+        await update.message.reply_text(
+            "❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية."
+        )
+        return
 
     if not keywords:
         await update.message.reply_text(

@@ -1,22 +1,21 @@
 """
 دوال التعرف على المنتج من صورة، والبحث عنه داخل أمازون.
 """
+import asyncio
 import base64
+import logging
 import requests
 from config import GOOGLE_VISION_API_KEY, MOCK_MODE, AFFILIATE_TAG, AMAZON_DOMAIN
 from amazon_utils import build_affiliate_link
 
+logger = logging.getLogger(__name__)
 
-def identify_product_from_image(image_bytes: bytes) -> list[str]:
-    """
-    يحلل الصورة ويرجع قائمة كلمات وصفية عن المنتج (labels).
-    يستخدم Google Cloud Vision API — Web Detection + Label Detection معًا
-    لأفضل دقة ممكنة على منتجات فيها شعار أو نص.
-    """
-    if MOCK_MODE or not GOOGLE_VISION_API_KEY:
-        # نتيجة وهمية للتجربة بدون مفتاح API حقيقي
-        return ["حذاء رياضي", "أبيض", "sneaker"]
 
+def _call_vision_api(image_bytes: bytes) -> list[str]:
+    """
+    استدعاء متزامن لـ Google Cloud Vision API.
+    يُستدعى من خلال run_in_executor عشان ما يحجب event loop.
+    """
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
 
@@ -32,12 +31,25 @@ def identify_product_from_image(image_bytes: bytes) -> list[str]:
         ]
     }
 
-    response = requests.post(url, json=payload, timeout=15)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        logger.error("Vision API request failed: %s", e)
+        return []
+
+    responses = data.get("responses")
+    if not responses or not isinstance(responses, list):
+        logger.error("Unexpected Vision API response shape: %s", data)
+        return []
+
+    result = responses[0]
+    if "error" in result:
+        logger.error("Vision API returned error: %s", result["error"])
+        return []
 
     labels = []
-    result = data.get("responses", [{}])[0]
 
     # أولوية لنتائج Web Detection لأنها أدق لأسماء منتجات فعلية
     web_entities = result.get("webDetection", {}).get("webEntities", [])
@@ -47,9 +59,23 @@ def identify_product_from_image(image_bytes: bytes) -> list[str]:
 
     # إضافة Label Detection كدعم إضافي
     for label in result.get("labelAnnotations", []):
-        labels.append(label["description"])
+        labels.append(label.get("description", ""))
 
-    return labels[:5] if labels else []
+    return [l for l in labels if l][:5]
+
+
+async def identify_product_from_image(image_bytes: bytes) -> list[str]:
+    """
+    يحلل الصورة ويرجع قائمة كلمات وصفية عن المنتج (labels).
+    يستخدم Google Cloud Vision API — Web Detection + Label Detection معًا
+    لأفضل دقة ممكنة على منتجات فيها شعار أو نص.
+    """
+    if MOCK_MODE or not GOOGLE_VISION_API_KEY:
+        # نتيجة وهمية للتجربة بدون مفتاح API حقيقي
+        return ["حذاء رياضي", "أبيض", "sneaker"]
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _call_vision_api, image_bytes)
 
 
 def search_amazon_by_keywords(keywords: list[str]) -> list[dict]:
