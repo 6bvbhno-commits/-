@@ -9,7 +9,7 @@ import time as _time
 from collections import defaultdict
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -65,8 +65,24 @@ def _add_to_history(user_id: int, role: str, content: str) -> None:
         h[:] = h[-_MAX_HISTORY:]
 
 
-# ─── تنظيف دوري للذاكرة (يمنع تراكم بيانات المستخدمين غير النشطين) ──────────
+# ─── تنظيف دوري للذاكرة ──────────────────────────────────────────────────────
 _USER_TTL = 2 * 3600   # 2 ساعة عدم نشاط → نحذف من الذاكرة
+
+# ─── إحصاءات صحة البوت ───────────────────────────────────────────────────────
+_stats: dict = {
+    "requests_total": 0,
+    "requests_ok":    0,
+    "requests_error": 0,
+    "flood_waits":    0,
+    "last_request_ts": 0.0,
+}
+
+def _stat(key: str, inc: int = 1) -> None:
+    _stats[key] = _stats.get(key, 0) + inc
+    if key in ("requests_ok", "requests_error"):
+        _stats["requests_total"] = _stats.get("requests_total", 0) + 1
+    _stats["last_request_ts"] = _time.monotonic()
+
 
 async def _memory_cleanup_loop() -> None:
     """يُنظّف بيانات المستخدمين غير النشطين كل 30 دقيقة."""
@@ -82,11 +98,49 @@ async def _memory_cleanup_loop() -> None:
             if stale:
                 logger.info("memory_cleanup: حُذف %d مستخدم غير نشط", len(stale))
             logger.info(
-                "memory_cleanup: %d مستخدم نشط في الذاكرة",
+                "memory_cleanup: %d مستخدم نشط | طلبات=%d ok=%d err=%d floods=%d",
                 len(_user_last_seen),
+                _stats.get("requests_total", 0),
+                _stats.get("requests_ok",    0),
+                _stats.get("requests_error", 0),
+                _stats.get("flood_waits",    0),
             )
         except Exception as _ce:
             logger.warning("memory_cleanup فشل: %s", _ce)
+
+
+async def _health_monitor_loop() -> None:
+    """
+    يُراقب البوت كل 5 دقائق ويكتشف أي حالة تجمّد.
+    إذا مرّت 10 دقائق بدون أي طلب ناجح وكان عدد الأخطاء مرتفعاً → يُسجّل تحذيراً.
+    """
+    await asyncio.sleep(300)   # انتظر 5 دقائق بعد البدء
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now      = _time.monotonic()
+            last_req = _stats.get("last_request_ts", 0.0)
+            since    = int(now - last_req) if last_req else -1
+            total    = _stats.get("requests_total", 0)
+            errors   = _stats.get("requests_error", 0)
+            floods   = _stats.get("flood_waits",    0)
+
+            # حساب نسبة الأخطاء (آخر دورة)
+            err_rate = (errors / total * 100) if total > 0 else 0
+
+            logger.info(
+                "📊 health: %d طلب | %.1f%% أخطاء | %d FloodWait | آخر طلب منذ %ds",
+                total, err_rate, floods, since,
+            )
+
+            # تحذير إذا كانت الأخطاء عالية جداً
+            if total > 10 and err_rate > 50:
+                logger.warning(
+                    "🔴 health: نسبة أخطاء عالية %.1f%% — راجع السجلات", err_rate
+                )
+
+        except Exception as _he:
+            logger.warning("health_monitor فشل: %s", _he)
 
 # ─── ثوابت ───────────────────────────────────────────────────────────────────
 _MAX_MSG       = 4096
@@ -111,20 +165,34 @@ async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown") -> None:
-    """يرسل رسالة مع تقليم تلقائي إذا تجاوزت حد تيليجرام."""
+    """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً."""
     if not update.message:
         return
     if len(text) > _MAX_MSG:
         text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة)_"
-    try:
-        await update.message.reply_text(text, parse_mode=parse_mode)
-    except TelegramError:
-        if parse_mode:
-            plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
-            try:
-                await update.message.reply_text(plain[:_MAX_MSG])
-            except TelegramError as e2:
-                logger.error("فشل إرسال الرسالة: %s", e2)
+    for attempt in range(4):
+        try:
+            await update.message.reply_text(text, parse_mode=parse_mode)
+            return
+        except RetryAfter as e:
+            wait = min(int(e.retry_after) + 1, 30)
+            logger.warning("Telegram FloodWait %ds (محاولة %d/3)", wait, attempt + 1)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                logger.warning("Telegram network خطأ، إعادة المحاولة: %s", e)
+            else:
+                logger.error("Telegram network فشل نهائي: %s", e)
+                return
+        except TelegramError:
+            if parse_mode:
+                plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
+                try:
+                    await update.message.reply_text(plain[:_MAX_MSG])
+                except TelegramError as e2:
+                    logger.error("فشل إرسال الرسالة: %s", e2)
+            return
 
 
 # =============================================================================
@@ -383,7 +451,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("استثناء غير متوقع:", exc_info=context.error)
+    err = context.error
+
+    # FloodWait — تيليجرام يطلب انتظاراً
+    if isinstance(err, RetryAfter):
+        _stat("flood_waits")
+        logger.warning("Telegram FloodWait %ds — error_handler", err.retry_after)
+        return
+
+    # أخطاء شبكة عابرة — لا داعي لرسالة
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning("Telegram network خطأ عابر: %s", err)
+        return
+
+    _stat("requests_error")
+    logger.error("استثناء غير متوقع: %s", err, exc_info=err)
+
     if isinstance(update, Update) and update.message:
         try:
             await update.message.reply_text(
@@ -400,7 +483,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     asyncio.create_task(_memory_cleanup_loop())
-    logger.info("✅ مهمة تنظيف الذاكرة بدأت")
+    asyncio.create_task(_health_monitor_loop())
+    logger.info("✅ مهمة تنظيف الذاكرة + مراقبة الصحة بدأت")
 
 
 def main():

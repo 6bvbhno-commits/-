@@ -36,9 +36,14 @@ def _call_openai_vision(image_bytes: bytes) -> str | None:
     """
     if not OPENAI_BASE_URL or not OPENAI_API_KEY:
         return None
-    # حد الطلبات المتزامنة — يمنع إغراق الـ proxy
-    with _OPENAI_SEM:
+    # حد الطلبات المتزامنة — timeout 30s منعاً للانتظار الأبدي
+    if not _OPENAI_SEM.acquire(timeout=30):
+        logger.warning("OpenAI SEM timeout — تخطي التحليل")
+        return None
+    try:
         return _call_openai_vision_inner(image_bytes)
+    finally:
+        _OPENAI_SEM.release()
 
 
 def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
@@ -166,8 +171,11 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         }]
     }
 
-    # semaphore: طلب واحد فقط في الوقت الواحد لتجنب 429 الجماعي
-    with _GEMINI_SEM:
+    # semaphore — timeout 40s منعاً للانتظار الأبدي
+    if not _GEMINI_SEM.acquire(timeout=40):
+        logger.warning("Gemini SEM timeout — تخطي التحليل")
+        return None
+    try:
         for model in models:
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -195,8 +203,10 @@ def _call_gemini(image_bytes: bytes) -> str | None:
             except Exception as e:
                 logger.error("خطأ في Gemini (%s): %s", model, e)
 
-    logger.error("Gemini: فشلت جميع الموديلات")
-    return None
+        logger.error("Gemini: فشلت جميع الموديلات")
+        return None
+    finally:
+        _GEMINI_SEM.release()
 
 
 def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]:

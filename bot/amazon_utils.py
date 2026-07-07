@@ -459,7 +459,17 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     affiliate_link = build_affiliate_link(asin, domain)
 
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
-    with _SCRAPE_SEMAPHORE:
+    if not _SCRAPE_SEMAPHORE.acquire(timeout=45):
+        logger.warning("SCRAPE_SEMAPHORE timeout للـ ASIN %s — جاري محاولة stale cache", asin)
+        with _CACHE_LOCK:
+            if cache_key in _CACHE:
+                stale_ts, stale_data = _CACHE[cache_key]
+                result = dict(stale_data)
+                result["stale"] = True
+                result["stale_age_min"] = max(1, int((time.time() - stale_ts) / 60))
+                return result
+        return {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
+    try:
 
         # --- المحاولة الأولى: سطح المكتب ---
         page_data = _scrape_desktop(asin, domain)
@@ -527,6 +537,8 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         }
 
         return _record_and_return(result)
+    finally:
+        _SCRAPE_SEMAPHORE.release()
 
 
 def _esc(text: str) -> str:
