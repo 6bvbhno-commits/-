@@ -4,9 +4,11 @@
 """
 import asyncio
 import logging
+import re as _re
 import time as _time
 from collections import defaultdict
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -36,9 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── حماية من الفيضان: 5 طلبات / 60 ثانية لكل مستخدم ───────────────────────
-_RATE_WINDOW   = 60    # ثانية
-_RATE_MAX      = 10    # أقصى طلبات في النافذة
+# ─── حماية من الفيضان ────────────────────────────────────────────────────────
+_RATE_WINDOW = 60
+_RATE_MAX    = 20   # رُفع من 10 → 20 لاستيعاب الضغط
 _user_times: dict[int, list[float]] = defaultdict(list)
 
 def _is_rate_limited(user_id: int) -> bool:
@@ -53,57 +55,79 @@ def _is_rate_limited(user_id: int) -> bool:
 # ─── حد تيليجرام للرسائل ────────────────────────────────────────────────────
 _MAX_MSG = 4096
 
+# ─── أنماط الروابط المختصرة (تحتاج resolve) ─────────────────────────────────
+_SHORT_LINK_RE = _re.compile(
+    r"https?://(?:amzn\.to|amzn\.eu|a\.co|link\.amazon|ty\.gl|bit\.ly|tinyurl\.com|t\.co|rb\.gy)/",
+    _re.IGNORECASE,
+)
+
+# =============================================================================
+# دوال مساعدة
+# =============================================================================
+
+async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يُرسل مؤشر "يكتب..." لإشعار المستخدم بأن البوت يعمل."""
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING,
+        )
+    except Exception:
+        pass
+
+
 async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown") -> None:
     """يرسل رسالة مع تقليم تلقائي إذا تجاوزت حد تيليجرام."""
     if not update.message:
         return
     if len(text) > _MAX_MSG:
-        text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة لطولها)_"
+        text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة)_"
     try:
         await update.message.reply_text(text, parse_mode=parse_mode)
-    except TelegramError as e:
-        # إذا فشل Markdown، أعد الإرسال نصاً عادياً
+    except TelegramError:
         if parse_mode:
-            plain = text.replace("*", "").replace("`", "").replace("_", "").replace("\\", "")
+            plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
             try:
                 await update.message.reply_text(plain[:_MAX_MSG])
             except TelegramError as e2:
-                logger.error("فشل إرسال الرسالة حتى بدون Markdown: %s", e2)
+                logger.error("فشل إرسال الرسالة: %s", e2)
         else:
-            logger.error("فشل إرسال الرسالة: %s", e)
+            pass
 
 
-# ─── المعالجات ───────────────────────────────────────────────────────────────
+# =============================================================================
+# المعالجات
+# =============================================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """رسالة الترحيب — تحتوي على إفصاح الأفلييت الإلزامي."""
+    """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
     welcome_text = (
-        "👋 أهلاً بك!\n\n"
+        "👋 *أهلاً بك!*\n\n"
         "🏷️ *وش يسوي هذا البوت؟*\n"
-        "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين — ويعطيك رابط الشراء مباشرة.\n\n"
+        "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين.\n\n"
         "📌 *كيف تستخدمه؟*\n"
-        "• أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر الآن\n"
-        "• أو صوّر أي منتج ← يتعرف عليه ويدور لك على أفضل سعر له\n\n"
-        "ℹ️ روابط الشراء تحتوي على تاق تسويق بالعمولة."
+        "• 🔗 أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر فوراً\n"
+        "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n\n"
+        "📊 يتذكر البوت تاريخ الأسعار تلقائياً ويبيّن لك اتجاه السعر.\n\n"
+        "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
     )
     if MOCK_MODE:
-        welcome_text += "\n\n⚠️ *وضع تجريبي مفعّل حاليًا* — الأسعار والنتائج وهمية للاختبار فقط."
+        welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
     await _reply(update, welcome_text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🆘 *المساعدة*\n\n"
-        "• أرسل *رابط منتج أمازون* (طويل أو مختصر) ← أرد بأرخص سعر ورابط شراء\n"
+        "• أرسل *رابط منتج أمازون* ← أرد بأرخص سعر ورابط شراء\n"
         "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n\n"
         "💡 *نصائح للصور:*\n"
-        "  - وضّح الاسم التجاري في الصورة\n"
-        "  - تأكد من الإضاءة الجيدة\n"
-        "  - الجهة الأمامية من العبوة أفضل\n\n"
+        "  - وضّح الاسم التجاري\n"
+        "  - إضاءة جيدة والجهة الأمامية أفضل\n\n"
         "📋 *الأوامر:*\n"
         "/start — رسالة الترحيب\n"
         "/help — هذه الرسالة\n\n"
-        "⚠️ الأسعار حية وقد تتغير، تحقق دائماً من صفحة المنتج قبل الشراء."
+        "⚠️ _الأسعار حية وقد تتغير — تحقق من صفحة المنتج قبل الشراء._"
     )
     await _reply(update, help_text)
 
@@ -117,26 +141,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(user_id):
         await _reply(
             update,
-            "⏳ أرسلت طلبات كثيرة بسرعة. انتظر دقيقة واحدة ثم حاول مجدداً.",
+            "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول مجدداً.",
             parse_mode=None,
         )
         return
 
+    # أرسل "يكتب..." فوراً لإشعار المستخدم
+    await _typing(update, context)
+
     text = update.message.text.strip()
 
-    # المحاولة الأولى: استخراج مباشر من الرابط كما هو
-    asin = extract_asin(text)
-    resolved_url = text
+    # استخراج الرابط من النص (قد يحتوي على كلام + رابط)
+    _url_match = _re.search(r"https?://\S+", text)
+    url_only   = _url_match.group(0).rstrip(".,;:!?)\"']}") if _url_match else text
 
-    # لو ما لقينا ASIN، غالبًا رابط مختصر — نحاول نفكه عبر إعادة التوجيه
+    # المحاولة الأولى: ASIN مباشر من الرابط
+    asin        = extract_asin(url_only)
+    resolved_url = url_only
+
+    # لو ما لقينا ASIN ← غالباً رابط مختصر
     if not asin:
-        # استخرج الرابط فقط من النص (قد يحتوي النص على كلام + رابط)
-        # وأزل الترقيم الزائد من نهاية الرابط
-        import re as _re
-        _url_match = _re.search(r"https?://\S+", text)
-        url_only = _url_match.group(0).rstrip(".,;:!?)\"']}") if _url_match else text
-
-        await _reply(update, "🔗 جاري تتبع الرابط واستخراج التفاصيل...", parse_mode=None)
+        is_short = bool(_SHORT_LINK_RE.match(url_only))
+        if is_short:
+            await _reply(update, "🔗 جاري تتبع الرابط...", parse_mode=None)
         try:
             loop = asyncio.get_running_loop()
             resolved_url = await loop.run_in_executor(None, resolve_short_link, url_only)
@@ -150,24 +177,28 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not asin:
         await _reply(
             update,
-            "⚠️ حتى بعد محاولة فك الرابط، ما قدرت ألقى رقم منتج (ASIN).\n"
-            "جرب تفتح الرابط بالمتصفح وتنسخه من شريط العنوان مباشرة.",
+            "⚠️ ما قدرت أستخرج رقم المنتج من هذا الرابط.\n"
+            "جرّب تفتح الرابط في المتصفح وانسخه من شريط العنوان مباشرة.",
             parse_mode=None,
         )
         return
 
-    await _reply(update, "🔎 جاري حساب وفحص السعر الدقيق...", parse_mode=None)
+    # أرسل "يكتب..." مجدداً قبل جلب السعر (عملية قد تأخذ 3-8 ثوانٍ)
+    await _typing(update, context)
+    await _reply(update, "🔎 جاري فحص أفضل سعر...", parse_mode=None)
 
     try:
         loop = asyncio.get_running_loop()
         offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
         message = format_offer_message(offer)
 
-        # أضف تاريخ السعر إن وُجد (يحتاج قراءتين على الأقل)
+        # أضف تاريخ السعر إن وُجد
         if offer and not offer.get("blocked"):
             try:
                 from price_history import format_history_message
-                history = await loop.run_in_executor(None, format_history_message, asin, domain)
+                history = await loop.run_in_executor(
+                    None, format_history_message, asin, domain
+                )
                 if history:
                     message = message + "\n\n" + history
             except Exception as _ph_err:
@@ -182,7 +213,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعالج أي صورة يرسلها المستخدم (من الكاميرا أو المعرض أو ملف)."""
+    """يعالج أي صورة يرسلها المستخدم."""
     if not update.message:
         return
 
@@ -190,36 +221,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_rate_limited(user_id):
         await _reply(
             update,
-            "⏳ أرسلت طلبات كثيرة بسرعة. انتظر دقيقة واحدة ثم حاول مجدداً.",
+            "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول مجدداً.",
             parse_mode=None,
         )
         return
 
-    await _reply(update, "📸 جاري تحليل الصورة بالذكاء الاصطناعي...", parse_mode=None)
+    # أرسل "يكتب..." فوراً
+    await _typing(update, context)
+    await _reply(update, "📸 جاري تحليل الصورة...", parse_mode=None)
 
     try:
-        # صورة عادية
         if update.message.photo:
             photo_file = await update.message.photo[-1].get_file()
-        # ملف صورة (document)
-        elif update.message.document and update.message.document.mime_type and \
-                update.message.document.mime_type.startswith("image/"):
+        elif (update.message.document
+              and update.message.document.mime_type
+              and update.message.document.mime_type.startswith("image/")):
             photo_file = await update.message.document.get_file()
         else:
             await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
             return
 
-        # لا نُمرّر URL التيليجرام لأي خدمة خارجية — يحتوي على التوكن
-        # Google Lens تحتاج URL عام؛ نتجنبها بتمرير سلسلة فارغة
         photo_bytes = await photo_file.download_as_bytearray()
 
-        # حد الحجم: 8 MB — صور أكبر من هذا نادرة ونرفضها لتوفير الوقت
         if len(photo_bytes) > 8 * 1024 * 1024:
-            await _reply(
-                update,
-                "⚠️ الصورة كبيرة جداً. أرسل صورة أصغر من 8 MB.",
-                parse_mode=None,
-            )
+            await _reply(update, "⚠️ الصورة كبيرة جداً (أكثر من 8 MB).", parse_mode=None)
             return
 
     except Exception as e:
@@ -240,16 +265,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not product_name:
         await _reply(
             update,
-            "❌ ما قدرت أتعرف على المنتج من الصورة.\n"
+            "❌ ما قدرت أتعرف على المنتج.\n"
             "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة.",
             parse_mode=None,
         )
         return
 
+    await _typing(update, context)
     await _reply(
         update,
-        f"🔍 تم التعرف عليه: {product_name}\nجاري البحث في أمازون...",
-        parse_mode=None,
+        f"✅ تم التعرف على المنتج:\n*{product_name}*\n\nجاري البحث في أمازون...",
     )
 
     try:
@@ -257,7 +282,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         offers = await loop.run_in_executor(None, search_amazon_by_keywords, product_name)
     except Exception as e:
         logger.error("فشل البحث في أمازون: %s", e)
-        await _reply(update, "❌ حصل خطأ أثناء البحث في أمازون. حاول مرة ثانية.", parse_mode=None)
+        await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
         return
 
     message = format_search_results(product_name, offers)
@@ -265,19 +290,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أي رسالة نصية ما فيها رابط أمازون."""
+    """أي رسالة نصية بدون رابط أمازون."""
     if not update.message:
         return
     await _reply(
         update,
-        "أرسل لي رابط منتج من أمازون 🔗 أو صورة منتج 📸 عشان أساعدك.\n"
+        "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة منتج وأنا أجيبك بأفضل سعر.\n"
         "اكتب /help لمزيد من التفاصيل.",
         parse_mode=None,
     )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعترض كل استثناء لم يُعالَج ويسجّله، ثم يُبلّغ المستخدم بهدوء."""
+    """يعترض كل استثناء لم يُعالَج."""
     logger.error("استثناء غير متوقع:", exc_info=context.error)
     if isinstance(update, Update) and update.message:
         try:
@@ -288,55 +313,43 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# ─── نقطة الانطلاق ───────────────────────────────────────────────────────────
+# =============================================================================
+# نقطة الانطلاق
+# =============================================================================
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("⚠️  لازم تحط توكن البوت في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
+        print("⚠️  حط توكن البوت في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
         return
 
     print("=" * 50)
     print(f"📊 MOCK_MODE: {MOCK_MODE}")
-    print(f"   {'⚠️  الأسعار وهمية للاختبار' if MOCK_MODE else '🔴 أسعار حقيقية'}")
+    print(f"   {'⚠️  أسعار وهمية' if MOCK_MODE else '🔴 أسعار حقيقية'}")
     print("=" * 50)
 
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .concurrent_updates(True)   # معالجة متزامنة لمستخدمين مختلفين
+        .concurrent_updates(True)
         .build()
     )
 
-    # الأوامر
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help",  help_command))
-
-    # الصور والملفات
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(
-        MessageHandler(
-            filters.Document.IMAGE,
-            handle_photo,
-        )
-    )
-
-    # الروابط النصية — فلتر الرسائل المحرَّرة حتى لا تُعالَج مرتين
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
             handle_link,
         )
     )
-
-    # النصوص العادية
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
             handle_unknown,
         )
     )
-
-    # معالج الأخطاء العام
     app.add_error_handler(error_handler)
 
     print("🚀 البوت شغّال الآن...")

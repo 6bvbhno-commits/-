@@ -16,15 +16,13 @@ from config import AFFILIATE_TAG, AMAZON_DOMAIN
 logger = logging.getLogger(__name__)
 
 # ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
-# يخزن النتائج 90 دقيقة؛ الحد الأقصى 500 إدخال لمنع التضخم في الذاكرة
 _CACHE: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL  = 90 * 60   # 90 دقيقة بالثواني
-_CACHE_MAX  = 500        # أقصى عدد إدخالات قبل الحذف
+_CACHE_TTL  = 3 * 60 * 60  # 3 ساعات (رُفع من 90 دقيقة — الأسعار مستقرة غالباً)
+_CACHE_MAX  = 500
 _CACHE_LOCK = threading.Lock()
 
 # ---- حد الطلبات المتزامنة لأمازون ----
-# يمنع إرسال عشرات الطلبات في نفس الوقت للـ IP الواحد
-_SCRAPE_SEMAPHORE = threading.Semaphore(4)  # أقصى 4 طلبات متزامنة
+_SCRAPE_SEMAPHORE = threading.Semaphore(6)  # رُفع من 4 → 6 لاستيعاب الضغط
 
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
@@ -203,9 +201,9 @@ def _scrape_desktop(asin: str, domain: str) -> dict | None:
     try:
         session = _make_session(mobile=False, domain=domain)
         # زيارة الصفحة الرئيسية أولاً للحصول على كوكيز طبيعية
-        session.get(f"https://www.{domain}", timeout=10, allow_redirects=True)
-        time.sleep(0.8)
-        resp = session.get(url, timeout=18, allow_redirects=True)
+        session.get(f"https://www.{domain}", timeout=6, allow_redirects=True)
+        time.sleep(0.5)
+        resp = session.get(url, timeout=12, allow_redirects=True)
 
         if resp.status_code != 200:
             logger.warning("Desktop: status %s للـ ASIN %s", resp.status_code, asin)
@@ -247,7 +245,7 @@ def _scrape_mobile(asin: str, domain: str) -> dict | None:
     url = f"https://www.{domain}/dp/{asin}"
     try:
         session = _make_session(mobile=True, domain=domain)
-        resp = session.get(url, timeout=18, allow_redirects=True)
+        resp = session.get(url, timeout=12, allow_redirects=True)
 
         if resp.status_code != 200:
             return None
@@ -473,7 +471,17 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 
         # --- كلاهما محجوب أو فشل الاتصال ---
         if not page_data or page_data.get("blocked"):
-            logger.warning("كلا الوضعين محجوبان للـ ASIN %s — إرجاع رابط الأفلييت", asin)
+            logger.warning("كلا الوضعين محجوبان للـ ASIN %s — محاولة stale cache", asin)
+            # Stale cache: أعد آخر نتيجة محفوظة حتى لو انتهت صلاحيتها
+            with _CACHE_LOCK:
+                if cache_key in _CACHE:
+                    stale_ts, stale_data = _CACHE[cache_key]
+                    age_min = max(1, int((time.time() - stale_ts) / 60))
+                    result  = dict(stale_data)
+                    result["stale"]         = True
+                    result["stale_age_min"] = age_min
+                    logger.info("Stale cache للـ ASIN %s (عمر %d دقيقة)", asin, age_min)
+                    return result
             return {"blocked": True, "affiliate_link": affiliate_link}
 
         title           = page_data.get("title")
@@ -538,8 +546,8 @@ def format_offer_message(offer: dict) -> str:
 
     if offer.get("blocked"):
         return (
-            "⚠️ أمازون يطلب تحقق من الهوية حالياً.\n"
-            f"شوف السعر مباشرة:\n{offer['affiliate_link']}"
+            "⚠️ أمازون يطلب تحقق مؤقتاً — شوف السعر مباشرة:\n"
+            f"{offer['affiliate_link']}"
         )
 
     raw_title    = (offer.get("title") or "")[:70]
@@ -551,13 +559,25 @@ def format_offer_message(offer: dict) -> str:
     safe_seller  = _esc(str(offer.get("seller_name", "Amazon.sa")))
     safe_cond    = _esc(str(offer.get("condition", "جديد")))
 
+    # إشعار stale: عرض آخر سعر محفوظ مع ملاحظة
+    if offer.get("stale"):
+        age    = offer.get("stale_age_min", 0)
+        hours  = age // 60
+        mins   = age % 60
+        age_ar = f"{hours} ساعة و{mins} دقيقة" if hours else f"{mins} دقيقة"
+        stale_note = f"\n\n⏰ _آخر سعر مسجّل قبل {age_ar} — أمازون حجب الاستعلام مؤقتاً_"
+        price_header = "🏷️ *آخر سعر متوفر:*"
+    else:
+        stale_note   = ""
+        price_header = "🏷️ *أرخص سعر متاح الآن:*"
+
     return (
         f"{title_part}"
-        f"🏷️ *أرخص سعر متاح الآن:*\n"
+        f"{price_header}\n"
         f"• السعر: `{safe_price}`\n"
         f"• البائع: {safe_seller}{prime_badge}\n"
         f"• الحالة: {safe_cond}\n"
         f"{sellers_note}\n"
         f"🛒 *رابط الشراء:*\n{offer['affiliate_link']}\n\n"
-        f"_(رابط تسويق بالعمولة)_"
+        f"_(رابط تسويق بالعمولة)_{stale_note}"
     )
