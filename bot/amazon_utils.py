@@ -137,8 +137,9 @@ def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
 
 def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     """
-    يرجع أقل سعر متاح لمنتج معين عبر PA API v5 الرسمي.
-    يرجع إلى بيانات وهمية تلقائياً إذا كان MOCK_MODE مفعّلاً أو المفاتيح غير مدخلة.
+    يبحث عن أرخص بائع متاح للمنتج عبر PA API v5 الرسمي.
+    يقارن كل العروض المتاحة ويختار الأقل سعراً من البائعين الجدد.
+    يرجع إلى بيانات وهمية إذا كان MOCK_MODE مفعّلاً أو المفاتيح غير مدخلة.
     """
     if MOCK_MODE or not AMAZON_ACCESS_KEY:
         base_price = random.randint(100, 500)
@@ -148,22 +149,27 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             "title": "منتج تجريبي ذكي",
             "price": f"{base_price}.00",
             "currency": currency,
-            "seller_name": "Amazon",
+            "seller_name": "Amazon.sa",
             "condition": "جديد",
+            "is_prime": True,
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
 
-    host = f"paapi5.{domain}"
+    # الـ endpoint الصحيح لـ PA API v5: webservices.{domain}
+    host = f"webservices.{domain}"
     uri = "/paapi5/getitems"
 
     payload_dict = {
         "ItemIds": [asin],
         "Resources": [
-            "Offers.Findings.Price",        # BuyBox / أقل سعر إجمالي
+            "ItemInfo.Title",
             "Offers.Listings.Price",
             "Offers.Listings.MerchantInfo",
             "Offers.Listings.Condition",
-            "ItemInfo.Title",
+            "Offers.Listings.IsBuyBoxWinner",
+            "Offers.Listings.DeliveryInfo.IsPrimeEligible",
+            "Offers.Summaries.LowestPrice",   # ملخص أقل سعر كلي
+            "Offers.Summaries.OfferCount",
         ],
         "PartnerTag": AFFILIATE_TAG,
         "PartnerType": "Associates",
@@ -189,49 +195,57 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             return None
 
         item = items[0]
-        currency = "SAR" if "sa" in domain else "USD"
-        lowest_price_amount = None
-        display_price = None
+        title = item.get("ItemInfo", {}).get("Title", {}).get("DisplayValue")
 
-        # 1. نجرّب BuyBox / Findings أولاً — أدق وأقرب للسعر الظاهر في المتجر
-        findings_price = (
-            item.get("Offers", {}).get("Findings", {}).get("LowestPrice", {})
-        )
-        if findings_price:
-            lowest_price_amount = findings_price.get("Amount")
-            currency = findings_price.get("Currency", currency)
-            display_price = findings_price.get("DisplayAmount")
-
-        # 2. نجرّب Listings كبديل
+        # --- البحث عن أرخص بائع جديد من قائمة الـ Listings ---
         listings = item.get("Offers", {}).get("Listings", [])
-        seller_name = "أمازون"
-        condition = "جديد"
-        valid_listings = [l for l in listings if l.get("Price", {}).get("Amount")]
 
-        if valid_listings:
-            lowest_listing = min(valid_listings, key=lambda x: x["Price"]["Amount"])
-            seller_name = lowest_listing.get("MerchantInfo", {}).get("Name", seller_name)
-            condition = lowest_listing.get("Condition", {}).get("DisplayValue", condition)
-            if not lowest_price_amount:
-                lowest_price_amount = lowest_listing["Price"]["Amount"]
-                currency = lowest_listing["Price"]["Currency"]
-                display_price = lowest_listing["Price"]["DisplayAmount"]
+        # فلترة العروض: جديدة فقط وعندها سعر
+        new_listings = [
+            l for l in listings
+            if l.get("Price", {}).get("Amount")
+            and "used" not in (l.get("Condition", {}).get("Value", "")).lower()
+        ]
 
-        if not lowest_price_amount:
-            return None
-
-        # تطبيق ضريبة القيمة المضافة 15% لنطاق السعودية إذا كان السعر صافياً
-        if "sa" in domain:
-            final_with_vat = float(lowest_price_amount) * 1.15
-            display_price = f"{final_with_vat:,.2f} {currency}"
+        if new_listings:
+            # ترتيب تصاعدي حسب السعر → أول واحد هو الأرخص
+            cheapest = min(new_listings, key=lambda x: x["Price"]["Amount"])
+            seller_name = cheapest.get("MerchantInfo", {}).get("Name", "أمازون")
+            condition   = cheapest.get("Condition", {}).get("DisplayValue", "جديد")
+            is_prime    = cheapest.get("DeliveryInfo", {}).get("IsPrimeEligible", False)
+            display_price = cheapest["Price"]["DisplayAmount"]
+            currency      = cheapest["Price"]["Currency"]
+            offer_count   = (
+                item.get("Offers", {})
+                .get("Summaries", [{}])[0]
+                .get("OfferCount", 1)
+            )
+        else:
+            # احتياطي: ملخص أقل سعر من Summaries
+            summaries = item.get("Offers", {}).get("Summaries", [])
+            lowest_summary = next(
+                (s for s in summaries if s.get("Condition", {}).get("Value") == "New"),
+                summaries[0] if summaries else None,
+            )
+            if not lowest_summary or not lowest_summary.get("LowestPrice"):
+                return None
+            lp = lowest_summary["LowestPrice"]
+            display_price = lp.get("DisplayAmount", "—")
+            currency      = lp.get("Currency", "SAR")
+            seller_name   = "أمازون"
+            condition     = "جديد"
+            is_prime      = False
+            offer_count   = lowest_summary.get("OfferCount", 1)
 
         return {
             "asin": asin,
-            "title": item.get("ItemInfo", {}).get("Title", {}).get("DisplayValue"),
+            "title": title,
             "price": display_price,
             "currency": currency,
             "seller_name": seller_name,
             "condition": condition,
+            "is_prime": is_prime,
+            "offer_count": offer_count,
             "affiliate_link": build_affiliate_link(asin, domain=domain),
         }
     except Exception as e:
@@ -240,19 +254,28 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 
 
 def format_offer_message(offer: dict) -> str:
-    """يبني رسالة جاهزة للإرسال في تيليجرام."""
+    """يبني رسالة جاهزة للإرسال في تيليجرام تعرض أرخص بائع متاح."""
     if not offer:
-        return "❌ ما قدرت ألقى عروض متاحة أو أسعار دقيقة لهذا المنتج حاليًا. تأكد من توفر السلعة في المتجر."
+        return (
+            "❌ ما قدرت ألقى عروض متاحة لهذا المنتج حاليًا.\n"
+            "تأكد من توفر المنتج في المتجر أو جرّب لاحقًا."
+        )
 
-    title_part = (
-        f"📦 *{offer['title'][:60]}...*\n\n" if offer.get("title") else ""
+    title_part = f"📦 *{offer['title'][:70]}*\n\n" if offer.get("title") else ""
+
+    prime_badge = " 🔵 Prime" if offer.get("is_prime") else ""
+    offer_count = offer.get("offer_count")
+    sellers_note = (
+        f"_(من بين {offer_count} بائع متاح)_\n" if offer_count and offer_count > 1 else ""
     )
+
     return (
         f"{title_part}"
-        f"💰 *السعر الفعلي الحالي:*\n"
-        f"• السعر الشامل: `{offer['price']}`\n"
-        f"• البائع: {offer['seller_name']}\n"
-        f"• الحالة: {offer['condition']}\n\n"
-        f"🛒 *رابط الشراء المباشر:*\n{offer['affiliate_link']}\n\n"
+        f"🏷️ *أرخص سعر متاح الآن:*\n"
+        f"• السعر: `{offer['price']}`\n"
+        f"• البائع: {offer['seller_name']}{prime_badge}\n"
+        f"• الحالة: {offer['condition']}\n"
+        f"{sellers_note}\n"
+        f"🛒 *رابط الشراء:*\n{offer['affiliate_link']}\n\n"
         f"_(رابط تسويق بالعمولة)_"
     )
