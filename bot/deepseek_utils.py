@@ -101,10 +101,19 @@ def _call(model: str, messages: list[dict],
 
         data = resp.json()
 
-        # DeepSeek-R1 يحفظ التفكير في reasoning_content — نأخذ فقط content
         choice  = data.get("choices", [{}])[0]
         message = choice.get("message", {})
         text    = message.get("content", "").strip()
+
+        # DeepSeek-R1: إذا كان content فارغاً، استخرج الجواب من آخر reasoning_content
+        if not text:
+            reasoning = message.get("reasoning_content", "").strip()
+            if reasoning:
+                # آخر جملة غير فارغة هي الاستنتاج النهائي
+                lines = [l.strip() for l in reasoning.split("\n") if l.strip()]
+                text  = lines[-1] if lines else ""
+                if text:
+                    logger.info("DeepSeek R1: استُخرج الجواب من reasoning_content")
 
         if not text:
             logger.warning("DeepSeek: رد فارغ")
@@ -163,8 +172,8 @@ def chat_response(text: str, history: list[dict]) -> str:
 
 def price_advice(current_price: float, history_records: list[dict]) -> str:
     """
-    يُعيد توصية شراء مختصرة (💡 ...) باستخدام DeepSeek-R1 للتفكير العميق.
-    يُعيد نصاً فارغاً إذا كانت البيانات غير كافية.
+    يُعيد توصية شراء في سطر واحد (💡 ...) — DeepSeek-V3.
+    V3 أنظف وأسرع من R1 لهذه المهمة القصيرة.
     """
     if len(history_records) < 3:
         return ""
@@ -174,26 +183,26 @@ def price_advice(current_price: float, history_records: list[dict]) -> str:
     hi     = max(prices)
     avg    = sum(prices) / len(prices)
     days   = max(1, (history_records[-1]["ts"] - history_records[0]["ts"]) // 86400)
+    pct    = (current_price - lo) / (hi - lo) * 100 if hi != lo else 50
 
     prompt = (
-        f"منتج أمازون السعودية — بيانات سعرية:\n"
-        f"• السعر الحالي:  {current_price:.2f} ر.س\n"
-        f"• أدنى سعر ({days} يوم):  {lo:.2f} ر.س\n"
-        f"• أعلى سعر:  {hi:.2f} ر.س\n"
-        f"• المتوسط:  {avg:.2f} ر.س\n\n"
-        f"اكتب توصية شراء واحدة مختصرة (10-15 كلمة) تبدأ بـ 💡\n"
-        f"لا تذكر أرقاماً — فقط توصية واضحة (مثل: وقت مناسب للشراء، أو انتظر ينزل أكثر)."
+        f"بيانات سعر منتج أمازون ({days} يوم):\n"
+        f"• الحالي: {current_price:.2f} ر.س | الأدنى: {lo:.2f} | الأعلى: {hi:.2f} | المتوسط: {avg:.2f}\n"
+        f"• السعر الحالي عند {pct:.0f}% من النطاق (0%=أدنى سعر، 100%=أعلى سعر)\n\n"
+        f"أجب بسطر واحد فقط يبدأ بـ 💡 — توصية شراء بدون أرقام (10 كلمات أو أقل).\n"
+        f"مثال: 💡 وقت ممتاز للشراء، السعر في قاعه\n"
+        f"مثال: 💡 انتظر قليلاً، السعر مرتفع نسبياً\n"
+        f"لا تكتب إلا السطر."
     )
 
     result = _call(
-        model=_MODEL_R1,
+        model=_MODEL_CHAT,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=120,
+        max_tokens=60,
     )
     if not result:
         return ""
 
-    # خذ أول سطر فقط وتأكد من وجود 💡
     advice = result.strip().split("\n")[0]
     if not advice.startswith("💡"):
         advice = "💡 " + advice
