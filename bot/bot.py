@@ -615,9 +615,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
             return
 
-        # احفظ URL الصورة من تيليجرام لاستخدامه مع Google Lens
-        image_url = photo_file.file_path or ""
-
         # retry عند timeout — مرتان
         photo_bytes = None
         for _attempt in range(2):
