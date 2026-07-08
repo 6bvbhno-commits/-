@@ -7,18 +7,20 @@ import logging
 import re as _re
 import time as _time
 from collections import defaultdict
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN
+import price_alerts as _pa
+from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
 from amazon_utils import (
     extract_asin,
     extract_domain,
@@ -164,7 +166,12 @@ async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
-async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown") -> None:
+async def _reply(
+    update: Update,
+    text: str,
+    parse_mode: str | None = "Markdown",
+    reply_markup=None,
+) -> None:
     """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً."""
     if not update.message:
         return
@@ -172,7 +179,9 @@ async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown")
         text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة)_"
     for attempt in range(4):
         try:
-            await update.message.reply_text(text, parse_mode=parse_mode)
+            await update.message.reply_text(
+                text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
             return
         except RetryAfter as e:
             wait = min(int(e.retry_after) + 1, 30)
@@ -189,7 +198,7 @@ async def _reply(update: Update, text: str, parse_mode: str | None = "Markdown")
             if parse_mode:
                 plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
                 try:
-                    await update.message.reply_text(plain[:_MAX_MSG])
+                    await update.message.reply_text(plain[:_MAX_MSG], reply_markup=reply_markup)
                 except TelegramError as e2:
                     logger.error("فشل إرسال الرسالة: %s", e2)
             return
@@ -213,6 +222,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n"
         "• 💬 اكتب اسم أي منتج ← يبحث عنه مباشرة\n\n"
         "📊 البوت يحفظ تاريخ الأسعار ويعطيك توصية شراء ذكية.\n\n"
+        "🔔 *ميزة التنبيهات:* بعد أي سعر، اضغط زر *نبّهني* — راح يرسل لك إشعاراً فور انخفاض السعر!\n"
+        "📋 لعرض تنبيهاتك النشطة: /myalerts\n\n"
         "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
     )
     if MOCK_MODE:
@@ -317,8 +328,254 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
         return
 
-    await _reply(update, message)
+    # ── زر تنبيه انخفاض السعر ────────────────────────────────────────────────
+    kb = None
+    if offer and not offer.get("blocked") and not offer.get("stale") and offer.get("price_val"):
+        price_int = int(offer["price_val"] * 100)
+        # callback_data: al:{asin}:{domain}:{price_x100}  (≤ 64 bytes)
+        cb_data = f"al:{asin}:{domain}:{price_int}"
+        if len(cb_data.encode()) <= 64:
+            # حفظ العنوان مؤقتاً لاستخدامه في التنبيه
+            if offer.get("title"):
+                context.user_data[f"ptitle_{asin}"] = offer["title"][:80]
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔔 نبّهني لما ينزل السعر", callback_data=cb_data),
+            ]])
+
+    await _reply(update, message, reply_markup=kb)
     _stat("requests_ok")
+
+
+# =============================================================================
+# معالج أزرار التنبيهات (Inline Keyboard Callbacks)
+# =============================================================================
+
+def _mdv2(text: str) -> str:
+    """يهرّب النص لـ MarkdownV2 — ضروري لكل محتوى ديناميكي."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+async def handle_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج نقرات أزرار تنبيهات الأسعار."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    await query.answer()
+
+    data   = query.data or ""
+    uid    = query.from_user.id if query.from_user else 0
+    cid    = query.message.chat_id
+
+    # ── حذف تنبيه ────────────────────────────────────────────────────────────
+    if data.startswith("al_del:"):
+        try:
+            alert_id = int(data.split(":")[1])
+        except (IndexError, ValueError):
+            return
+        ok = _pa.delete_alert(alert_id, uid)
+        # أعد بناء قائمة التنبيهات المحدّثة
+        remaining = _pa.get_user_alerts(uid)
+        if not remaining:
+            try:
+                await query.edit_message_text(
+                    "✅ تم الحذف.\n\n📭 ما عندك تنبيهات نشطة.",
+                    parse_mode=None,
+                )
+            except Exception:
+                pass
+            return
+        # أعد رسم الرسالة مع الأزرار المحدّثة
+        text, keyboard = _build_myalerts_content(remaining)
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── إضافة تنبيه ──────────────────────────────────────────────────────────
+    if data.startswith("al:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        _, req_asin, req_domain, price_str = parts[0], parts[1], parts[2], parts[3]
+        try:
+            current_price = int(price_str) / 100
+        except ValueError:
+            return
+
+        product_name = context.user_data.get(f"ptitle_{req_asin}", "")
+        result = _pa.add_alert(uid, cid, req_asin, req_domain, product_name, current_price)
+
+        # أزل الزر من الرسالة الأصلية
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if result in ("added", "updated"):
+            verb = "تم تحديث" if result == "updated" else "تم تفعيل"
+            await query.message.reply_text(
+                f"✅ *{verb} التنبيه!*\n\n"
+                f"راح أراقب السعر وأنبّهك فوراً لما ينزل عن "
+                f"`{current_price:.2f} SAR` 🔔\n\n"
+                f"📋 لعرض تنبيهاتك: /myalerts",
+                parse_mode="Markdown",
+            )
+        elif result == "limit_reached":
+            await query.message.reply_text(
+                f"⚠️ وصلت للحد الأقصى ({_pa.MAX_ALERTS_PER_USER} تنبيهات).\n"
+                f"احذف تنبيهاً قديماً أولاً: /myalerts",
+                parse_mode=None,
+            )
+        else:
+            await query.message.reply_text("❌ فشل حفظ التنبيه. حاول مرة أخرى.", parse_mode=None)
+
+
+# =============================================================================
+# أمر /myalerts
+# =============================================================================
+
+def _build_myalerts_content(alerts: list[dict]) -> tuple[str, list]:
+    """يبني نص رسالة + مصفوفة أزرار لقائمة التنبيهات."""
+    text = f"🔔 *تنبيهاتك النشطة ({len(alerts)} من {_pa.MAX_ALERTS_PER_USER}):*\n\n"
+    keyboard = []
+    for i, a in enumerate(alerts, 1):
+        name = (a.get("product_name") or a["asin"])[:40]
+        text += (
+            f"*{i}.* 📦 {name}\n"
+            f"   💰 تنبيه عند انخفاض عن `{a['last_known']:.2f} SAR`\n\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🗑️ حذف رقم {i}",
+                callback_data=f"al_del:{a['id']}",
+            )
+        ])
+    return text, keyboard
+
+
+async def myalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعرض تنبيهات المستخدم النشطة مع أزرار الحذف."""
+    user_id = update.effective_user.id if update.effective_user else 0
+    alerts  = _pa.get_user_alerts(user_id)
+
+    if not alerts:
+        await _reply(
+            update,
+            "📭 ما عندك تنبيهات نشطة.\n\n"
+            "أرسل رابط منتج أمازون واضغط على زر *🔔 نبّهني* لإضافة تنبيه.",
+        )
+        return
+
+    text, keyboard = _build_myalerts_content(alerts)
+    await _reply(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# =============================================================================
+# حلقة فحص التنبيهات الخلفية (كل ساعة)
+# =============================================================================
+
+async def _price_alert_check_loop(app) -> None:
+    """
+    كل ساعة: يجلب أسعار المنتجات المتابَعة ويُرسل تنبيهات عند الانخفاض.
+    يُجمّع ASINs الفريدة لتجنب الطلبات المكررة.
+    """
+    await asyncio.sleep(120)   # انتظر دقيقتين بعد البدء
+    while True:
+        try:
+            alerts = _pa.get_all_active()
+            if alerts:
+                logger.info("alert_loop: فحص %d تنبيه نشط...", len(alerts))
+
+                # تجميع ASINs الفريدة
+                unique: dict[tuple, dict | None] = {}
+                for a in alerts:
+                    key = (a["asin"], a["domain"])
+                    if key not in unique:
+                        unique[key] = None
+
+                loop = asyncio.get_running_loop()
+
+                # جلب الأسعار مع تأخير بسيط بين الطلبات
+                for asin_key in unique:
+                    req_asin, req_domain = asin_key
+                    try:
+                        offer = await loop.run_in_executor(
+                            None, get_lowest_offer, req_asin, req_domain
+                        )
+                        unique[asin_key] = offer
+                    except Exception as fe:
+                        logger.warning("alert_loop: فشل جلب ASIN %s — %s", req_asin, fe)
+                    await asyncio.sleep(2)   # تأخير بين الطلبات لتجنب الحجب
+
+                # مطابقة النتائج مع التنبيهات
+                sent = 0
+                for alert in alerts:
+                    key   = (alert["asin"], alert["domain"])
+                    offer = unique.get(key)
+
+                    if not offer or offer.get("blocked") or offer.get("stale"):
+                        continue
+
+                    new_price = offer.get("price_val")
+                    if not new_price:
+                        continue
+
+                    if _pa.check_drop(new_price, alert["last_known"]):
+                        saving  = alert["last_known"] - new_price
+                        pct     = saving / alert["last_known"] * 100
+                        raw_name = (alert.get("product_name") or alert["asin"])[:60]
+                        link     = (
+                            f"https://www.{alert['domain']}/dp/{alert['asin']}"
+                            f"?tag={AFFILIATE_TAG}"
+                        )
+                        # كل محتوى ديناميكي يُهرَّب لـ MarkdownV2
+                        safe_name  = _mdv2(raw_name)
+                        safe_np    = _mdv2(f"{new_price:.2f}")
+                        safe_lk    = _mdv2(f"{alert['last_known']:.2f}")
+                        safe_sv    = _mdv2(f"{saving:.2f}")
+                        safe_pct   = _mdv2(f"{pct:.0f}")
+                        safe_link  = _mdv2(link)
+                        msg = (
+                            f"🔔 *انخفض السعر\\!*\n\n"
+                            f"📦 {safe_name}\n"
+                            f"💰 *السعر الجديد:* `{safe_np} SAR`\n"
+                            f"📉 كان: `{safe_lk} SAR` "
+                            f"— وفّرت `{safe_sv} SAR` \\({safe_pct}%\\)\n\n"
+                            f"🛒 *اشتري الآن:*\n{safe_link}\n\n"
+                            f"_\\(رابط تسويق بالعمولة\\)_"
+                        )
+                        try:
+                            await app.bot.send_message(
+                                chat_id=alert["chat_id"],
+                                text=msg,
+                                parse_mode="MarkdownV2",
+                            )
+                            _pa.update_last_price(alert["id"], new_price, notified=True)
+                            sent += 1
+                            logger.info(
+                                "alert_loop: ✅ تنبيه أُرسل — user=%d ASIN=%s %.2f→%.2f SAR",
+                                alert["user_id"], alert["asin"],
+                                alert["last_known"], new_price,
+                            )
+                        except Exception as se:
+                            logger.warning("alert_loop: فشل إرسال تنبيه — %s", se)
+                    else:
+                        _pa.update_last_price(alert["id"], new_price, notified=False)
+
+                if sent:
+                    logger.info("alert_loop: أُرسل %d تنبيه في هذه الدورة", sent)
+
+        except Exception as e:
+            logger.error("_price_alert_check_loop فشل: %s", e, exc_info=True)
+
+        await asyncio.sleep(3600)   # كل ساعة
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -502,7 +759,8 @@ async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     asyncio.create_task(_memory_cleanup_loop())
     asyncio.create_task(_health_monitor_loop())
-    logger.info("✅ مهمة تنظيف الذاكرة + مراقبة الصحة بدأت")
+    asyncio.create_task(_price_alert_check_loop(application))
+    logger.info("✅ مهام الخلفية بدأت: تنظيف الذاكرة + مراقبة الصحة + تنبيهات الأسعار")
 
 
 def main():
@@ -523,8 +781,12 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help",  help_command))
+    app.add_handler(CommandHandler("start",     start_command))
+    app.add_handler(CommandHandler("help",      help_command))
+    app.add_handler(CommandHandler("myalerts",  myalerts_command))
+
+    # أزرار التنبيهات (Inline Keyboard)
+    app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
 
     # صور وملفات صور
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
