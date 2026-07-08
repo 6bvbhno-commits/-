@@ -1,8 +1,10 @@
 """
 دوال التعرف على المنتج من صورة، والبحث عنه داخل أمازون.
 الأولوية:
-  1. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY) — فوري وبلا حصة مجانية
-  2. Gemini API (fallback) — مجاني لكن محدود
+  1. OpenAI GPT-4o-mini vision (Replit integration)
+  2. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY)
+  3. Gemini API (إذا وُجد GEMINI_API_KEY)
+  4. Hugging Face BLIP (مجاني بلا مفتاح — يعمل دائماً)
 """
 import base64
 import logging
@@ -320,13 +322,57 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
 # الدوال العامة (تُستدعى من bot.py)
 # =============================================================
 
+def _call_huggingface_vision(image_bytes: bytes) -> str | None:
+    """
+    يستخدم Hugging Face Inference API للتعرف على المنتج.
+    مجاني تماماً — لا يحتاج أي مفتاح API.
+    يستخدم نموذج BLIP لوصف الصورة ثم يحوّله لاسم منتج.
+    """
+    try:
+        # نموذج BLIP لوصف الصور — مجاني بالكامل
+        resp = requests.post(
+            "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large",
+            headers={"Content-Type": "application/octet-stream"},
+            data=image_bytes,
+            timeout=30,
+        )
+        if resp.status_code == 503:
+            # النموذج يتحمّل — انتظر وأعد المحاولة
+            import time
+            logger.info("HuggingFace: النموذج يتحمّل، انتظار 10 ثوانٍ...")
+            time.sleep(10)
+            resp = requests.post(
+                "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large",
+                headers={"Content-Type": "application/octet-stream"},
+                data=image_bytes,
+                timeout=30,
+            )
+        if resp.status_code != 200:
+            logger.warning("HuggingFace BLIP HTTP %s: %s", resp.status_code, resp.text[:100])
+            return None
+
+        data = resp.json()
+        if isinstance(data, list) and data:
+            caption = data[0].get("generated_text", "").strip()
+            if caption:
+                logger.info("HuggingFace BLIP نجح: %s", caption[:60])
+                # BLIP يرجع وصفاً إنجليزياً — نستخدمه مباشرة للبحث
+                return caption
+        logger.warning("HuggingFace BLIP: نتيجة فارغة")
+        return None
+    except Exception as exc:
+        logger.error("HuggingFace BLIP exception: %s", exc)
+        return None
+
+
 def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str | None:
     """
     يتعرف على المنتج من الصورة.
     الأولوية:
       1. OpenAI GPT-4o-mini vision (Replit integration — موثوق وسريع)
       2. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY + image_url)
-      3. Gemini API (fallback أخير)
+      3. Gemini API (إذا وُجد GEMINI_API_KEY)
+      4. Hugging Face BLIP (مجاني بلا مفتاح — يعمل دائماً كـ fallback)
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
     # ── OpenAI Vision (الأولوية الأولى) ──────────────────────────────────────
@@ -342,8 +388,14 @@ def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str 
             return result
         logger.info("Google Lens لم يتعرف — أنتقل لـ Gemini")
 
-    # ── Gemini (fallback أخير) ────────────────────────────────────────────────
-    return _call_gemini(image_bytes)
+    # ── Gemini (الأولوية الثالثة) ─────────────────────────────────────────────
+    result = _call_gemini(image_bytes)
+    if result:
+        return result
+    logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+
+    # ── Hugging Face BLIP (fallback مجاني — لا يحتاج مفتاح) ─────────────────
+    return _call_huggingface_vision(image_bytes)
 
 
 def search_amazon_by_keywords(product_name: str, domain: str = AMAZON_DOMAIN) -> list[dict]:
