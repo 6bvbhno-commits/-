@@ -1,5 +1,2 @@
-[phases.install]
-cmds = ["pip install --break-system-packages -r bot/requirements.txt"]
-
 [start]
 cmd = "bash bot/run.sh"
