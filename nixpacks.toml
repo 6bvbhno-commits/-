@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["python3 -m pip install -r bot/requirements.txt"]
+
+[start]
+cmd = "bash bot/run.sh"
