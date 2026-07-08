@@ -262,7 +262,6 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
             # العنوان: h2 span أكثر موثوقية من h2 a span
             title_el = item.select_one("h2 span") or item.select_one("h2 a span")
             link_el  = item.select_one("h2 a")
-            price_el = item.select_one("span.a-price-whole")
 
             if not title_el:
                 continue
@@ -288,10 +287,22 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
             else:
                 continue
 
-            price_text = price_el.get_text(strip=True) if price_el else ""
-            # تنظيف السعر من الأحرف الزائدة وإضافة الوحدة
-            price_clean = re.sub(r"[^\d.,٠-٩]", "", price_text)
-            price = f"{price_clean} ريال" if price_clean else "غير محدد"
+            # استخراج السعر — محاولة عدة selectors
+            price = "غير محدد"
+            price_selectors = [
+                "span.a-price .a-offscreen",
+                ".a-price-whole",
+                "span.a-offscreen",
+                ".a-color-price",
+            ]
+            for sel in price_selectors:
+                el = item.select_one(sel)
+                if el:
+                    raw = el.get_text(strip=True)
+                    price_clean = re.sub(r"[^\d.,٠-٩]", "", raw)
+                    if price_clean and any(c.isdigit() for c in price_clean):
+                        price = f"{price_clean} ريال"
+                        break
 
             results.append({
                 "title": title[:60] + ("..." if len(title) > 60 else ""),
@@ -389,22 +400,30 @@ def _escape_md(text: str) -> str:
 
 def format_search_results(product_name: str, offers: list[dict]) -> str:
     """يبني رسالة تيليجرام تعرض نتائج البحث مع روابط الأفلييت."""
+    import urllib.parse
     safe_name = _escape_md(product_name)
+    search_url = (
+        f"https://www.{AMAZON_DOMAIN}/s?"
+        f"k={urllib.parse.quote(product_name)}&tag={AFFILIATE_TAG}"
+    )
 
     if not offers:
         return (
             f"🔍 تم التعرف على: *{safe_name}*\n\n"
-            "❌ لم نجد نتائج مطابقة حالياً في أمازون السعودية.\n"
-            "جرّب إرسال رابط المنتج مباشرة."
+            "⚠️ ما قدرت أجلب الأسعار مباشرة الآن (أمازون يحجب الطلبات أحياناً).\n\n"
+            f"🔎 ابحث عنه مباشرة في أمازون:\n{search_url}\n\n"
+            "_(رابط تسويق بالعمولة)_"
         )
 
     lines = [f"🔍 تم التعرف على: *{safe_name}*\n\n💰 *أفضل الأسعار في أمازون:*\n"]
     for i, offer in enumerate(offers, start=1):
         safe_title = _escape_md(offer["title"])
-        safe_price = _escape_md(offer["price"])
+        price      = offer["price"]
+        safe_price = _escape_md(price)
+        price_line = f"   • السعر: `{safe_price}`\n" if price != "غير محدد" else ""
         lines.append(
             f"{i}. *{safe_title}*\n"
-            f"   • السعر: `{safe_price}`\n"
+            f"{price_line}"
             f"   • الرابط: {offer['link']}\n"
         )
     lines.append("_(روابط تسويق بالعمولة)_")

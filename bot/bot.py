@@ -615,6 +615,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
             return
 
+        # احفظ URL الصورة من تيليجرام لاستخدامه مع Google Lens
+        image_url = photo_file.file_path or ""
+
         # retry عند timeout — مرتان
         photo_bytes = None
         for _attempt in range(2):
@@ -643,7 +646,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop         = asyncio.get_running_loop()
         product_name = await loop.run_in_executor(
-            None, identify_product_from_image, bytes(photo_bytes), ""
+            None, identify_product_from_image, bytes(photo_bytes), image_url
         )
     except Exception as e:
         logger.error("فشل تحليل الصورة: %s", e)
