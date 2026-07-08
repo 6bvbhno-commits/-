@@ -473,6 +473,31 @@ def _build_myalerts_content(alerts: list[dict]) -> tuple[str, list]:
     return text, keyboard
 
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعرض حالة مفاتيح API المتاحة — للتشخيص فقط (لا يكشف القيم)."""
+    from config import (
+        OPENAI_BASE_URL, OPENAI_API_KEY,
+        GEMINI_API_KEY, SERPAPI_KEY,
+        DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
+        TELEGRAM_BOT_TOKEN,
+    )
+
+    def _status(val: str) -> str:
+        return "✅ متوفر" if val else "❌ غير موجود"
+
+    msg = (
+        "🔧 *حالة مفاتيح API:*\n\n"
+        f"• OpenAI Vision (Replit): {_status(OPENAI_BASE_URL and OPENAI_API_KEY)}\n"
+        f"• Gemini API: {_status(GEMINI_API_KEY)}\n"
+        f"• SerpAPI (Lens): {_status(SERPAPI_KEY)}\n"
+        f"• DeepSeek: {_status(DEEPSEEK_API_KEY)}\n"
+        f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
+        f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n\n"
+        "⚠️ _للتعرف على الصور يجب توفر Gemini أو OpenAI أو SerpAPI_"
+    )
+    await _reply(update, msg)
+
+
 async def myalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعرض تنبيهات المستخدم النشطة مع أزرار الحذف."""
     user_id = update.effective_user.id if update.effective_user else 0
@@ -651,12 +676,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not product_name:
-        await _reply(
-            update,
-            "❌ ما قدرت أتعرف على المنتج.\n"
-            "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة.",
-            parse_mode=None,
-        )
+        from config import GEMINI_API_KEY, OPENAI_API_KEY, SERPAPI_KEY
+        if not GEMINI_API_KEY and not OPENAI_API_KEY and not SERPAPI_KEY:
+            await _reply(
+                update,
+                "❌ مفاتيح التعرف على الصور غير مضبوطة على السيرفر.\n\n"
+                "🔧 الحل: أضف GEMINI\\_API\\_KEY في متغيرات Railway، "
+                "أو أرسل اسم المنتج نصياً وأبحث عنه مباشرة.",
+                parse_mode=None,
+            )
+        else:
+            await _reply(
+                update,
+                "❌ ما قدرت أتعرف على المنتج.\n"
+                "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة.",
+                parse_mode=None,
+            )
         return
 
     await _typing(update, context)
@@ -797,6 +832,7 @@ def main():
     app.add_handler(CommandHandler("start",     start_command))
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
+    app.add_handler(CommandHandler("debug",     debug_command))
 
     # أزرار التنبيهات (Inline Keyboard)
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
