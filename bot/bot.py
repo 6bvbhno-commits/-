@@ -335,8 +335,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # callback_data: al:{asin}:{domain}:{price_x100}  (≤ 64 bytes)
         cb_data = f"al:{asin}:{domain}:{price_int}"
         if len(cb_data.encode()) <= 64:
-            # حفظ العنوان مؤقتاً لاستخدامه في التنبيه
+            # حفظ العنوان مؤقتاً — نظّف القديم إذا تراكمت أكثر من 20 مفتاح
             if offer.get("title"):
+                ptitle_keys = [k for k in context.user_data if k.startswith("ptitle_")]
+                if len(ptitle_keys) >= 20:
+                    for old_k in ptitle_keys[:10]:
+                        context.user_data.pop(old_k, None)
                 context.user_data[f"ptitle_{asin}"] = offer["title"][:80]
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔔 نبّهني لما ينزل السعر", callback_data=cb_data),
@@ -441,15 +445,24 @@ async def handle_alert_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # أمر /myalerts
 # =============================================================================
 
+def _esc_md(text: str) -> str:
+    """يهرّب أحرف Markdown v1 في النص الديناميكي."""
+    for ch in r"_*`[":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _build_myalerts_content(alerts: list[dict]) -> tuple[str, list]:
     """يبني نص رسالة + مصفوفة أزرار لقائمة التنبيهات."""
     text = f"🔔 *تنبيهاتك النشطة ({len(alerts)} من {_pa.MAX_ALERTS_PER_USER}):*\n\n"
     keyboard = []
     for i, a in enumerate(alerts, 1):
-        name = (a.get("product_name") or a["asin"])[:40]
+        raw_name = (a.get("product_name") or a["asin"])[:40]
+        name = _esc_md(raw_name)          # هرّب الأحرف الخاصة
+        price = f"{a['last_known']:.2f}"
         text += (
             f"*{i}.* 📦 {name}\n"
-            f"   💰 تنبيه عند انخفاض عن `{a['last_known']:.2f} SAR`\n\n"
+            f"   💰 تنبيه عند انخفاض عن `{price} SAR`\n\n"
         )
         keyboard.append([
             InlineKeyboardButton(

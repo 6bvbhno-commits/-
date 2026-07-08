@@ -150,10 +150,10 @@ def _call_gemini(image_bytes: bytes) -> str | None:
     import time
 
     models = [
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",       # مستقر ومتاح — الأولوية
+        "gemini-2.0-flash-lite",  # أخف وأسرع
+        "gemini-1.5-flash",       # احتياط قديم لكن موثوق
+        "gemini-2.5-flash",       # قد يكون متاحاً في بعض المناطق
     ]
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
