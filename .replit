@@ -1,12 +1,9 @@
 modules = ["nodejs-24", "python-base-3.13"]
 
 [deployment]
-run = ["sh", "-c", "cd bot && python3 bot.py"]
+run = ["bash", "bot/run.sh"]
 deploymentTarget = "vm"
-
-[deployment.postBuild]
-args = ["pnpm", "store", "prune"]
-env = { "CI" = "true" }
+build = ["sh", "-c", "pip install -r bot/requirements.txt -q"]
 
 [workflows]
 runButton = "Project"
