@@ -4,6 +4,17 @@
 # ══════════════════════════════════════════════════════════════
 cd "$(dirname "$0")"
 
+# ── إعداد بيئة Python افتراضية في /tmp (يعمل في التطوير والنشر) ──
+VENV="/tmp/bot-venv"
+if [ ! -f "$VENV/bin/python3" ]; then
+    echo "⚙️  إنشاء بيئة Python افتراضية..."
+    python3 -m venv "$VENV" --clear
+    "$VENV/bin/pip" install -r requirements.txt -q
+    echo "✅ المكتبات جاهزة"
+fi
+export VIRTUAL_ENV="$VENV"
+export PATH="$VENV/bin:$PATH"
+
 LOG_FILE="/tmp/bot_watchdog.log"
 RESTART_COUNT=0
 ERROR_COUNT=0

@@ -1,9 +1,8 @@
 modules = ["nodejs-24", "python-base-3.13"]
 
 [deployment]
-run = ["bash", "-c", "source /home/user/.bot-venv/bin/activate && bash bot/run.sh"]
+run = ["bash", "bot/run.sh"]
 deploymentTarget = "vm"
-build = ["sh", "-c", "python3 -m venv /home/user/.bot-venv && /home/user/.bot-venv/bin/pip install -r bot/requirements.txt -q"]
 
 [workflows]
 runButton = "Project"
