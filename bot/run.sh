@@ -4,6 +4,13 @@
 # ══════════════════════════════════════════════════════════════
 cd "$(dirname "$0")"
 
+# ── منع التشغيل المزدوج: إذا لم نكن على Railway، لا تشغّل البوت ──
+if [ -z "$RAILWAY_ENVIRONMENT" ]; then
+    echo "⛔ البوت معطّل على Replit — يعمل على Railway فقط."
+    echo "   لتشغيله هنا، احذف متغير RAILWAY_ENVIRONMENT أو عدّل run.sh"
+    exit 0
+fi
+
 # ── إعداد Python: استخدم النظام إذا كانت المكتبات متوفرة (Railway)، وإلا أنشئ venv (Replit) ──
 if python3 -c "import telegram" 2>/dev/null; then
     echo "✅ المكتبات جاهزة في Python النظام"
