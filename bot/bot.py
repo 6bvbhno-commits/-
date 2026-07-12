@@ -3,13 +3,18 @@
 يستخدم مكتبة python-telegram-bot (الإصدار 20+) + Claude AI.
 """
 import asyncio
+import json as _json
 import logging
 import re as _re
+import threading as _threading
 import time as _time
+import requests as _req
 from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer as _HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
-from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
+from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError, Conflict
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,6 +27,7 @@ from telegram.ext import (
 import price_alerts as _pa
 from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
 from amazon_utils import (
+    build_affiliate_link,
     extract_asin,
     extract_domain,
     resolve_short_link,
@@ -42,7 +48,11 @@ logger = logging.getLogger(__name__)
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
-_RATE_MAX    = 20
+_RATE_MAX    = 30   # رُفع من 20 → 30 لاستيعاب ضغط الحملات التسويقية
+
+# ─── Global backpressure — يحد الطلبات الثقيلة المتزامنة (LLM + scraping) ──
+# يُهيَّأ في _post_init بعد بدء event loop
+_GLOBAL_SEM: asyncio.Semaphore | None = None
 _user_times: dict[int, list[float]] = defaultdict(list)
 _user_last_seen: dict[int, float]   = {}   # آخر نشاط — للتنظيف الدوري
 
@@ -79,6 +89,41 @@ _stats: dict = {
     "last_request_ts": 0.0,
 }
 
+# ─── Stats HTTP server (port 8766) — يُعرض للـ dashboard ─────────────────────
+_STATS_PORT = 8766
+
+class _StatsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/stats":
+            payload = _json.dumps({
+                "active_users":   len(_user_last_seen),
+                "requests_total": _stats.get("requests_total", 0),
+                "requests_ok":    _stats.get("requests_ok",    0),
+                "requests_error": _stats.get("requests_error", 0),
+                "flood_waits":    _stats.get("flood_waits",    0),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *_):
+        pass   # صامت — لا نريد logs لكل طلب
+
+def _start_stats_server():
+    try:
+        srv = _HTTPServer(("127.0.0.1", _STATS_PORT), _StatsHandler)
+    except OSError as _e:
+        logger.warning("📡 Stats server: تعذّر الربط بـ port %d — %s (البوت يستمر بدونه)", _STATS_PORT, _e)
+        return
+    t = _threading.Thread(target=srv.serve_forever, daemon=True, name="stats-http")
+    t.start()
+    logger.info("📡 Stats server شغّال على port %d", _STATS_PORT)
+
 def _stat(key: str, inc: int = 1) -> None:
     _stats[key] = _stats.get(key, 0) + inc
     if key in ("requests_ok", "requests_error"):
@@ -89,10 +134,11 @@ def _stat(key: str, inc: int = 1) -> None:
 async def _memory_cleanup_loop() -> None:
     """يُنظّف بيانات المستخدمين غير النشطين كل 30 دقيقة."""
     while True:
-        await asyncio.sleep(1800)
         try:
+            await asyncio.sleep(1800)
             cutoff = _time.monotonic() - _USER_TTL
-            stale  = [uid for uid, t in _user_last_seen.items() if t < cutoff]
+            # list() snapshot — يمنع RuntimeError لو تغيّر الـ dict أثناء الـ iteration
+            stale  = [uid for uid, t in list(_user_last_seen.items()) if t < cutoff]
             for uid in stale:
                 _user_times.pop(uid, None)
                 _user_history.pop(uid, None)
@@ -107,8 +153,36 @@ async def _memory_cleanup_loop() -> None:
                 _stats.get("requests_error", 0),
                 _stats.get("flood_waits",    0),
             )
+        except asyncio.CancelledError:
+            raise   # السماح بإيقاف المهمة عند الإغلاق النظيف
         except Exception as _ce:
             logger.warning("memory_cleanup فشل: %s", _ce)
+
+
+async def _keep_alive_loop() -> None:
+    """
+    يُرسل ping لـ API كل 4 دقائق لمنع Replit من إيقاف الخادم.
+    حيوي خلال الحملات التسويقية — أي توقف يعني ضياع رسائل المستخدمين.
+    """
+    import os as _os
+    domain = _os.getenv("REPLIT_DEV_DOMAIN", "")
+    if not domain:
+        logger.info("keep_alive: لا يوجد REPLIT_DEV_DOMAIN — تم تخطي الـ ping")
+        return
+    url = f"https://{domain}/api/healthz"
+    await asyncio.sleep(60)   # انتظر دقيقة بعد البداية
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            # requests يدعم verify=False بشكل أبسط من httpx داخل Replit
+            status = await loop.run_in_executor(
+                None,
+                lambda: _req.get(url, timeout=10, verify=False).status_code
+            )
+            logger.info("keep_alive: ping → %s", status)
+        except Exception as _e:
+            logger.warning("keep_alive: ping فشل — %s", _e)
+        await asyncio.sleep(240)   # كل 4 دقائق
 
 
 async def _health_monitor_loop() -> None:
@@ -116,31 +190,26 @@ async def _health_monitor_loop() -> None:
     يُراقب البوت كل 5 دقائق ويكتشف أي حالة تجمّد.
     إذا مرّت 10 دقائق بدون أي طلب ناجح وكان عدد الأخطاء مرتفعاً → يُسجّل تحذيراً.
     """
-    await asyncio.sleep(300)   # انتظر 5 دقائق بعد البدء
     while True:
-        await asyncio.sleep(300)
         try:
+            await asyncio.sleep(300)
             now      = _time.monotonic()
             last_req = _stats.get("last_request_ts", 0.0)
             since    = int(now - last_req) if last_req else -1
             total    = _stats.get("requests_total", 0)
             errors   = _stats.get("requests_error", 0)
             floods   = _stats.get("flood_waits",    0)
-
-            # حساب نسبة الأخطاء (آخر دورة)
             err_rate = (errors / total * 100) if total > 0 else 0
-
             logger.info(
                 "📊 health: %d طلب | %.1f%% أخطاء | %d FloodWait | آخر طلب منذ %ds",
                 total, err_rate, floods, since,
             )
-
-            # تحذير إذا كانت الأخطاء عالية جداً
             if total > 10 and err_rate > 50:
                 logger.warning(
                     "🔴 health: نسبة أخطاء عالية %.1f%% — راجع السجلات", err_rate
                 )
-
+        except asyncio.CancelledError:
+            raise
         except Exception as _he:
             logger.warning("health_monitor فشل: %s", _he)
 
@@ -204,48 +273,97 @@ async def _reply(
             return
 
 
+# حد أقصى لطول تسمية الصورة في تيليجرام
+_MAX_CAPTION = 1024
+
+
+async def _reply_photo(
+    update: Update,
+    photo_url: str,
+    caption: str,
+    parse_mode: str | None = "Markdown",
+    reply_markup=None,
+) -> bool:
+    """يرسل صورة المنتج مع النص كتسمية. يرجع True عند النجاح.
+
+    عند أي فشل (رابط صورة غير صالح، خطأ تيليجرام) يرجع False كي يتحول
+    المستدعي إلى إرسال النص فقط.
+    """
+    if not update.message or not photo_url or not photo_url.startswith("http"):
+        return False
+    cap = caption if len(caption) <= _MAX_CAPTION else caption[: _MAX_CAPTION - 20] + "\n\n_…_"
+    for attempt in range(3):
+        try:
+            await update.message.reply_photo(
+                photo=photo_url, caption=cap,
+                parse_mode=parse_mode, reply_markup=reply_markup,
+            )
+            return True
+        except RetryAfter as e:
+            wait = min(int(e.retry_after) + 1, 30)
+            logger.warning("Telegram FloodWait (photo) %ds", wait)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                logger.warning("إرسال الصورة فشل شبكياً، سأرسل نصاً: %s", e)
+                return False
+        except TelegramError as e:
+            # رابط صورة غير مقبول من تيليجرام — نتحول للنص
+            logger.info("تعذّر إرسال الصورة (%s) — سأرسل النص فقط", e)
+            return False
+    return False
+
+
 # =============================================================================
 # المعالجات
 # =============================================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
-    user_id = update.effective_user.id if update.effective_user else 0
-    _user_history[user_id].clear()   # بداية محادثة جديدة
+    try:
+        user_id = update.effective_user.id if update.effective_user else 0
+        _user_history[user_id].clear()   # بداية محادثة جديدة
 
-    welcome_text = (
-        "👋 *أهلاً بك!*\n\n"
-        "🏷️ *وش يسوي هذا البوت؟*\n"
-        "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين.\n\n"
-        "📌 *كيف تستخدمه؟*\n"
-        "• 🔗 أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر فوراً\n"
-        "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n"
-        "• 💬 اكتب اسم أي منتج ← يبحث عنه مباشرة\n\n"
-        "📊 البوت يحفظ تاريخ الأسعار ويعطيك توصية شراء ذكية.\n\n"
-        "🔔 *ميزة التنبيهات:* بعد أي سعر، اضغط زر *نبّهني* — راح يرسل لك إشعاراً فور انخفاض السعر!\n"
-        "📋 لعرض تنبيهاتك النشطة: /myalerts\n\n"
-        "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
-    )
-    if MOCK_MODE:
-        welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
-    await _reply(update, welcome_text)
+        welcome_text = (
+            "👋 *أهلاً بك!*\n\n"
+            "🏷️ *وش يسوي هذا البوت؟*\n"
+            "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين.\n\n"
+            "📌 *كيف تستخدمه؟*\n"
+            "• 🔗 أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر فوراً\n"
+            "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n"
+            "• 💬 اكتب اسم أي منتج ← يبحث عنه مباشرة\n\n"
+            "📊 البوت يحفظ تاريخ الأسعار ويعطيك توصية شراء ذكية.\n\n"
+            "🔔 *ميزة التنبيهات:* بعد أي سعر، اضغط زر *نبّهني* — راح يرسل لك إشعاراً فور انخفاض السعر!\n"
+            "📋 لعرض تنبيهاتك النشطة: /myalerts\n\n"
+            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
+        )
+        if MOCK_MODE:
+            welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
+        await _reply(update, welcome_text)
+    except Exception as _e:
+        logger.error("start_command فشل: %s", _e, exc_info=True)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🆘 *المساعدة*\n\n"
-        "• أرسل *رابط منتج أمازون* ← أرد بأرخص سعر ورابط شراء\n"
-        "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n"
-        "• اكتب *اسم أي منتج* ← أبحث عنه مباشرة في أمازون\n"
-        "• اسألني أي سؤال عن التسوق ← أساعدك\n\n"
-        "💡 *نصائح للصور:*\n"
-        "  - وضّح الاسم التجاري، إضاءة جيدة، الجهة الأمامية\n\n"
-        "📋 *الأوامر:*\n"
-        "/start — بداية جديدة\n"
-        "/help — هذه الرسالة\n\n"
-        "⚠️ _الأسعار حية وقد تتغير — تحقق من صفحة المنتج قبل الشراء._"
-    )
-    await _reply(update, help_text)
+    try:
+        help_text = (
+            "🆘 *المساعدة*\n\n"
+            "• أرسل *رابط منتج أمازون* ← أرد بأرخص سعر ورابط شراء\n"
+            "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n"
+            "• اكتب *اسم أي منتج* ← أبحث عنه مباشرة في أمازون\n"
+            "• اسألني أي سؤال عن التسوق ← أساعدك\n\n"
+            "💡 *نصائح للصور:*\n"
+            "  - وضّح الاسم التجاري، إضاءة جيدة، الجهة الأمامية\n\n"
+            "📋 *الأوامر:*\n"
+            "/start — بداية جديدة\n"
+            "/help — هذه الرسالة\n\n"
+            "⚠️ _الأسعار حية وقد تتغير — تحقق من صفحة المنتج قبل الشراء._"
+        )
+        await _reply(update, help_text)
+    except Exception as _e:
+        logger.error("help_command فشل: %s", _e, exc_info=True)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -293,60 +411,82 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     await _reply(update, "🔎 جاري فحص أفضل سعر...", parse_mode=None)
 
-    try:
-        loop  = asyncio.get_running_loop()
-        offer = await loop.run_in_executor(None, get_lowest_offer, asin, domain)
-        message = format_offer_message(offer)
-
-        # تاريخ السعر + توصية Claude
-        if offer and not offer.get("blocked"):
+    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+        try:
+            loop  = asyncio.get_running_loop()
+            # timeout 13 ثانية — يكفي لمحاولة كشط واحدة ناجحة (12s) دون قطعها،
+            # وأسرع من السابق (20s) عند الحجب. لو تجاوزها نرجع رابط الأفلييت مباشرة.
             try:
-                from price_history import format_history_message, get_history
-                from claude_utils   import price_advice
+                offer = await asyncio.wait_for(
+                    loop.run_in_executor(None, get_lowest_offer, asin, domain),
+                    timeout=13.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("get_lowest_offer timeout للـ ASIN %s — إرجاع رابط مباشر", asin)
+                offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
+            message = format_offer_message(offer)
 
-                history_task  = loop.run_in_executor(None, format_history_message, asin, domain)
-                records_task  = loop.run_in_executor(None, get_history, asin, domain, 30)
+            # تاريخ السعر + توصية Claude
+            if offer and not offer.get("blocked"):
+                try:
+                    from price_history import format_history_message, get_history
+                    from claude_utils   import price_advice
 
-                history_msg, records = await asyncio.gather(history_task, records_task)
+                    history_task  = loop.run_in_executor(None, format_history_message, asin, domain)
+                    records_task  = loop.run_in_executor(None, get_history, asin, domain, 30)
 
-                if history_msg:
-                    message = message + "\n\n" + history_msg
+                    history_msg, records = await asyncio.gather(history_task, records_task)
 
-                # توصية Claude إذا كان عندنا بيانات كافية
-                if records and len(records) >= 3 and offer.get("price_val"):
-                    advice = await loop.run_in_executor(
-                        None, price_advice, offer["price_val"], records
-                    )
-                    if advice:
-                        message = message + "\n" + advice
+                    if history_msg:
+                        message = message + "\n\n" + history_msg
 
-            except Exception as _ph_err:
-                logger.warning("price/claude block فشل: %s", _ph_err)
+                    # توصية Claude إذا كان عندنا بيانات كافية
+                    if records and len(records) >= 3 and offer.get("price_val"):
+                        advice = await loop.run_in_executor(
+                            None, price_advice, offer["price_val"], records
+                        )
+                        if advice:
+                            message = message + "\n" + advice
 
-    except Exception as e:
-        logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
-        await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
-        return
+                except Exception as _ph_err:
+                    logger.warning("price/claude block فشل: %s", _ph_err)
 
-    # ── زر تنبيه انخفاض السعر ────────────────────────────────────────────────
-    kb = None
+        except Exception as e:
+            logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
+            await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
+            return
+
+    # ── أزرار: شراء (URL → متصفح خارجي) + تنبيه ────────────────────────────
+    # نبني الرابط هنا مباشرة — لا نعتمد على offer/cache/API (صيغة Associates الرسمية)
+    affiliate_url = build_affiliate_link(asin, domain)
+    buy_btn  = InlineKeyboardButton("🛒 اشتري من أمازون ↗", url=affiliate_url)
+    alert_btn = None
+
     if offer and not offer.get("blocked") and not offer.get("stale") and offer.get("price_val"):
         price_int = int(offer["price_val"] * 100)
-        # callback_data: al:{asin}:{domain}:{price_x100}  (≤ 64 bytes)
         cb_data = f"al:{asin}:{domain}:{price_int}"
         if len(cb_data.encode()) <= 64:
-            # حفظ العنوان مؤقتاً — نظّف القديم إذا تراكمت أكثر من 20 مفتاح
             if offer.get("title"):
                 ptitle_keys = [k for k in context.user_data if k.startswith("ptitle_")]
-                if len(ptitle_keys) >= 20:
-                    for old_k in ptitle_keys[:10]:
+                if len(ptitle_keys) >= 10:
+                    for old_k in ptitle_keys[:5]:
                         context.user_data.pop(old_k, None)
                 context.user_data[f"ptitle_{asin}"] = offer["title"][:80]
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔔 نبّهني لما ينزل السعر", callback_data=cb_data),
-            ]])
+            alert_btn = InlineKeyboardButton("🔔 نبّهني لما ينزل السعر", callback_data=cb_data)
 
-    await _reply(update, message, reply_markup=kb)
+    # بناء الكيبورد: زر الشراء أولاً (أهم)، ثم زر التنبيه
+    rows = []
+    if buy_btn:
+        rows.append([buy_btn])
+    if alert_btn:
+        rows.append([alert_btn])
+    kb = InlineKeyboardMarkup(rows) if rows else None
+
+    # صورة المنتج (تأكيد أن العرض موجود) — تُرسل كتسمية، وإلا نص فقط
+    image_url = (offer or {}).get("image", "") if offer else ""
+    sent = await _reply_photo(update, image_url, message, reply_markup=kb)
+    if not sent:
+        await _reply(update, message, reply_markup=kb)
     _stat("requests_ok")
 
 
@@ -363,6 +503,12 @@ def _mdv2(text: str) -> str:
 
 async def handle_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج نقرات أزرار تنبيهات الأسعار."""
+    try:
+        await _handle_alert_callback_inner(update, context)
+    except Exception as _e:
+        logger.error("handle_alert_callback فشل: %s", _e, exc_info=True)
+
+async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.message:
         return
@@ -569,10 +715,7 @@ async def _price_alert_check_loop(app) -> None:
                         saving  = alert["last_known"] - new_price
                         pct     = saving / alert["last_known"] * 100
                         raw_name = (alert.get("product_name") or alert["asin"])[:60]
-                        link     = (
-                            f"https://www.{alert['domain']}/dp/{alert['asin']}"
-                            f"?tag={AFFILIATE_TAG}"
-                        )
+                        link     = build_affiliate_link(alert["asin"], alert["domain"])
                         # كل محتوى ديناميكي يُهرَّب لـ MarkdownV2
                         safe_name  = _mdv2(raw_name)
                         safe_np    = _mdv2(f"{new_price:.2f}")
@@ -640,6 +783,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
             return
 
+        # رابط Telegram CDN للصورة (يُستخدم في Google Lens)
+        image_url = photo_file.file_path or ""
+
         # retry عند timeout — مرتان
         photo_bytes = None
         for _attempt in range(2):
@@ -697,15 +843,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     await _reply(update, f"✅ تم التعرف على المنتج:\n*{product_name}*\n\nجاري البحث في أمازون...", )
 
-    try:
-        loop   = asyncio.get_running_loop()
-        offers = await loop.run_in_executor(None, search_amazon_by_keywords, product_name)
-    except Exception as e:
-        logger.error("فشل البحث في أمازون: %s", e)
-        await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
-        return
+    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+        try:
+            loop   = asyncio.get_running_loop()
+            offers = await asyncio.wait_for(
+                loop.run_in_executor(None, search_amazon_by_keywords, product_name),
+                timeout=20.0,
+            )
+        except asyncio.TimeoutError:
+            offers = []
+        except Exception as e:
+            logger.error("فشل البحث في أمازون: %s", e)
+            await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
+            return
 
-    await _reply(update, format_search_results(product_name, offers))
+    msg, search_url, image_url = format_search_results(product_name, offers)
+    search_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔎 ابحث في أمازون ↗", url=search_url)
+    ]]) if search_url and search_url.startswith("http") else None
+    sent = await _reply_photo(update, image_url, msg, reply_markup=search_kb)
+    if not sent:
+        await _reply(update, msg, reply_markup=search_kb)
     _stat("requests_ok")
 
 
@@ -745,24 +903,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             f"🔍 جاري البحث عن: *{product_query}*",
         )
-        try:
-            offers  = await loop.run_in_executor(None, search_amazon_by_keywords, product_query)
-            message = format_search_results(product_query, offers)
-        except Exception as e:
-            logger.error("فشل البحث عن '%s': %s", product_query, e)
-            message = "❌ حصل خطأ أثناء البحث. حاول مرة ثانية."
+        async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+            try:
+                offers  = await asyncio.wait_for(
+                    loop.run_in_executor(None, search_amazon_by_keywords, product_query),
+                    timeout=25.0,
+                )
+                message, search_url, image_url = format_search_results(product_query, offers)
+            except asyncio.TimeoutError:
+                message, search_url, image_url = format_search_results(product_query, [])
+            except Exception as e:
+                logger.error("فشل البحث عن '%s': %s", product_query, e)
+                message, search_url, image_url = "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", "", ""
 
-        await _reply(update, message)
+        search_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔎 ابحث في أمازون ↗", url=search_url)
+        ]]) if search_url and search_url.startswith("http") else None
+        sent = await _reply_photo(update, image_url, message, reply_markup=search_kb)
+        if not sent:
+            await _reply(update, message, reply_markup=search_kb)
         _add_to_history(user_id, "assistant", message[:300])
         return
 
     # ← رسالة عامة: Claude يرد محادثياً
-    try:
-        from claude_utils import chat_response
-        history  = _user_history[user_id][:-1]   # بدون الرسالة الحالية (مضافة سابقاً)
-        response = await loop.run_in_executor(None, chat_response, text, history)
-    except Exception as e:
-        logger.warning("Claude chat فشل: %s", e)
+    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+        try:
+            from claude_utils import chat_response
+            history  = _user_history[user_id][:-1]
+            response = await asyncio.wait_for(
+                loop.run_in_executor(None, chat_response, text, history),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            response = None
+        except Exception as e:
+            logger.warning("Claude chat فشل: %s", e)
+            response = None
+
+    if not response:
         response = (
             "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة أو 💬 اسم منتج "
             "وأجيبك بأفضل سعر فوراً."
@@ -774,29 +952,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    err = context.error
+    try:
+        err = context.error
 
-    # FloodWait — تيليجرام يطلب انتظاراً
-    if isinstance(err, RetryAfter):
-        _stat("flood_waits")
-        logger.warning("Telegram FloodWait %ds — error_handler", err.retry_after)
-        return
+        # FloodWait — تيليجرام يطلب انتظاراً
+        if isinstance(err, RetryAfter):
+            _stat("flood_waits")
+            logger.warning("Telegram FloodWait %ds — error_handler", err.retry_after)
+            await asyncio.sleep(min(int(err.retry_after) + 1, 30))
+            return
 
-    # أخطاء شبكة عابرة — لا داعي لرسالة
-    if isinstance(err, (TimedOut, NetworkError)):
-        logger.warning("Telegram network خطأ عابر: %s", err)
-        return
+        # Conflict — نسخة أخرى تعمل: اطرد المنافس بشكل غير متزامن ثم ارجع للـ polling
+        if isinstance(err, Conflict):
+            logger.warning("⚡ تعارض: أطرد النسخة المنافسة...")
+            _kick = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+            loop = asyncio.get_running_loop()
+            try:
+                r1 = await loop.run_in_executor(
+                    None,
+                    lambda: _req.post(f"{_kick}/setWebhook", json={"url": "https://example.com/kick"}, timeout=8)
+                )
+                if not r1.json().get("ok"):
+                    logger.warning("setWebhook أعاد: %s", r1.text)
+                await asyncio.sleep(0.8)
+                r2 = await loop.run_in_executor(
+                    None,
+                    lambda: _req.post(f"{_kick}/deleteWebhook", json={"drop_pending_updates": False}, timeout=8)
+                )
+                if not r2.json().get("ok"):
+                    logger.warning("deleteWebhook أعاد: %s", r2.text)
+                logger.info("✅ تم طرد المنافس — Polling يستأنف")
+            except Exception as _ce:
+                logger.warning("طرد المنافس فشل: %s", _ce)
+                await asyncio.sleep(3)
+            return
 
-    _stat("requests_error")
-    logger.error("استثناء غير متوقع: %s", err, exc_info=err)
+        # أخطاء شبكة عابرة — لا داعي لرسالة
+        if isinstance(err, (TimedOut, NetworkError)):
+            logger.warning("Telegram network خطأ عابر: %s", err)
+            return
 
-    if isinstance(update, Update) and update.message:
-        try:
-            await update.message.reply_text(
-                "⚠️ حصل خطأ غير متوقع. حاول مرة أخرى أو أرسل /start."
-            )
-        except Exception:
-            pass
+        _stat("requests_error")
+        logger.error("استثناء غير متوقع: %s", err, exc_info=err)
+
+        if isinstance(update, Update) and update.message:
+            try:
+                await update.message.reply_text(
+                    "⚠️ حصل خطأ غير متوقع. حاول مرة أخرى أو أرسل /start."
+                )
+            except Exception:
+                pass
+
+    except Exception as _ef:
+        # error_handler نفسه فشل — نسجّل فقط ولا نرفع
+        logger.critical("error_handler نفسه فشل: %s", _ef, exc_info=True)
 
 
 # =============================================================================
@@ -805,10 +1014,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
+    global _GLOBAL_SEM
+    _GLOBAL_SEM = asyncio.Semaphore(8)   # حد أقصى 8 طلب ثقيل متزامن
+    _start_stats_server()
     asyncio.create_task(_memory_cleanup_loop())
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_price_alert_check_loop(application))
-    logger.info("✅ مهام الخلفية بدأت: تنظيف الذاكرة + مراقبة الصحة + تنبيهات الأسعار")
+    asyncio.create_task(_keep_alive_loop())
+    logger.info("✅ مهام الخلفية بدأت: تنظيف الذاكرة + مراقبة الصحة + تنبيهات الأسعار + keep-alive")
 
 
 def main():
@@ -819,12 +1032,41 @@ def main():
     print("=" * 50)
     print(f"📊 MOCK_MODE: {MOCK_MODE}")
     print(f"   {'⚠️  أسعار وهمية' if MOCK_MODE else '🔴 أسعار حقيقية'}")
+    print(f"🔗 Affiliate tag: {AFFILIATE_TAG}")
+    print(f"🔗 Link sample:   {build_affiliate_link('B0GM947WC5', AMAZON_DOMAIN)}")
     print("=" * 50)
+
+    import os as _os
+
+    _DEV_DOMAIN  = _os.getenv("REPLIT_DEV_DOMAIN", "")
+    _WEBHOOK_URL = f"https://{_DEV_DOMAIN}/api/tgwh" if _DEV_DOMAIN else ""
+    _BOT_PORT    = 8765
+    _URL_PATH    = "/tgwh"
+
+    # ── ضبط اتصال قوي يتحمّل تذبذب الشبكة بدون توقف ──────────────────────
+    # طلبات عامة: pool كبير + مهلات متوازنة
+    _req_general = HTTPXRequest(
+        connection_pool_size=256,   # يتحمّل عدد كبير من الطلبات المتزامنة
+        connect_timeout=15.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    # طلب get_updates (polling): read_timeout أطول من long-polling نفسه
+    _req_updates = HTTPXRequest(
+        connection_pool_size=32,
+        connect_timeout=15.0,
+        read_timeout=40.0,          # أطول من poll timeout عشان ما يقطع الاتصال
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
 
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)
+        .request(_req_general)
+        .get_updates_request(_req_updates)
         .post_init(_post_init)
         .build()
     )
@@ -833,34 +1075,50 @@ def main():
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
     app.add_handler(CommandHandler("debug",     debug_command))
-
-    # أزرار التنبيهات (Inline Keyboard)
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
-
-    # صور وملفات صور
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
-
-    # روابط أمازون
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
             handle_link,
         )
     )
-
-    # أي نص آخر (اسم منتج، سؤال، محادثة) → Claude
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
             handle_text,
         )
     )
-
     app.add_error_handler(error_handler)
 
     print("🚀 البوت شغّال الآن...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+    # ── طرد أي جلسة polling منافسة (Railway وغيرها) ──────────────────────────
+    # setWebhook يقطع أي polling نشط فوراً، deleteWebhook يعيد الحالة نظيفة.
+    # drop_pending_updates=False ← Telegram يحتفظ بالرسائل خلال الانقطاع ويسلمها عند العودة.
+    _kick_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    _dummy    = "https://example.com/kick"
+    try:
+        r1 = _req.post(f"{_kick_url}/setWebhook",    json={"url": _dummy}, timeout=10)
+        if not r1.json().get("ok"):
+            print(f"⚠️  setWebhook: {r1.text}")
+        _time.sleep(0.8)
+        r2 = _req.post(f"{_kick_url}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+        if not r2.json().get("ok"):
+            print(f"⚠️  deleteWebhook: {r2.text}")
+        _time.sleep(0.2)
+        print("✅ طردت أي نسخة منافسة — Polling كل ثانية يبدأ الآن")
+    except Exception as _ke:
+        print(f"⚠️  تعذّر الطرد: {_ke}")
+
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,                   # long-polling — أقل من read_timeout (40s)
+        bootstrap_retries=-1,         # محاولات لا نهائية وقت الإقلاع — لا يستسلم عند تذبذب الشبكة
+        drop_pending_updates=False,   # ← لا نحذف رسائل — Telegram يحتفظ بها ويسلمها فور عودتنا
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":

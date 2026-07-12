@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urlparse, parse_qs, urljoin
 
 import requests
 
+from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
 from config import AFFILIATE_TAG, AMAZON_DOMAIN, SERPAPI_KEY
 
 logger = logging.getLogger(__name__)
@@ -66,34 +67,12 @@ def _parse_price(raw) -> tuple[float | None, str | None]:
 
 
 def _affiliate_link(asin: str | None, raw_link: str, domain: str) -> str:
-    """
-    يبني رابط أفلييت — التاق يُضاف دائماً بغض النظر عن مصدر الرابط:
-    - إذا كان ASIN موجوداً → /dp/ASIN?tag=TAG  (أفضل شكل)
-    - وإلا يبني رابط أمازون من raw_link ويضيف tag= (يستبدله لو موجود مسبقاً)
-    - إذا لم يكن هناك أي بيانات → رابط بحث أمازون مع التاق
-    """
+    """يبني رابط أفلييت بصيغة Associates الرسمية."""
     if asin:
-        return f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
-
+        return build_affiliate_link(asin, domain)
     if raw_link:
-        # نزيل tag= القديم إن وُجد ثم نضيف التاق الصحيح
-        from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
-        try:
-            parsed = urlparse(raw_link)
-            params = parse_qs(parsed.query, keep_blank_values=True)
-            params.pop("tag", None)               # نحذف أي tag قديم
-            params["tag"] = [AFFILIATE_TAG]
-            new_query = urlencode({k: v[0] for k, v in params.items()})
-            tagged = urlunparse(parsed._replace(query=new_query))
-            # إذا كان الرابط لا يشير لأمازون نبني رابطاً نظيفاً بدلاً منه
-            if "amazon." not in (parsed.netloc or parsed.path):
-                return f"https://www.{domain}/s?k=&tag={AFFILIATE_TAG}"
-            return tagged
-        except Exception:
-            pass
-
-    # fallback: صفحة بحث فارغة — الأفضل من رابط بدون تاق
-    return f"https://www.{domain}/?tag={AFFILIATE_TAG}"
+        return tag_amazon_url(raw_link, domain)
+    return build_affiliate_search_link("", domain)
 
 
 # ─── جلب بيانات منتج بـ ASIN ──────────────────────────────────────────────────
@@ -179,6 +158,7 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             "is_prime":       is_prime,
             "offer_count":    offer_count,
             "affiliate_link": aff_link,
+            "image":          product.get("thumbnail") or "",
         }
 
     except Exception as exc:
@@ -202,7 +182,7 @@ def search_items(keywords: str, domain: str = AMAZON_DOMAIN, max_results: int = 
         resp = requests.get(
             _BASE,
             params={
-                "engine":        "amazon_search",
+                "engine":        "amazon",
                 "k":             keywords,
                 "amazon_domain": domain,
                 "api_key":       SERPAPI_KEY,
@@ -248,6 +228,7 @@ def search_items(keywords: str, domain: str = AMAZON_DOMAIN, max_results: int = 
                 "title": title[:80],
                 "price": price_text,
                 "link":  link,
+                "image": item.get("thumbnail") or "",
             })
 
         return results

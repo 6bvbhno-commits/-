@@ -1,22 +1,32 @@
 """
 Amazon PA API v5 — الواجهة الرسمية لأسعار أمازون.
-تستخدم AWS Signature V4 للتوقيع، بدون أي SDK خارجي.
-تدعم: GetItems (بـ ASIN) و SearchItems (بالكلمات المفتاحية).
 
-المتطلبات (Replit Secrets):
-  AMAZON_ACCESS_KEY  — Access Key ID
-  AMAZON_SECRET_KEY  — Secret Access Key
+يدعم طريقتَي توثيق:
+  1. LWA (Login with Amazon) OAuth2 — التنسيق الجديد
+     المفاتيح: AMAZON_LWA_CLIENT_ID + AMAZON_LWA_CLIENT_SECRET
+  2. AWS Signature V4 — التنسيق القديم (احتياطي)
+     المفاتيح: AMAZON_ACCESS_KEY + AMAZON_SECRET_KEY
 """
 
 import hashlib
 import hmac
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 import requests
 
-from config import AFFILIATE_TAG, AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_DOMAIN
+from amazon_utils import build_affiliate_link
+from config import (
+    AFFILIATE_TAG,
+    AMAZON_DOMAIN,
+    AMAZON_ACCESS_KEY,
+    AMAZON_SECRET_KEY,
+    AMAZON_LWA_CLIENT_ID,
+    AMAZON_LWA_CLIENT_SECRET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +38,6 @@ _PARTNER_TYPE = "Associates"
 _MARKETPLACE  = "www.amazon.sa"
 _LANG         = "ar_SA"
 
-# الموارد المطلوبة من كل طلب
 _RESOURCES = [
     "Images.Primary.Medium",
     "ItemInfo.Title",
@@ -38,14 +47,69 @@ _RESOURCES = [
     "Offers.Summaries.OfferCount",
 ]
 
-# خريطة path → اسم العملية الصحيح (CamelCase) المطلوب في X-Amz-Target
+# ─── LWA token cache ──────────────────────────────────────────────────────────
+_lwa_token: str = ""
+_lwa_expires_at: float = 0.0
+_lwa_lock = threading.Lock()
+_lwa_permanently_failed: bool = False   # True بعد أول 400 — نتخطى LWA نهائياً
+
+LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
+
+
+def _get_lwa_token() -> str | None:
+    """
+    يحصل على access_token من LWA ويُخزّنه حتى انتهاء صلاحيته.
+    إذا فشل بـ 400 مرة واحدة، يُعطّل LWA نهائياً لهذه الجلسة.
+    """
+    global _lwa_token, _lwa_expires_at, _lwa_permanently_failed
+
+    with _lwa_lock:
+        if _lwa_permanently_failed:
+            return None
+
+        # إذا ما زال صالحاً (مع هامش 60 ثانية)
+        if _lwa_token and time.time() < _lwa_expires_at - 60:
+            return _lwa_token
+
+        try:
+            resp = requests.post(
+                LWA_TOKEN_URL,
+                data={
+                    "grant_type":    "client_credentials",
+                    "client_id":     AMAZON_LWA_CLIENT_ID,
+                    "client_secret": AMAZON_LWA_CLIENT_SECRET,
+                    "scope":         "ProductAdvertisingAPI",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 400:
+                # هذه المفاتيح ليست لـ PA API — عطّل LWA نهائياً
+                logger.warning("LWA 400: هذه المفاتيح لا تدعم PA API — سيتم تعطيل LWA نهائياً")
+                _lwa_permanently_failed = True
+                return None
+            if resp.status_code != 200:
+                logger.error("LWA token error: HTTP %s", resp.status_code)
+                return None
+
+            data = resp.json()
+            _lwa_token      = data["access_token"]
+            expires_in      = int(data.get("expires_in", 3600))
+            _lwa_expires_at = time.time() + expires_in
+            logger.info("LWA token تم التحديث، صالح لـ %d ثانية", expires_in)
+            return _lwa_token
+
+        except Exception as exc:
+            logger.error("LWA token exception: %s", exc)
+            return None
+
+
+# ─── AWS Signature V4 (التنسيق القديم) ───────────────────────────────────────
+
 _OP_NAMES = {
     "getitems":    "GetItems",
     "searchitems": "SearchItems",
 }
 
-
-# ─── AWS Signature V4 ─────────────────────────────────────────────────────────
 
 def _hmac_sha256(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -59,23 +123,19 @@ def _signing_key(secret: str, date_str: str) -> bytes:
     return k
 
 
-def _sign_request(path: str, payload: dict) -> dict:
-    """
-    يبني ترويسات HTTP الموقّعة بـ AWS SigV4.
-    path مثال: "/paapi5/getitems"
-    """
-    op_slug   = path.split("/")[-1]          # "getitems"
-    op_name   = _OP_NAMES.get(op_slug, op_slug)  # "GetItems"
-    target    = f"com.amazon.paapi5.v1.ProductAdvertisingAPIv1.{op_name}"
+def _sign_request_aws(path: str, payload: dict) -> dict:
+    """يبني ترويسات AWS SigV4."""
+    op_slug  = path.split("/")[-1]
+    op_name  = _OP_NAMES.get(op_slug, op_slug)
+    target   = f"com.amazon.paapi5.v1.ProductAdvertisingAPIv1.{op_name}"
 
-    now       = datetime.now(timezone.utc)
-    amz_date  = now.strftime("%Y%m%dT%H%M%SZ")
-    date_str  = now.strftime("%Y%m%d")
+    now      = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_str = now.strftime("%Y%m%d")
 
     body      = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
-    # --- Canonical Request ---
     canonical_headers = (
         f"content-encoding:amz-1.0\n"
         f"content-type:application/json; charset=utf-8\n"
@@ -86,24 +146,16 @@ def _sign_request(path: str, payload: dict) -> dict:
     signed_headers = "content-encoding;content-type;host;x-amz-date;x-amz-target"
 
     canonical_request = "\n".join([
-        "POST",
-        path,
-        "",               # query string فارغ
-        canonical_headers,
-        signed_headers,
-        body_hash,
+        "POST", path, "",
+        canonical_headers, signed_headers, body_hash,
     ])
 
-    # --- String to Sign ---
     credential_scope = f"{date_str}/{_REGION}/{_SERVICE}/aws4_request"
     string_to_sign   = "\n".join([
-        "AWS4-HMAC-SHA256",
-        amz_date,
-        credential_scope,
+        "AWS4-HMAC-SHA256", amz_date, credential_scope,
         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
     ])
 
-    # --- Signature ---
     sig_key   = _signing_key(AMAZON_SECRET_KEY, date_str)
     signature = hmac.new(sig_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -113,7 +165,6 @@ def _sign_request(path: str, payload: dict) -> dict:
         f"SignedHeaders={signed_headers}, "
         f"Signature={signature}"
     )
-
     return {
         "Content-Encoding": "amz-1.0",
         "Content-Type":     "application/json; charset=utf-8",
@@ -124,11 +175,89 @@ def _sign_request(path: str, payload: dict) -> dict:
     }
 
 
+# ─── إرسال الطلب (يختار التوثيق تلقائياً) ────────────────────────────────────
+
+def _post(path: str, payload: dict) -> dict | None:
+    """
+    يرسل طلب POST بأفضل طريقة توثيق متاحة.
+    الترتيب: LWA OAuth2 → AWS SigV4 (fallback دائم عند أي خطأ LWA)
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    url  = f"https://{_HOST}{path}"
+
+    # ── الأولوية: LWA OAuth2 ────────────────────────────────────────────────
+    lwa_tried = False
+    if AMAZON_LWA_CLIENT_ID and AMAZON_LWA_CLIENT_SECRET:
+        lwa_tried = True
+        token = _get_lwa_token()
+        if token:
+            op_slug = path.split("/")[-1]
+            op_name = _OP_NAMES.get(op_slug, op_slug)
+            target  = f"com.amazon.paapi5.v1.ProductAdvertisingAPIv1.{op_name}"
+            headers = {
+                "Authorization":    f"Bearer {token}",
+                "Content-Encoding": "amz-1.0",
+                "Content-Type":     "application/json; charset=utf-8",
+                "Host":             _HOST,
+                "X-Amz-Target":     target,
+            }
+            try:
+                resp = requests.post(url, headers=headers, data=body, timeout=15)
+
+                # Token منتهي — امسحه وجرب مرة واحدة بـ token جديد
+                if resp.status_code == 401:
+                    with _lwa_lock:
+                        global _lwa_token, _lwa_expires_at, _lwa_permanently_failed
+                        _lwa_token = ""
+                        _lwa_expires_at = 0.0
+                    new_token = _get_lwa_token()
+                    if new_token:
+                        headers["Authorization"] = f"Bearer {new_token}"
+                        resp = requests.post(url, headers=headers, data=body, timeout=15)
+
+                if resp.status_code == 429:
+                    logger.warning("PA API LWA: rate limit (429)")
+                    return None
+
+                if resp.status_code == 200:
+                    return resp.json()
+
+                # أي خطأ آخر (401/403/400 scope خاطئ) → جرّب AWS SigV4
+                logger.warning(
+                    "PA API LWA: HTTP %s — %s — أنتقل لـ AWS SigV4 إذا متوفر",
+                    resp.status_code, resp.text[:300],
+                )
+                # لا نعيد None هنا — نكمل للـ fallback أدناه
+
+            except Exception as exc:
+                logger.error("PA API LWA exception: %s — أنتقل لـ AWS SigV4", exc)
+                # نكمل للـ fallback
+
+    # ── Fallback: AWS SigV4 ─────────────────────────────────────────────────
+    if AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY:
+        try:
+            headers = _sign_request_aws(path, payload)
+            resp    = requests.post(url, headers=headers, data=body, timeout=15)
+            if resp.status_code == 429:
+                logger.warning("PA API AWS: rate limit (429)")
+                return None
+            if resp.status_code != 200:
+                logger.error("PA API AWS: HTTP %s — %s", resp.status_code, resp.text[:400])
+                return None
+            return resp.json()
+        except Exception as exc:
+            logger.error("PA API AWS exception: %s", exc)
+            return None
+
+    logger.warning("PA API: لا توجد مفاتيح توثيق")
+    return None
+
+
 # ─── مساعدات استخراج البيانات ─────────────────────────────────────────────────
 
 def _parse_item(item: dict, asin: str) -> dict | None:
     """يحوّل عنصر PA API إلى نفس شكل نتيجة الكشط."""
-    aff_link = f"https://www.{AMAZON_DOMAIN}/dp/{asin}?tag={AFFILIATE_TAG}"
+    aff_link = build_affiliate_link(asin, AMAZON_DOMAIN)
 
     title = (
         item.get("ItemInfo", {})
@@ -141,6 +270,7 @@ def _parse_item(item: dict, asin: str) -> dict | None:
     offer_count = summaries[0].get("OfferCount", 1) if summaries else 1
 
     if not listings:
+        logger.info("PA API: لا توجد listings للـ ASIN %s", asin)
         return None
 
     best = min(listings,
@@ -157,10 +287,18 @@ def _parse_item(item: dict, asin: str) -> dict | None:
     if price_val is None:
         return None
 
+    image_url = (
+        item.get("Images", {})
+            .get("Primary", {})
+            .get("Medium", {})
+            .get("URL", "")
+    )
+
     return {
         "asin":           asin,
         "title":          title,
         "price":          price_text,
+        "image":          image_url,
         "price_val":      float(price_val),
         "currency":       "SAR",
         "seller_name":    seller_name,
@@ -171,45 +309,21 @@ def _parse_item(item: dict, asin: str) -> dict | None:
     }
 
 
-def _post(path: str, payload: dict) -> dict | None:
-    """يرسل طلب POST موقّع ويرجع الـ JSON أو None عند الخطأ."""
-    try:
-        headers = _sign_request(path, payload)
-        url     = f"https://{_HOST}{path}"
-        resp    = requests.post(
-            url,
-            headers=headers,
-            data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            timeout=15,
-        )
-        if resp.status_code == 429:
-            logger.warning("PA API: rate limit (429) على %s", path)
-            return None
-        if resp.status_code != 200:
-            logger.error("PA API %s: HTTP %s — %s", path, resp.status_code, resp.text[:400])
-            return None
-        return resp.json()
-    except Exception as exc:
-        logger.error("PA API %s: %s", path, exc)
-        return None
-
-
 # ─── الدوال العامة ────────────────────────────────────────────────────────────
 
 def paapi_available() -> bool:
-    """هل مفاتيح PA API موجودة؟"""
-    return bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY)
+    """هل مفاتيح PA API موجودة (LWA أو AWS)؟"""
+    return bool(
+        (AMAZON_LWA_CLIENT_ID and AMAZON_LWA_CLIENT_SECRET)
+        or (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY)
+    )
 
 
 def get_item_by_asin(asin: str) -> dict | None:
-    """
-    يجلب أرخص سعر لمنتج بـ ASIN عبر PA API.
-    يرجع None إذا فشل أو ما وُجدت مفاتيح.
-    """
+    """يجلب أرخص سعر لمنتج بـ ASIN عبر PA API."""
     if not paapi_available():
         return None
 
-    path    = "/paapi5/getitems"
     payload = {
         "PartnerTag":             AFFILIATE_TAG,
         "PartnerType":            _PARTNER_TYPE,
@@ -219,7 +333,7 @@ def get_item_by_asin(asin: str) -> dict | None:
         "LanguagesOfPreference":  [_LANG],
     }
 
-    data  = _post(path, payload)
+    data  = _post("/paapi5/getitems", payload)
     items = (data or {}).get("ItemsResult", {}).get("Items", [])
     if not items:
         logger.info("PA API GetItems: لا نتائج للـ ASIN %s", asin)
@@ -229,14 +343,10 @@ def get_item_by_asin(asin: str) -> dict | None:
 
 
 def search_items(keywords: str, max_results: int = 5) -> list[dict]:
-    """
-    يبحث بالكلمات المفتاحية عبر PA API.
-    يرجع قائمة فارغة إذا فشل.
-    """
+    """يبحث بالكلمات المفتاحية عبر PA API."""
     if not paapi_available():
         return []
 
-    path    = "/paapi5/searchitems"
     payload = {
         "PartnerTag":            AFFILIATE_TAG,
         "PartnerType":           _PARTNER_TYPE,
@@ -248,7 +358,7 @@ def search_items(keywords: str, max_results: int = 5) -> list[dict]:
         "LanguagesOfPreference": [_LANG],
     }
 
-    data  = _post(path, payload)
+    data  = _post("/paapi5/searchitems", payload)
     items = (data or {}).get("SearchResult", {}).get("Items", [])
 
     results = []

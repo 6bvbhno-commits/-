@@ -3,15 +3,20 @@
 استراتيجية الأسعار:
   1. PA API الرسمي (إذا وُجدت المفاتيح) — أسرع وأدق وبدون حجب
   2. كشط مباشر (fallback) — Desktop → Mobile → offer-listing
+  ملاحظة: الكشط معطّل على Railway لأن Amazon يحجبه فوراً.
 """
 import json
 import logging
+import os
 import re
 import time
 import threading
 import requests
 from bs4 import BeautifulSoup
 from config import AFFILIATE_TAG, AMAZON_DOMAIN
+
+# هل نعمل على Railway؟ — Amazon يحجب scraping من سيرفراتهم
+_ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +215,28 @@ def _extract_price_from_json(html: str) -> tuple[float | None, str]:
     return None, ""
 
 
+def _extract_product_image(soup) -> str:
+    """يستخرج رابط صورة المنتج الرئيسية من صفحة أمازون.
+
+    يجرّب عدة مصادر بالترتيب: og:image (الأكثر موثوقية) ثم عناصر الصور
+    المعروفة. يرجع سلسلة فارغة إذا لم يجد صورة صالحة.
+    """
+    try:
+        og = soup.select_one('meta[property="og:image"]')
+        if og and (og.get("content") or "").startswith("http"):
+            return og["content"]
+        for sel in ("#landingImage", "#imgTagWrapperId img", "#main-image", "img#main-image-container img"):
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            src = el.get("src") or el.get("data-old-hires") or ""
+            if src.startswith("http"):
+                return src
+    except Exception:
+        pass
+    return ""
+
+
 def _scrape_desktop(asin: str, domain: str) -> dict | None:
     """يجلب نسخة سطح المكتب ويستخرج البيانات."""
     url = f"https://www.{domain}/dp/{asin}"
@@ -247,6 +274,7 @@ def _scrape_desktop(asin: str, domain: str) -> dict | None:
             "price_text": price_text,
             "seller_name": seller_name,
             "is_prime": is_prime,
+            "image": _extract_product_image(soup),
         }
     except Exception as e:
         logger.error("Desktop scrape خطأ للـ ASIN %s: %s", asin, e)
@@ -287,6 +315,7 @@ def _scrape_mobile(asin: str, domain: str) -> dict | None:
             "price_text": price_text,
             "seller_name": "Amazon.sa",
             "is_prime": is_prime,
+            "image": _extract_product_image(soup),
         }
     except Exception as e:
         logger.error("Mobile scrape خطأ للـ ASIN %s: %s", asin, e)
@@ -403,8 +432,67 @@ def extract_domain(url: str) -> str:
     return m.group(1).lower() if m else AMAZON_DOMAIN
 
 
+def _normalize_domain(domain: str) -> str:
+    """يُعيد نطاق أمازون بدون www."""
+    d = (domain or AMAZON_DOMAIN).lower().strip().removeprefix("www.")
+    return d or AMAZON_DOMAIN
+
+
 def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
-    return f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+    """
+    صيغة Associates الرسمية لـ amazon.sa:
+    https://www.amazon.sa/dp/ASIN/ref=nosim?tag=YOURTAG-21
+    """
+    asin = (asin or "").upper().strip()
+    d = _normalize_domain(domain)
+    url = f"https://www.{d}/dp/{asin}/ref=nosim?tag={AFFILIATE_TAG}"
+    logger.info("🔗 AFFILIATE_LINK | ASIN=%s | tag=%s | url=%s", asin, AFFILIATE_TAG, url)
+    return url
+
+
+def _with_fresh_affiliate_link(offer: dict, asin: str, domain: str) -> dict:
+    """يُحدّث affiliate_link دائماً — حتى عند قراءة الكاش — لضمان الصيغة الحالية."""
+    if not offer or not asin:
+        return offer
+    result = dict(offer)
+    result["affiliate_link"] = build_affiliate_link(asin, domain)
+    return result
+
+
+def build_affiliate_search_link(keyword: str, domain: str = AMAZON_DOMAIN) -> str:
+    """رابط بحث أمازون مع tag= للعمولة."""
+    import urllib.parse
+
+    d = _normalize_domain(domain)
+    k = urllib.parse.quote_plus(keyword.strip())
+    return f"https://www.{d}/s?k={k}&tag={AFFILIATE_TAG}"
+
+
+def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
+    """يضيف أو يستبدل tag= على رابط أمازون موجود."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    if not raw_link:
+        return build_affiliate_search_link("", domain)
+
+    asin = extract_asin(raw_link)
+    if asin:
+        return build_affiliate_link(asin, extract_domain(raw_link) or domain)
+
+    try:
+        parsed = urlparse(raw_link if "://" in raw_link else f"https://{raw_link.lstrip('/')}")
+        if "amazon." not in (parsed.netloc or "").lower():
+            return build_affiliate_search_link("", domain)
+
+        d = _normalize_domain(extract_domain(raw_link) or domain)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        for bad in ("tag", "linkCode", "ref_", "ref"):
+            params.pop(bad, None)
+        params["tag"] = [AFFILIATE_TAG]
+        new_query = urlencode({k: v[0] for k, v in params.items() if v})
+        return urlunparse(parsed._replace(netloc=f"www.{d}", query=new_query))
+    except Exception:
+        return build_affiliate_search_link("", domain)
 
 
 def _cache_set(key: str, value: dict) -> None:
@@ -434,7 +522,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             ts, cached = _CACHE[cache_key]
             if time.time() - ts < _CACHE_TTL:
                 logger.info("Cache hit للـ ASIN %s", asin)
-                return cached
+                return _with_fresh_affiliate_link(cached, asin, domain)
 
     # ── دالة مساعدة: تسجيل + cache + إعادة ─────────────────────────────────
     def _record_and_return(res: dict) -> dict:
@@ -473,32 +561,38 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 
     affiliate_link = build_affiliate_link(asin, domain)
 
+    # ── على Railway: Amazon يحجب الكشط فوراً — أرجع الرابط مباشرة ──────────
+    if _ON_RAILWAY:
+        logger.info("Railway detected — تخطي الكشط، إرجاع رابط أفلييت مباشرة للـ ASIN %s", asin)
+        return {"blocked": True, "affiliate_link": affiliate_link}
+
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
     if not _SCRAPE_SEMAPHORE.acquire(timeout=45):
         logger.warning("SCRAPE_SEMAPHORE timeout للـ ASIN %s — جاري محاولة stale cache", asin)
         with _CACHE_LOCK:
             if cache_key in _CACHE:
                 stale_ts, stale_data = _CACHE[cache_key]
-                result = dict(stale_data)
+                result = _with_fresh_affiliate_link(stale_data, asin, domain)
                 result["stale"] = True
                 result["stale_age_min"] = max(1, int((time.time() - stale_ts) / 60))
                 return result
         return {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
     try:
 
-        # --- المحاولة الأولى: سطح المكتب ---
-        page_data = _scrape_desktop(asin, domain)
+        # --- المحاولة الأولى: الجوال (أقل حجباً من Desktop) ---
+        logger.info("كشط موبايل للـ ASIN %s", asin)
+        page_data = _scrape_mobile(asin, domain)
 
-        # --- المحاولة الثانية: الجوال إذا تم الحجب ---
+        # --- المحاولة الثانية: سطح المكتب إذا فشل الجوال ---
         if not page_data or page_data.get("blocked"):
-            logger.info("تجربة نسخة الجوال للـ ASIN %s", asin)
-            time.sleep(_random.uniform(1.5, 3.5))   # تأخير عشوائي لتقليل الحجب
-            page_data = _scrape_mobile(asin, domain)
+            logger.info("تجربة Desktop للـ ASIN %s", asin)
+            time.sleep(_random.uniform(1.0, 2.5))
+            page_data = _scrape_desktop(asin, domain)
 
         # --- المحاولة الثالثة: offer-listing مباشرة ---
         if not page_data or page_data.get("blocked"):
             logger.info("تجربة offer-listing مباشرة للـ ASIN %s", asin)
-            time.sleep(_random.uniform(2.0, 4.0))
+            time.sleep(_random.uniform(1.5, 3.0))
             offers_direct = _scrape_offer_listing(asin, domain)
             if offers_direct:
                 best_direct = offers_direct[0]
@@ -518,7 +612,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 if cache_key in _CACHE:
                     stale_ts, stale_data = _CACHE[cache_key]
                     age_min = max(1, int((time.time() - stale_ts) / 60))
-                    result  = dict(stale_data)
+                    result  = _with_fresh_affiliate_link(stale_data, asin, domain)
                     result["stale"]         = True
                     result["stale_age_min"] = age_min
                     logger.info("Stale cache للـ ASIN %s (عمر %d دقيقة)", asin, age_min)
@@ -565,6 +659,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             "is_prime":    best_is_prime,
             "offer_count": offer_count,
             "affiliate_link": affiliate_link,
+            "image":       page_data.get("image", ""),
         }
 
         return _record_and_return(result)
@@ -579,48 +674,73 @@ def _esc(text: str) -> str:
     return text
 
 
+# عبارات إغراء مُدوَّرة — تمنع تكرار نفس الرسالة عند إرسال كمية كبيرة من الروابط
+# عبارات تسويقية انسيابية تذكر اسم المنتج ({name}) داخل الجملة
+_OFFER_TEASERS_NAMED = [
+    "🔥 لقيت لك *{name}* بأفضل سعر — الحق عليه قبل نفاذ الكمية!",
+    "⚡ *{name}* متوفر الحين بسعر ممتاز — فرصة لا تفوتك!",
+    "💥 نزل سعر *{name}* — بادر فيه قبل ما يرجع يرتفع!",
+    "🎯 لقيت لك *{name}* بأقوى عرض على أمازون!",
+    "🛍️ *{name}* بسعر مغري — جهّز طلبك قبل ما تخلص الكمية!",
+    "✨ عرض اليوم: *{name}* بأفضل سعر — الحق عليه!",
+]
+
+# عبارات عامة — تُستخدم فقط إذا ما توفر اسم المنتج
+_OFFER_TEASERS = [
+    "🔥 *لقيت لك أقوى صفقة على هذا المنتج!*",
+    "⚡ *عرض قوي متوفر الحين على هذا المنتج!*",
+    "💥 *صفقة اليوم — السعر ممتاز جداً!*",
+    "🎯 *أفضل سعر حصلته لك على أمازون!*",
+    "🛍️ *وجدت لك عرضاً يستاهل الطلب!*",
+    "✨ *منتج مطلوب وبسعر مغري — لا يفوتك!*",
+]
+
+_OFFER_CTA = [
+    "شيك على العرض الآن 👇 والسعر قدامك من أمازون",
+    "افتح الرابط تحت 👇 وشوف السعر واطلب مباشرة",
+    "اضغط للأسفل 👇 وتصفّح المنتج بنفسك على أمازون",
+    "خذ لك ثانية وشوف العرض بنفسك 👇",
+    "السعر يتغيّر بسرعة — شيك على العرض الحين 👇",
+]
+
+
 def format_offer_message(offer: dict) -> str:
-    """يبني رسالة تيليجرام تعرض أرخص سعر متاح."""
+    """يبني رسالة تيليجرام تُشوّق المستخدم للضغط على رابط أمازون."""
     if not offer:
         return (
             "❌ ما قدرت ألقى عروض متاحة لهذا المنتج.\n"
             "تأكد من توفر المنتج في المتجر أو جرّب لاحقًا."
         )
 
-    if offer.get("blocked"):
-        return (
-            "⚠️ أمازون يطلب تحقق مؤقتاً — شوف السعر مباشرة:\n"
-            f"{offer['affiliate_link']}"
-        )
+    # استخرج العنوان من أي مصدر متاح
+    raw_title = (offer.get("title") or "")[:70]
+    if not raw_title and offer.get("blocked"):
+        raw_link = offer.get("affiliate_link", "")
+        slug_m = re.search(r"/([A-Za-z0-9][^/]{5,80})/dp/", raw_link)
+        if slug_m:
+            slug = slug_m.group(1).replace("-", " ").title()
+            # استبعد النطاقات (تحتوي نقطة) والـ ASIN الخام
+            if "." not in slug and not re.fullmatch(r"[A-Z0-9]{10}", slug.replace(" ", "")):
+                raw_title = slug[:70]
 
-    raw_title    = (offer.get("title") or "")[:70]
-    title_part   = f"📦 *{_esc(raw_title)}*\n\n" if raw_title else ""
-    prime_badge  = " 🔵 Prime" if offer.get("is_prime") else ""
-    offer_count  = offer.get("offer_count", 1)
-    sellers_note = f"_(من بين {offer_count} بائع متاح)_\n" if offer_count > 1 else ""
-    safe_price   = _esc(str(offer.get("price", "")))
-    safe_seller  = _esc(str(offer.get("seller_name", "Amazon.sa")))
-    safe_cond    = _esc(str(offer.get("condition", "جديد")))
+    prime_line = "✅ _أصلي ومتوفر على Amazon.sa — شحن Prime سريع_\n\n" if offer.get("is_prime") else ""
 
-    # إشعار stale: عرض آخر سعر محفوظ مع ملاحظة
-    if offer.get("stale"):
-        age    = offer.get("stale_age_min", 0)
-        hours  = age // 60
-        mins   = age % 60
-        age_ar = f"{hours} ساعة و{mins} دقيقة" if hours else f"{mins} دقيقة"
-        stale_note = f"\n\n⏰ _آخر سعر مسجّل قبل {age_ar} — أمازون حجب الاستعلام مؤقتاً_"
-        price_header = "🏷️ *آخر سعر متوفر:*"
+    # اسم المنتج داخل الجملة نفسها — نقصّه بلطف عند حدود الكلمات إن كان طويلاً
+    if raw_title:
+        disp_name = raw_title.strip()
+        if len(disp_name) > 55:
+            disp_name = disp_name[:55].rsplit(" ", 1)[0].strip(" -–—") + "…"
+        teaser = _random.choice(_OFFER_TEASERS_NAMED).format(name=_esc(disp_name))
+        title_part = ""  # الاسم مضمّن في الجملة، ما نحتاج سطر منفصل
     else:
-        stale_note   = ""
-        price_header = "🏷️ *أرخص سعر متاح الآن:*"
+        teaser = _random.choice(_OFFER_TEASERS)
+        title_part = ""
+    cta = _random.choice(_OFFER_CTA)
 
     return (
         f"{title_part}"
-        f"{price_header}\n"
-        f"• السعر: `{safe_price}`\n"
-        f"• البائع: {safe_seller}{prime_badge}\n"
-        f"• الحالة: {safe_cond}\n"
-        f"{sellers_note}\n"
-        f"🛒 *رابط الشراء:*\n{offer['affiliate_link']}\n\n"
-        f"_(رابط تسويق بالعمولة)_{stale_note}"
+        f"{teaser}\n\n"
+        f"{prime_line}"
+        f"{cta}\n\n"
+        f"🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"
     )

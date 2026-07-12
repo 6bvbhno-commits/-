@@ -11,6 +11,7 @@ import logging
 import re
 import threading
 import requests
+from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
 from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
 
 # حد Gemini: طلبان متزامنان — ضغط عالي يستحق 2 (429 تُعالج بالتجربة التالية)
@@ -20,6 +21,15 @@ _GEMINI_SEM = threading.Semaphore(2)
 _OPENAI_SEM = threading.Semaphore(5)
 
 logger = logging.getLogger(__name__)
+
+# برومبت موحّد للتعرف على المنتج — مُحسّن لإخراج عبارة بحث دقيقة تصلح لأمازون مباشرة
+_VISION_PROMPT = (
+    "حلل الصورة بدقة وأعطني أفضل عبارة بحث للعثور على هذا المنتج بالضبط في أمازون. "
+    "اذكر ما يظهر منها فقط بهذا الترتيب: العلامة التجارية (Brand) + الموديل أو رقم المنتج + "
+    "نوع المنتج + أهم مواصفة مميزة (اللون/الحجم/السعة/العدد). "
+    "إن كانت العلامة أو الموديل بالإنجليزية فاكتبها بالإنجليزية. "
+    "أخرِج العبارة فقط في سطر واحد، بدون أي شرح أو مقدمات أو ترقيم."
+)
 
 _HEADERS = {
     "User-Agent": (
@@ -57,15 +67,10 @@ def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": (
-                        "ما هو هذا المنتج بدقة؟ "
-                        "أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية "
-                        "لكي أبحث عنه في موقع أمازون. "
-                        "لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
-                    )},
+                    {"type": "text", "text": _VISION_PROMPT},
                     {"type": "image_url", "image_url": {
                         "url": f"data:image/jpeg;base64,{image_b64}",
-                        "detail": "low",
+                        "detail": "high",
                     }},
                 ],
             }],
@@ -162,12 +167,7 @@ def _call_gemini(image_bytes: bytes) -> str | None:
     payload = {
         "contents": [{
             "parts": [
-                {"text": (
-                    "ما هو هذا المنتج بدقة؟ "
-                    "أعطني فقط اسم المنتج والموديل باللغة الإنجليزية أو العربية "
-                    "لكي أبحث عنه في موقع أمازون. "
-                    "لا تكتب أي جمل أخرى، فقط اسم المنتج للبحث المباشر."
-                )},
+                {"text": _VISION_PROMPT},
                 {"inlineData": {"mimeType": "image/jpeg", "data": image_b64}},
             ]
         }]
@@ -281,11 +281,13 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
                     asin = m.group(1).upper()
 
             if asin:
-                affiliate_link = f"https://www.{domain}/dp/{asin}?tag={AFFILIATE_TAG}"
+                affiliate_link = build_affiliate_link(asin, domain)
             elif link_el:
-                # لا ASIN — نضيف التاق على الرابط الخام كي تُحسب العمولة دائماً
-                clean_path = link_el.get("href", "").split("?")[0]
-                affiliate_link = f"https://www.{domain}{clean_path}?tag={AFFILIATE_TAG}"
+                raw_href = link_el.get("href", "")
+                affiliate_link = tag_amazon_url(
+                    f"https://www.{domain}{raw_href.split('?')[0]}",
+                    domain,
+                )
             else:
                 continue
 
@@ -306,10 +308,15 @@ def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]
                         price = f"{price_clean} ريال"
                         break
 
+            # صورة المنتج
+            img_el = item.select_one("img.s-image") or item.select_one("img")
+            image_url = img_el.get("src", "") if img_el else ""
+
             results.append({
                 "title": title[:60] + ("..." if len(title) > 60 else ""),
                 "price": price,
                 "link": affiliate_link,
+                "image": image_url,
             })
 
     except Exception as e:
@@ -431,6 +438,7 @@ def search_amazon_by_keywords(product_name: str, domain: str = AMAZON_DOMAIN) ->
                         "title": r.get("title") or product_name,
                         "price": r.get("price") or "غير محدد",
                         "link":  r.get("affiliate_link", ""),
+                        "image": r.get("image", ""),
                     }
                     for r in pa_results
                 ]
@@ -450,34 +458,42 @@ def _escape_md(text: str) -> str:
     return text
 
 
-def format_search_results(product_name: str, offers: list[dict]) -> str:
-    """يبني رسالة تيليجرام تعرض نتائج البحث مع روابط الأفلييت."""
-    import urllib.parse
+import random as _random
+
+_SEARCH_TEASERS = [
+    "🔥 *لقيت لك أفضل عروض هذا المنتج على أمازون!*",
+    "⚡ *عروض قوية متوفرة الحين على هذا المنتج!*",
+    "🎯 *أفضل الأسعار لقيتها لك — تفضّل!*",
+    "🛍️ *وجدت لك خيارات ممتازة بأسعار مغرية!*",
+]
+
+_SEARCH_CTA = [
+    "اضغط الزر تحت 👇 وشوف العروض واطلب مباشرة من أمازون",
+    "افتح النتائج الحين 👇 واختر الأنسب لك",
+    "اضغط للأسفل 👇 وتصفّح العروض بنفسك على أمازون",
+]
+
+
+def format_search_results(product_name: str, offers: list[dict]) -> tuple[str, str, str]:
+    """يبني رسالة تيليجرام تعرض نتائج البحث مع روابط الأفلييت.
+
+    يرجع (النص، رابط البحث، رابط صورة المنتج). رابط الصورة قد يكون فارغاً.
+    """
     safe_name = _escape_md(product_name)
-    search_url = (
-        f"https://www.{AMAZON_DOMAIN}/s?"
-        f"k={urllib.parse.quote(product_name)}&tag={AFFILIATE_TAG}"
+    search_url = build_affiliate_search_link(product_name, AMAZON_DOMAIN)
+
+    # صورة أول عرض يحتوي على رابط صورة صالح
+    image_url = ""
+    for off in (offers or []):
+        img = (off.get("image") or "").strip()
+        if img.startswith("http"):
+            image_url = img
+            break
+
+    teaser = (
+        f"🔍 تم التعرف على: *{safe_name}*\n\n"
+        f"{_random.choice(_SEARCH_TEASERS)}\n\n"
+        f"{_random.choice(_SEARCH_CTA)}\n\n"
+        f"🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"
     )
-
-    if not offers:
-        return (
-            f"🔍 تم التعرف على: *{safe_name}*\n\n"
-            "⚠️ ما قدرت أجلب الأسعار مباشرة الآن (أمازون يحجب الطلبات أحياناً).\n\n"
-            f"🔎 ابحث عنه مباشرة في أمازون:\n{search_url}\n\n"
-            "_(رابط تسويق بالعمولة)_"
-        )
-
-    lines = [f"🔍 تم التعرف على: *{safe_name}*\n\n💰 *أفضل الأسعار في أمازون:*\n"]
-    for i, offer in enumerate(offers, start=1):
-        safe_title = _escape_md(offer["title"])
-        price      = offer["price"]
-        safe_price = _escape_md(price)
-        price_line = f"   • السعر: `{safe_price}`\n" if price != "غير محدد" else ""
-        lines.append(
-            f"{i}. *{safe_title}*\n"
-            f"{price_line}"
-            f"   • الرابط: {offer['link']}\n"
-        )
-    lines.append("_(روابط تسويق بالعمولة)_")
-
-    return "\n".join(lines)
+    return teaser, search_url, image_url
