@@ -35,12 +35,8 @@ from amazon_utils import (
     format_offer_message,
 )
 from vision_utils import (
-    identify_product_from_image,
     search_amazon_by_keywords,
     format_search_results,
-    test_gemini_connection,
-    test_deepseek_vision,
-    test_openai_vision,
 )
 
 logging.basicConfig(
@@ -335,7 +331,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "يجيب لك *أقل سعر متاح* لأي منتج في أمازون السعودية — من بين كل البائعين.\n\n"
             "📌 *كيف تستخدمه؟*\n"
             "• 🔗 أرسل رابط أي منتج من أمازون ← يرد بأرخص سعر فوراً\n"
-            "• 📸 صوّر أي منتج ← يتعرف عليه ويبحث له عن أسعار\n"
             "• 💬 اكتب اسم أي منتج ← يبحث عنه مباشرة\n\n"
             "📊 البوت يحفظ تاريخ الأسعار ويعطيك توصية شراء ذكية.\n\n"
             "🔔 *ميزة التنبيهات:* بعد أي سعر، اضغط زر *نبّهني* — راح يرسل لك إشعاراً فور انخفاض السعر!\n"
@@ -354,11 +349,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
             "🆘 *المساعدة*\n\n"
             "• أرسل *رابط منتج أمازون* ← أرد بأرخص سعر ورابط شراء\n"
-            "• أرسل *صورة منتج* ← أتعرف عليه وأبحث له عن أسعار\n"
             "• اكتب *اسم أي منتج* ← أبحث عنه مباشرة في أمازون\n"
             "• اسألني أي سؤال عن التسوق ← أساعدك\n\n"
-            "💡 *نصائح للصور:*\n"
-            "  - وضّح الاسم التجاري، إضاءة جيدة، الجهة الأمامية\n\n"
             "📋 *الأوامر:*\n"
             "/start — بداية جديدة\n"
             "/help — هذه الرسالة\n\n"
@@ -626,9 +618,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """يعرض حالة مفاتيح API المتاحة — للتشخيص فقط (لا يكشف القيم)."""
     import os
     from config import (
-        get_gemini_api_key,
         get_deepseek_api_key,
-        get_openai_vision_config,
         SERPAPI_KEY,
         ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
@@ -637,36 +627,17 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     def _status(val: str) -> str:
         return "✅ متوفر" if val else "❌ غير موجود"
 
-    gemini_key = get_gemini_api_key()
     deepseek_key = get_deepseek_api_key()
-    openai_base, openai_key = get_openai_vision_config()
-    gemini_test = test_gemini_connection() if gemini_key else "❌ المفتاح غير موجود"
-    deepseek_test = test_deepseek_vision() if deepseek_key else "❌ المفتاح غير موجود"
-    openai_test = test_openai_vision() if openai_key else "❌ المفتاح غير موجود"
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
-    vision_env = [
-        n for n in (
-            "OPENAI_API_KEY", "CHATGPT_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
-            "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_KEY", "SERPAPI_KEY",
-            "AI_INTEGRATIONS_OPENAI_API_KEY",
-        )
-        if (os.getenv(n) or "").strip()
-    ]
 
     msg = (
         "🔧 *حالة مفاتيح API:*\n\n"
-        f"• ChatGPT/OpenAI (صور): {_status(openai_key)}\n"
-        f"• OpenAI اختبار: {openai_test}\n"
         f"• DeepSeek (نص): {_status(deepseek_key)}\n"
-        f"• DeepSeek (صور): {deepseek_test}\n"
-        f"• Gemini API: {_status(gemini_key)}\n"
-        f"• Gemini اختبار: {gemini_test}\n"
-        f"• SerpAPI (Lens): {_status(SERPAPI_KEY)}\n"
+        f"• SerpAPI: {_status(SERPAPI_KEY)}\n"
         f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
         f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n"
-        f"• خدمة Railway: `{railway_svc}`\n"
-        f"• متغيرات الصور: `{', '.join(vision_env) or 'لا شيء'}`\n\n"
-        "📸 _الصور: ChatGPT أولاً، ثم DeepSeek، ثم Gemini_"
+        f"• خدمة Railway: `{railway_svc}`\n\n"
+        "📸 _التعرف على الصور: معطّل_"
     )
     await _reply(update, msg)
 
@@ -786,133 +757,18 @@ async def _price_alert_check_loop(app) -> None:
         await asyncio.sleep(3600)   # كل ساعة
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعالج أي صورة يرسلها المستخدم."""
+async def handle_unsupported_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يرفض الصور ويوجّه المستخدم للرابط أو اسم المنتج."""
     if not update.message:
         return
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    if _is_rate_limited(user_id):
-        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
-        return
-
-    await _typing(update, context)
-    await _reply(update, "📸 جاري تحليل الصورة...", parse_mode=None)
-
-    try:
-        if update.message.photo:
-            photo_file = await update.message.photo[-1].get_file()
-        elif (update.message.document
-              and update.message.document.mime_type
-              and update.message.document.mime_type.startswith("image/")):
-            photo_file = await update.message.document.get_file()
-        else:
-            await _reply(update, "❌ أرسل صورة لأتعرف على المنتج.", parse_mode=None)
-            return
-
-        # رابط Telegram CDN للصورة (يُستخدم في Google Lens)
-        image_url = photo_file.file_path or ""
-
-        # retry عند timeout — مرتان
-        photo_bytes = None
-        for _attempt in range(2):
-            try:
-                photo_bytes = await photo_file.download_as_bytearray()
-                break
-            except Exception as _dl_e:
-                if _attempt == 0:
-                    logger.warning("تحميل الصورة timeout — إعادة محاولة: %s", _dl_e)
-                    await asyncio.sleep(1)
-                else:
-                    raise _dl_e
-
-        if photo_bytes is None or len(photo_bytes) == 0:
-            await _reply(update, "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.", parse_mode=None)
-            return
-        if len(photo_bytes) > 8 * 1024 * 1024:
-            await _reply(update, "⚠️ الصورة كبيرة جداً (أكثر من 8 MB).", parse_mode=None)
-            return
-
-    except Exception as e:
-        logger.error("فشل تحميل الصورة: %s", e)
-        await _reply(update, "❌ ما قدرت أحمّل الصورة. حاول مرة ثانية.", parse_mode=None)
-        return
-
-    try:
-        loop         = asyncio.get_running_loop()
-        product_name = await loop.run_in_executor(
-            None, identify_product_from_image, bytes(photo_bytes), image_url
-        )
-    except Exception as e:
-        logger.error("فشل تحليل الصورة: %s", e)
-        await _reply(update, "❌ حصل خطأ أثناء تحليل الصورة. حاول مرة ثانية.", parse_mode=None)
-        return
-
-    if not product_name:
-        import os
-        from config import get_gemini_api_key, get_deepseek_api_key, get_openai_vision_config, SERPAPI_KEY
-        gemini_key = get_gemini_api_key()
-        deepseek_key = get_deepseek_api_key()
-        _, openai_key = get_openai_vision_config()
-        railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
-        logger.info(
-            "vision_fail service=%s openai=%s deepseek=%s gemini=%s",
-            railway_svc, bool(openai_key), bool(deepseek_key), bool(gemini_key),
-        )
-        if not openai_key and not deepseek_key and not gemini_key and not SERPAPI_KEY:
-            await _reply(
-                update,
-                "❌ التعرف على الصور غير مفعّل على السيرفر.\n\n"
-                f"🔧 الخدمة الحالية: `{railway_svc}`\n"
-                "أضف في Railway على خدمة *charming-strength*:\n"
-                "• `OPENAI_API_KEY` (ChatGPT)\n"
-                "• أو `DEEPSEEK_API_KEY`\n"
-                "• أو `GEMINI_API_KEY`\n\n"
-                "ثم اضغط **Deploy** وأرسل `/debug`.",
-                parse_mode=None,
-            )
-        else:
-            vision_hint = ""
-            if openai_key:
-                vision_hint = f"\n\n🔧 ChatGPT: {test_openai_vision()}"
-            elif deepseek_key:
-                vision_hint = f"\n\n🔧 DeepSeek: {test_deepseek_vision()}"
-            elif gemini_key:
-                vision_hint = f"\n\n🔧 Gemini: {test_gemini_connection()}"
-            await _reply(
-                update,
-                "❌ ما قدرت أتعرف على المنتج.\n"
-                "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة."
-                f"{vision_hint}",
-                parse_mode=None,
-            )
-        return
-
-    await _typing(update, context)
-    await _reply(update, f"✅ تم التعرف على المنتج:\n*{product_name}*\n\nجاري البحث في أمازون...", )
-
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
-        try:
-            loop   = asyncio.get_running_loop()
-            offers = await asyncio.wait_for(
-                loop.run_in_executor(None, search_amazon_by_keywords, product_name),
-                timeout=20.0,
-            )
-        except asyncio.TimeoutError:
-            offers = []
-        except Exception as e:
-            logger.error("فشل البحث في أمازون: %s", e)
-            await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
-            return
-
-    msg, search_url, image_url = format_search_results(product_name, offers)
-    search_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔎 ابحث في أمازون ↗", url=search_url)
-    ]]) if search_url and search_url.startswith("http") else None
-    sent = await _reply_photo(update, image_url, msg, reply_markup=search_kb)
-    if not sent:
-        await _reply(update, msg, reply_markup=search_kb)
-    _stat("requests_ok")
+    await _reply(
+        update,
+        "📸 التعرف على الصور غير متاح حالياً.\n\n"
+        "أرسل لي:\n"
+        "• 🔗 رابط منتج من أمازون\n"
+        "• 💬 أو اسم المنتج مباشرة",
+        parse_mode=None,
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -990,7 +846,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not response:
         response = (
-            "أرسل لي 🔗 رابط منتج أمازون أو 📸 صورة أو 💬 اسم منتج "
+            "أرسل لي 🔗 رابط منتج أمازون أو 💬 اسم المنتج "
             "وأجيبك بأفضل سعر فوراً."
         )
 
@@ -1094,16 +950,12 @@ def main():
     print("=" * 50)
 
     import os as _os
-    from config import get_deepseek_api_key, get_gemini_api_key, get_openai_vision_config
+    from config import get_deepseek_api_key
 
     _svc = _os.getenv("RAILWAY_SERVICE_NAME", "local")
-    _gemini = get_gemini_api_key()
     _deepseek = get_deepseek_api_key()
-    _, _openai = get_openai_vision_config()
     print(f"🤖 Railway service: {_svc}")
-    print(f"🔑 OPENAI_API_KEY: {'✅ (' + str(len(_openai)) + ' حرف)' if _openai else '❌ غير موجود'}")
     print(f"🔑 DEEPSEEK_API_KEY: {'✅ (' + str(len(_deepseek)) + ' حرف)' if _deepseek else '❌ غير موجود'}")
-    print(f"🔑 GEMINI_API_KEY: {'✅ (' + str(len(_gemini)) + ' حرف)' if _gemini else '❌ غير موجود'}")
     print(f"🔑 TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
 
     _DEV_DOMAIN  = _os.getenv("REPLIT_DEV_DOMAIN", "")
@@ -1144,8 +996,8 @@ def main():
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
     app.add_handler(CommandHandler("debug",     debug_command))
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_unsupported_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_unsupported_photo))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
