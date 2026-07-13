@@ -675,72 +675,122 @@ def _esc(text: str) -> str:
 
 
 # عبارات إغراء مُدوَّرة — تمنع تكرار نفس الرسالة عند إرسال كمية كبيرة من الروابط
-# عبارات تسويقية انسيابية تذكر اسم المنتج ({name}) داخل الجملة
 _OFFER_TEASERS_NAMED = [
-    "🔥 لقيت لك *{name}* بأفضل سعر — الحق عليه قبل نفاذ الكمية!",
-    "⚡ *{name}* متوفر الحين بسعر ممتاز — فرصة لا تفوتك!",
-    "💥 نزل سعر *{name}* — بادر فيه قبل ما يرجع يرتفع!",
-    "🎯 لقيت لك *{name}* بأقوى عرض على أمازون!",
-    "🛍️ *{name}* بسعر مغري — جهّز طلبك قبل ما تخلص الكمية!",
-    "✨ عرض اليوم: *{name}* بأفضل سعر — الحق عليه!",
+    "🔥 *{name}* — لقيت لك أقوى سعر على أمازون السعودية!",
+    "⚡ *{name}* متوفر الحين بعرض يستاهل الطلب!",
+    "💥 فرصة على *{name}* — السعر ممتاز والكمية محدودة!",
+    "🎯 *{name}* بأفضل عرض لقيته لك — لا تفوّتها!",
+    "🛍️ *{name}* بسعر مغري — اطلبه قبل ما يرتفع!",
+    "✨ صفقة اليوم: *{name}* — جاهز للشراء من أمازون!",
+    "🏆 *{name}* — وفّرت لك وقت البحث وجبت لك الأرخص!",
 ]
 
-# عبارات عامة — تُستخدم فقط إذا ما توفر اسم المنتج
 _OFFER_TEASERS = [
-    "🔥 *لقيت لك أقوى صفقة على هذا المنتج!*",
-    "⚡ *عرض قوي متوفر الحين على هذا المنتج!*",
-    "💥 *صفقة اليوم — السعر ممتاز جداً!*",
-    "🎯 *أفضل سعر حصلته لك على أمازون!*",
-    "🛍️ *وجدت لك عرضاً يستاهل الطلب!*",
-    "✨ *منتج مطلوب وبسعر مغري — لا يفوتك!*",
+    "🔥 *لقيت لك صفقة قوية على هذا المنتج!*",
+    "⚡ *عرض ممتاز متوفر الحين — يستاهل الطلب!*",
+    "💥 *السعر حلو — والكمية ما تدوم طويل!*",
+    "🎯 *أفضل سعر لقيته لك على أمازون السعودية!*",
+    "🛍️ *منتج مطلوب وبعرض يستاهل — لا تتردد!*",
 ]
 
 _OFFER_CTA = [
-    "شيك على العرض الآن 👇 والسعر قدامك من أمازون",
-    "افتح الرابط تحت 👇 وشوف السعر واطلب مباشرة",
-    "اضغط للأسفل 👇 وتصفّح المنتج بنفسك على أمازون",
-    "خذ لك ثانية وشوف العرض بنفسك 👇",
-    "السعر يتغيّر بسرعة — شيك على العرض الحين 👇",
+    "👇 اضغط *اشتري من أمازون* وكمّل طلبك بثواني",
+    "👇 افتح الرابط تحت واطلب مباشرة — سريع وآمن",
+    "👇 السعر يتغيّر بسرعة — اطلبه الحين قبل ما يرتفع",
+    "👇 شوف التفاصيل واطلب من أمازون بضغطة واحدة",
+]
+
+_ALERT_HINTS = [
+    "🔔 *نصيحة:* اضغط زر *نبّهني* تحت — وأرسلك إشعار فور نزول السعر!",
+    "🔔 ما تبي تفوّت الخصم؟ فعّل *نبّهني* وأخبرك أول ما ينزل السعر 👇",
+    "🔔 فعّل تنبيه السعر بزر *نبّهني* — أراقبه لك كل يوم وأبلغك فور الانخفاض!",
+]
+
+_BLOCKED_CTA = [
+    "👇 افتح الرابط وشوف السعر والعروض مباشرة من أمازون",
+    "👇 اضغط تحت وتصفّح المنتج — السعر قدامك على أمازون",
 ]
 
 
-def format_offer_message(offer: dict) -> str:
-    """يبني رسالة تيليجرام تُشوّق المستخدم للضغط على رابط أمازون."""
+def build_product_image_url(asin: str, domain: str = AMAZON_DOMAIN, offer: dict | None = None) -> str:
+    """أفضل رابط صورة متاح — من العرض أو ويدجت أمازون كبديل."""
+    if offer:
+        img = (offer.get("image") or "").strip()
+        if img.startswith("http"):
+            return img
+    mp = domain if "amazon." in domain else AMAZON_DOMAIN
+    return (
+        f"https://ws-eu.amazon-adsystem.com/widgets/q?"
+        f"ServiceVersion=20070822&MarketPlace=www.{mp}&ASIN={asin}"
+        f"&Format=_SL500_&ID=AsinImage&tag={AFFILIATE_TAG}"
+    )
+
+
+def format_offer_message(offer: dict, *, include_alert_hint: bool = True) -> str:
+    """يبني رسالة تيليجرام تحفيزية مع السعر ودعوة للشراء والتنبيه."""
     if not offer:
         return (
             "❌ ما قدرت ألقى عروض متاحة لهذا المنتج.\n"
             "تأكد من توفر المنتج في المتجر أو جرّب لاحقًا."
         )
 
-    # استخرج العنوان من أي مصدر متاح
     raw_title = (offer.get("title") or "")[:70]
     if not raw_title and offer.get("blocked"):
         raw_link = offer.get("affiliate_link", "")
         slug_m = re.search(r"/([A-Za-z0-9][^/]{5,80})/dp/", raw_link)
         if slug_m:
             slug = slug_m.group(1).replace("-", " ").title()
-            # استبعد النطاقات (تحتوي نقطة) والـ ASIN الخام
             if "." not in slug and not re.fullmatch(r"[A-Z0-9]{10}", slug.replace(" ", "")):
                 raw_title = slug[:70]
 
-    prime_line = "✅ _أصلي ومتوفر على Amazon.sa — شحن Prime سريع_\n\n" if offer.get("is_prime") else ""
-
-    # اسم المنتج داخل الجملة نفسها — نقصّه بلطف عند حدود الكلمات إن كان طويلاً
     if raw_title:
         disp_name = raw_title.strip()
         if len(disp_name) > 55:
             disp_name = disp_name[:55].rsplit(" ", 1)[0].strip(" -–—") + "…"
-        teaser = _random.choice(_OFFER_TEASERS_NAMED).format(name=_esc(disp_name))
-        title_part = ""  # الاسم مضمّن في الجملة، ما نحتاج سطر منفصل
+        headline = _random.choice(_OFFER_TEASERS_NAMED).format(name=_esc(disp_name))
     else:
-        teaser = _random.choice(_OFFER_TEASERS)
-        title_part = ""
-    cta = _random.choice(_OFFER_CTA)
+        headline = _random.choice(_OFFER_TEASERS)
 
-    return (
-        f"{title_part}"
-        f"{teaser}\n\n"
-        f"{prime_line}"
-        f"{cta}\n\n"
-        f"🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"
-    )
+    lines = [headline, ""]
+
+    if offer.get("blocked"):
+        lines += [
+            "🔗 *المنتج جاهز على أمازون* — افتح الرابط وشوف السعر الحي.",
+            "",
+            _random.choice(_BLOCKED_CTA),
+            "",
+            "🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_",
+        ]
+        return "\n".join(lines)
+
+    price_val = offer.get("price_val")
+    price_txt = (offer.get("price") or "").strip()
+    if price_val and not price_txt:
+        price_txt = f"{price_val:.2f} SAR"
+    if price_txt:
+        lines.append(f"💰 *السعر الآن:* `{_esc(price_txt)}`")
+
+    seller = (offer.get("seller_name") or "").strip()
+    if seller:
+        lines.append(f"🏪 *البائع:* {_esc(seller[:40])}")
+
+    offer_count = offer.get("offer_count")
+    if offer_count and int(offer_count) > 1:
+        lines.append(f"📦 *{int(offer_count)} عروض* — قارناها واخترنا لك الأرخص")
+
+    if offer.get("is_prime"):
+        lines.append("🚀 *Prime* — توصيل سريع من أمازون")
+
+    if offer.get("stale"):
+        age = offer.get("stale_age_min", 0)
+        lines.append(f"⏱️ _آخر تحديث للسعر: منذ {age} دقيقة — تحقق من الرابط قبل الشراء_")
+
+    lines.append("")
+    lines.append(_random.choice(_OFFER_CTA))
+
+    if include_alert_hint and price_val:
+        lines.append("")
+        lines.append(_random.choice(_ALERT_HINTS))
+
+    lines += ["", "🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"]
+    return "\n".join(lines)

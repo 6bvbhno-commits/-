@@ -177,7 +177,7 @@ def format_history_message(asin: str, domain: str) -> str:
     # تمييز السعر الحالي: أدنى سعر؟
     tag = ""
     if abs(curr - lo) < 0.01:
-        tag = " 🟢 *أدنى سعر سُجّل!*"
+        tag = " 🟢 *أدنى سعر سُجّل — وقت ممتاز للشراء!*"
     elif abs(curr - hi) < 0.01:
         tag = " 🔴 (أعلى سعر)"
 
