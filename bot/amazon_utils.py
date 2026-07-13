@@ -561,10 +561,10 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
 
     affiliate_link = build_affiliate_link(asin, domain)
 
-    # ── على Railway: Amazon يحجب الكشط فوراً — أرجع الرابط مباشرة ──────────
+    # ── على Railway: جلب صورة/عنوان ثم رابط الأفلييت ───────────────────────
     if _ON_RAILWAY:
-        logger.info("Railway detected — تخطي الكشط، إرجاع رابط أفلييت مباشرة للـ ASIN %s", asin)
-        return {"blocked": True, "affiliate_link": affiliate_link}
+        logger.info("Railway — preview للـ ASIN %s", asin)
+        return _railway_product_preview(asin, domain)
 
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
     if not _SCRAPE_SEMAPHORE.acquire(timeout=45):
@@ -726,6 +726,81 @@ def build_product_image_url(asin: str, domain: str = AMAZON_DOMAIN, offer: dict 
     )
 
 
+def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
+    """يحمّل بايتات الصورة — تيليجرام يرفض بعض روابط أمازون المباشرة."""
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/*,*/*",
+            },
+        )
+        if resp.status_code != 200 or not resp.content or len(resp.content) < 500:
+            return None
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if ctype and "image" not in ctype and "octet-stream" not in ctype:
+            return None
+        return resp.content
+    except Exception as exc:
+        logger.warning("download_image_bytes فشل: %s", exc)
+        return None
+
+
+def _railway_product_preview(asin: str, domain: str = AMAZON_DOMAIN) -> dict:
+    """على Railway: جلب صورة/عنوان خفيف قبل إرجاع رابط الأفلييت فقط."""
+    affiliate_link = build_affiliate_link(asin, domain)
+    result: dict = {
+        "blocked": True,
+        "affiliate_link": affiliate_link,
+        "asin": asin,
+    }
+    widget_url = build_product_image_url(asin, domain)
+    if download_image_bytes(widget_url, timeout=10):
+        result["image"] = widget_url
+
+    try:
+        page_url = f"https://www.{domain}/dp/{asin}"
+        resp = requests.get(
+            page_url,
+            timeout=10,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Accept-Language": "ar,en;q=0.9",
+            },
+        )
+        if resp.status_code == 200 and "captcha" not in resp.text.lower()[:8000]:
+            og_img = re.search(
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                resp.text,
+            )
+            if og_img and og_img.group(1).startswith("http"):
+                result["image"] = og_img.group(1)
+            og_title = re.search(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                resp.text,
+            )
+            if og_title:
+                result["title"] = og_title.group(1).strip()[:120]
+    except Exception as exc:
+        logger.info("railway preview: %s", exc)
+
+    return result
+
+
 def format_offer_message(offer: dict, *, include_alert_hint: bool = True) -> str:
     """يبني رسالة تيليجرام تحفيزية مع السعر ودعوة للشراء والتنبيه."""
     if not offer:
@@ -755,9 +830,11 @@ def format_offer_message(offer: dict, *, include_alert_hint: bool = True) -> str
 
     if offer.get("blocked"):
         lines += [
-            "🔗 *المنتج جاهز على أمازون* — افتح الرابط وشوف السعر الحي.",
+            "🔗 *المنتج جاهز على أمازون*",
             "",
-            _random.choice(_BLOCKED_CTA),
+            "👇 اضغط *اشتري الآن* تحت وشوف السعر الحي مباشرة",
+            "",
+            "🔔 فعّل *نبّهني* لما يتوفر سعر — وأرسل لك إشعار فور الانخفاض",
             "",
             "🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_",
         ]

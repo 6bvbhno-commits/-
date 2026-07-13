@@ -10,6 +10,7 @@ import threading as _threading
 import time as _time
 import requests as _req
 from collections import defaultdict
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer as _HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
@@ -29,6 +30,7 @@ from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
 from amazon_utils import (
     build_affiliate_link,
     build_product_image_url,
+    download_image_bytes,
     extract_asin,
     extract_domain,
     resolve_short_link,
@@ -45,6 +47,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+BOT_VERSION = "2.2"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -284,19 +288,25 @@ async def _reply_photo(
     parse_mode: str | None = "Markdown",
     reply_markup=None,
 ) -> bool:
-    """يرسل صورة المنتج مع النص كتسمية. يرجع True عند النجاح.
-
-    عند أي فشل (رابط صورة غير صالح، خطأ تيليجرام) يرجع False كي يتحول
-    المستدعي إلى إرسال النص فقط.
-    """
+    """يرسل صورة المنتج مع النص — يحمّل الصورة أولاً لأن تيليجرام يرفض روابط أمازون."""
     if not update.message or not photo_url or not photo_url.startswith("http"):
         return False
     cap = caption if len(caption) <= _MAX_CAPTION else caption[: _MAX_CAPTION - 20] + "\n\n_…_"
+    loop = asyncio.get_running_loop()
+    photo_bytes = await loop.run_in_executor(None, download_image_bytes, photo_url)
+    if not photo_bytes:
+        logger.warning("تعذّر تحميل صورة المنتج: %s", photo_url[:80])
+        return False
+
+    photo_file = BytesIO(photo_bytes)
     for attempt in range(3):
         try:
+            photo_file.seek(0)
             await update.message.reply_photo(
-                photo=photo_url, caption=cap,
-                parse_mode=parse_mode, reply_markup=reply_markup,
+                photo=photo_file,
+                caption=cap,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
             return True
         except RetryAfter as e:
@@ -307,11 +317,10 @@ async def _reply_photo(
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
             else:
-                logger.warning("إرسال الصورة فشل شبكياً، سأرسل نصاً: %s", e)
+                logger.warning("إرسال الصورة فشل شبكياً: %s", e)
                 return False
         except TelegramError as e:
-            # رابط صورة غير مقبول من تيليجرام — نتحول للنص
-            logger.info("تعذّر إرسال الصورة (%s) — سأرسل النص فقط", e)
+            logger.info("تعذّر إرسال الصورة (%s)", e)
             return False
     return False
 
@@ -337,7 +346,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "بعد أي سعر، اضغط زر *🔔 نبّهني* — وأرسل لك إشعار *فوراً* لما ينزل السعر!\n"
             "📋 تنبيهاتك النشطة: /myalerts\n\n"
             "💡 _نصيحة: أرسل رابط المنتج مباشرة للحصول على أفضل نتيجة._\n\n"
-            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
+            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._\n\n"
+            f"🆔 إصدار البوت: `{BOT_VERSION}`"
         )
         if MOCK_MODE:
             welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
@@ -408,17 +418,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _typing(update, context)
-    await _reply(update, "⏳ لحظة... أجيب لك صورة المنتج وأفضل سعر 🔍", parse_mode=None)
 
     async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
         try:
             loop  = asyncio.get_running_loop()
-            # timeout 13 ثانية — يكفي لمحاولة كشط واحدة ناجحة (12s) دون قطعها،
-            # وأسرع من السابق (20s) عند الحجب. لو تجاوزها نرجع رابط الأفلييت مباشرة.
             try:
                 offer = await asyncio.wait_for(
                     loop.run_in_executor(None, get_lowest_offer, asin, domain),
-                    timeout=13.0,
+                    timeout=22.0,
                 )
             except asyncio.TimeoutError:
                 logger.warning("get_lowest_offer timeout للـ ASIN %s — إرجاع رابط مباشر", asin)
@@ -484,6 +491,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # صورة المنتج مع النص التحفيزي — دائماً نحاول الإرسال كصورة
     image_url = build_product_image_url(asin, domain, offer)
     sent = await _reply_photo(update, image_url, message, reply_markup=kb)
+    if not sent and (offer or {}).get("image"):
+        sent = await _reply_photo(update, offer["image"], message, reply_markup=kb)
     if not sent:
         await _reply(update, message, reply_markup=kb)
     _stat("requests_ok")
@@ -631,6 +640,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
     )
+    from serpapi_utils import serpapi_available
+    from paapi_utils import paapi_available
 
     def _status(val: str) -> str:
         return "✅ متوفر" if val else "❌ غير موجود"
@@ -639,15 +650,28 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
 
     msg = (
-        "🔧 *حالة مفاتيح API:*\n\n"
+        f"🔧 *حالة البوت v{BOT_VERSION}*\n\n"
+        f"• إصدار الكود: `{BOT_VERSION}`\n"
+        f"• خدمة Railway: `{railway_svc}`\n"
+        f"• SerpAPI (سعر+صورة): {'✅' if serpapi_available() else '❌'}\n"
+        f"• PA API (سعر+صورة): {'✅' if paapi_available() else '❌'}\n"
         f"• DeepSeek (نص): {_status(deepseek_key)}\n"
-        f"• SerpAPI: {_status(SERPAPI_KEY)}\n"
-        f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
-        f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n"
-        f"• خدمة Railway: `{railway_svc}`\n\n"
-        "📸 _التعرف على الصور: معطّل_"
+        f"• Anthropic: {_status(ANTHROPIC_API_KEY)}\n"
+        f"• Telegram: {_status(TELEGRAM_BOT_TOKEN)}\n\n"
+        "💡 _بدون SerpAPI أو PA API على Railway يظهر الرابط والصورة فقط بدون سعر حي._"
     )
     await _reply(update, msg)
+
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import os
+    svc = os.getenv("RAILWAY_SERVICE_NAME", "local")
+    await _reply(
+        update,
+        f"🆔 *إصدار البوت:* `{BOT_VERSION}`\n"
+        f"🤖 *الخدمة:* `{svc}`\n\n"
+        "إذا ما تشوف هذا الإصدار — Railway ما نشر التحديث بعد.",
+    )
 
 
 async def myalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -692,8 +716,18 @@ async def _send_alert_notification(app, alert: dict, offer: dict, new_price: flo
         InlineKeyboardButton("🛒 اشتري الآن ↗", url=link),
     ]])
     image_url = build_product_image_url(alert["asin"], alert["domain"], offer)
+    loop = asyncio.get_running_loop()
+    photo_bytes = await loop.run_in_executor(None, download_image_bytes, image_url)
     try:
-        if image_url:
+        if photo_bytes:
+            await app.bot.send_photo(
+                chat_id=alert["chat_id"],
+                photo=BytesIO(photo_bytes),
+                caption=caption[:_MAX_CAPTION],
+                parse_mode="Markdown",
+                reply_markup=buy_kb,
+            )
+        elif image_url:
             await app.bot.send_photo(
                 chat_id=alert["chat_id"],
                 photo=image_url,
@@ -981,6 +1015,7 @@ def main():
         return
 
     print("=" * 50)
+    print(f"🆔 Bot version: {BOT_VERSION}")
     print(f"📊 MOCK_MODE: {MOCK_MODE}")
     print(f"   {'⚠️  أسعار وهمية' if MOCK_MODE else '🔴 أسعار حقيقية'}")
     print(f"🔗 Affiliate tag: {AFFILIATE_TAG}")
@@ -1033,6 +1068,7 @@ def main():
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
     app.add_handler(CommandHandler("debug",     debug_command))
+    app.add_handler(CommandHandler("version",   version_command))
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_unsupported_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_unsupported_photo))
