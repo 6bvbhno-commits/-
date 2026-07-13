@@ -39,6 +39,7 @@ from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
     test_gemini_connection,
+    test_deepseek_vision,
 )
 
 logging.basicConfig(
@@ -636,27 +637,30 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     gemini_key = get_gemini_api_key()
     gemini_test = test_gemini_connection() if gemini_key else "❌ المفتاح غير موجود"
+    deepseek_test = test_deepseek_vision() if DEEPSEEK_API_KEY else "❌ المفتاح غير موجود"
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
     vision_env = [
         n for n in (
-            "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY",
-            "GEMINI_KEY", "SERPAPI_KEY", "AI_INTEGRATIONS_OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_KEY", "SERPAPI_KEY",
+            "AI_INTEGRATIONS_OPENAI_API_KEY",
         )
         if (os.getenv(n) or "").strip()
     ]
 
     msg = (
         "🔧 *حالة مفاتيح API:*\n\n"
+        f"• DeepSeek (نص): {_status(DEEPSEEK_API_KEY)}\n"
+        f"• DeepSeek (صور): {deepseek_test}\n"
         f"• OpenAI Vision (Replit): {_status(OPENAI_BASE_URL and OPENAI_API_KEY)}\n"
         f"• Gemini API: {_status(gemini_key)}\n"
         f"• Gemini اختبار: {gemini_test}\n"
         f"• SerpAPI (Lens): {_status(SERPAPI_KEY)}\n"
-        f"• DeepSeek: {_status(DEEPSEEK_API_KEY)}\n"
         f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
         f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n"
         f"• خدمة Railway: `{railway_svc}`\n"
         f"• متغيرات الصور: `{', '.join(vision_env) or 'لا شيء'}`\n\n"
-        "⚠️ _DeepSeek للنص فقط — للصور: Gemini أو SerpAPI_"
+        "📸 _الصور: DeepSeek V4 أولاً، ثم Gemini_"
     )
     await _reply(update, msg)
 
@@ -840,30 +844,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not product_name:
         import os
-        from config import get_gemini_api_key, OPENAI_API_KEY, SERPAPI_KEY
+        from config import get_gemini_api_key, OPENAI_API_KEY, SERPAPI_KEY, DEEPSEEK_API_KEY
         gemini_key = get_gemini_api_key()
+        deepseek_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
         railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
-        if not gemini_key and not OPENAI_API_KEY and not SERPAPI_KEY:
+        if not deepseek_key and not gemini_key and not OPENAI_API_KEY and not SERPAPI_KEY:
             await _reply(
                 update,
                 "❌ التعرف على الصور غير مفعّل على السيرفر.\n\n"
                 f"🔧 الخدمة الحالية: `{railway_svc}`\n"
                 "أضف في Railway على خدمة *charming-strength*:\n"
-                "• `GEMINI_API_KEY` (من Google AI Studio)\n"
-                "• أو `SERPAPI_KEY`\n\n"
-                "ثم اربط المتغير واضغط **Deploy**.\n"
-                "أرسل `/debug` للتأكد.",
+                "• `DEEPSEEK_API_KEY` (موجود عندك — تأكد من الربط + Deploy)\n"
+                "• أو `GEMINI_API_KEY`\n\n"
+                "ثم اضغط **Deploy** وأرسل `/debug`.",
                 parse_mode=None,
             )
         else:
-            gemini_hint = ""
-            if gemini_key:
-                gemini_hint = f"\n\n🔧 Gemini: {test_gemini_connection()}"
+            vision_hint = ""
+            if deepseek_key:
+                vision_hint = f"\n\n🔧 DeepSeek: {test_deepseek_vision()}"
+            elif gemini_key:
+                vision_hint = f"\n\n🔧 Gemini: {test_gemini_connection()}"
             await _reply(
                 update,
                 "❌ ما قدرت أتعرف على المنتج.\n"
                 "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة."
-                f"{gemini_hint}",
+                f"{vision_hint}",
                 parse_mode=None,
             )
         return

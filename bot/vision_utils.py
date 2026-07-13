@@ -1,10 +1,11 @@
 """
 دوال التعرف على المنتج من صورة، والبحث عنه داخل أمازون.
-الأولوية:
-  1. OpenAI GPT-4o-mini vision (Replit integration)
-  2. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY)
-  3. Gemini API (إذا وُجد GEMINI_API_KEY)
-  4. Hugging Face BLIP (مجاني بلا مفتاح — يعمل دائماً)
+الأولوية على Railway:
+  1. DeepSeek V4 Vision (DEEPSEEK_API_KEY)
+  2. Gemini API (GEMINI_API_KEY)
+  3. SerpAPI Google Lens
+  4. OpenAI GPT-4o-mini vision (Replit)
+  5. Hugging Face BLIP
 """
 import base64
 import logging
@@ -14,13 +15,24 @@ import requests
 from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
 import os
 
-from config import get_gemini_api_key, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+from config import (
+    get_gemini_api_key,
+    DEEPSEEK_API_KEY,
+    SERPAPI_KEY,
+    OPENAI_BASE_URL,
+    OPENAI_API_KEY,
+    AFFILIATE_TAG,
+    AMAZON_DOMAIN,
+)
 
 # على Railway لا يوجد Replit OpenAI — Gemini/SerpAPI أولوية للصور
 _ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
 
 # حد Gemini: طلبان متزامنان — ضغط عالي يستحق 2 (429 تُعالج بالتجربة التالية)
 _GEMINI_SEM = threading.Semaphore(2)
+
+# حد DeepSeek Vision: طلبان متزامنان
+_DEEPSEEK_SEM = threading.Semaphore(2)
 
 # حد OpenAI Vision: أقصى 5 طلبات متزامنة (رُفع من 3 لاستيعاب الضغط العالي)
 _OPENAI_SEM = threading.Semaphore(5)
@@ -160,6 +172,109 @@ def _google_lens(image_url: str) -> str | None:
     except Exception as exc:
         logger.error("Google Lens exception: %s", exc)
         return None
+
+
+def _deepseek_vision_models() -> list[str]:
+    return [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+    ]
+
+
+def _call_deepseek_vision(image_bytes: bytes) -> str | None:
+    """التعرف على المنتج عبر DeepSeek V4 Vision (OpenAI-compatible)."""
+    api_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
+    if not api_key:
+        return None
+
+    if not _DEEPSEEK_SEM.acquire(timeout=40):
+        logger.warning("DeepSeek vision SEM timeout")
+        return None
+    try:
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        mime_type = _image_mime_type(image_bytes)
+        payload_base = {
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VISION_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_b64}",
+                        },
+                    },
+                ],
+            }],
+            "max_tokens": 120,
+            "stream": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        for model in _deepseek_vision_models():
+            try:
+                resp = requests.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers=headers,
+                    json={**payload_base, "model": model},
+                    timeout=25,
+                )
+                if resp.status_code == 200:
+                    text = (
+                        resp.json()
+                        .get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                        .strip()
+                    )
+                    if text:
+                        logger.info("DeepSeek vision نجح: %s", model)
+                        return text
+                    logger.warning("DeepSeek vision رد فارغ (%s)", model)
+                elif resp.status_code in (402, 429):
+                    logger.warning("DeepSeek vision %s (%s)", resp.status_code, model)
+                else:
+                    logger.warning(
+                        "DeepSeek vision HTTP %s (%s): %s",
+                        resp.status_code, model, resp.text[:200],
+                    )
+            except Exception as exc:
+                logger.error("DeepSeek vision exception (%s): %s", model, exc)
+
+        return None
+    finally:
+        _DEEPSEEK_SEM.release()
+
+
+def test_deepseek_vision() -> str:
+    """اختبار DeepSeek vision — يُستخدم في /debug."""
+    api_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
+    if not api_key:
+        return "❌ المفتاح غير موجود"
+    try:
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "قل: ok"}],
+                "max_tokens": 10,
+                "stream": False,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return "✅ يعمل (deepseek-v4-flash)"
+        return f"❌ HTTP {resp.status_code}: {resp.text[:120]}"
+    except Exception as exc:
+        return f"❌ خطأ: {exc}"
 
 
 def _gemini_models() -> list[str]:
@@ -493,12 +608,16 @@ def _call_huggingface_vision(image_bytes: bytes) -> str | None:
 def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str | None:
     """
     يتعرف على المنتج من الصورة.
-    على Railway: Gemini → SerpAPI Lens → OpenAI → BLIP
-    على Replit:  OpenAI → SerpAPI Lens → Gemini → BLIP
+    على Railway: DeepSeek Vision → Gemini → SerpAPI Lens → OpenAI → BLIP
+    على Replit:  OpenAI → SerpAPI Lens → Gemini → DeepSeek → BLIP
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
     if _ON_RAILWAY:
-        # ── Gemini (الأولوية على Railway — DeepSeek لا يدعم الصور) ─────────
+        result = _call_deepseek_vision(image_bytes)
+        if result:
+            return result
+        logger.info("DeepSeek vision لم يُنتج نتيجة — أنتقل لـ Gemini")
+
         result = _call_gemini(image_bytes)
         if result:
             return result
@@ -529,7 +648,12 @@ def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str 
         result = _call_gemini(image_bytes)
         if result:
             return result
-        logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+        logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ DeepSeek")
+
+        result = _call_deepseek_vision(image_bytes)
+        if result:
+            return result
+        logger.info("DeepSeek vision لم يُنتج نتيجة — أنتقل لـ HuggingFace")
 
     # ── Hugging Face BLIP (fallback مجاني — غير موثوق على Railway) ───────────
     return _call_huggingface_vision(image_bytes)
