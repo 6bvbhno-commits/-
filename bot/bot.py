@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.6"
+BOT_VERSION = "2.7"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -226,6 +226,102 @@ _SHORT_LINK_RE = _re.compile(
     r"https?://(?:amzn\.to|amzn\.eu|a\.co|link\.amazon|ty\.gl|bit\.ly|tinyurl\.com|t\.co|rb\.gy)/",
     _re.IGNORECASE,
 )
+_GREETING_RE = _re.compile(
+    r"^(?:مرحبا|مرحباً|هلا|اهلا|أهلا|السلام|سلام عليكم|هاي|hi|hello|"
+    r"شكرا|شكراً|thanks|مساء|صباح)[\s!.؟?]*$",
+    _re.IGNORECASE,
+)
+
+
+def _guess_product_query(text: str) -> str | None:
+    """يخمّن أن النص اسم منتج — بدون انتظار الذكاء الاصطناعي."""
+    t = text.strip()
+    if len(t) < 3 or len(t) > 120:
+        return None
+    if _GREETING_RE.match(t):
+        return None
+    if _re.match(r"^(?:من انت|وش البوت|help|مساعدة|/help)[\s?.!]*$", t, _re.IGNORECASE):
+        return None
+    return t
+
+
+async def _search_and_deliver_product(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    product_query: str,
+) -> None:
+    """يبحث عن منتج بالاسم ويرسل صورة + وصف + أزرار — مثل الرابط."""
+    await _typing(update, context)
+    loop = asyncio.get_running_loop()
+
+    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+        try:
+            offers = await asyncio.wait_for(
+                loop.run_in_executor(None, search_amazon_by_keywords, product_query),
+                timeout=25.0,
+            )
+        except Exception as e:
+            logger.error("فشل البحث عن '%s': %s", product_query, e)
+            offers = []
+
+    if offers:
+        first = offers[0]
+        asin = (first.get("asin") or "").strip()
+        if asin:
+            try:
+                offer = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: get_lowest_offer(asin, AMAZON_DOMAIN, ""),
+                    ),
+                    timeout=25.0,
+                )
+            except Exception as e:
+                logger.warning("get_lowest_offer للبحث فشل: %s", e)
+                offer = None
+            if not offer:
+                offer = {
+                    "asin": asin,
+                    "title": first.get("title") or product_query,
+                    "price": first.get("price"),
+                    "image": first.get("image", ""),
+                    "blocked": True,
+                    "affiliate_link": build_affiliate_link(asin, AMAZON_DOMAIN),
+                }
+            await _send_product_offer(update, context, asin, AMAZON_DOMAIN, offer, "")
+            return
+
+    message, search_url, image_url = format_search_results(product_query, offers or [])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛒 شوف العروض واطلب ↗", url=search_url),
+    ]]) if search_url.startswith("http") else None
+
+    chat_id = update.effective_chat.id
+    reply_to = update.message.message_id
+    photo_bytes = None
+    if image_url:
+        photo_bytes = await loop.run_in_executor(None, download_image_bytes, image_url)
+
+    if photo_bytes:
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                reply_to_message_id=reply_to,
+                photo=BytesIO(photo_bytes),
+                caption=f"📦 {product_query[:80]}",
+                parse_mode=None,
+            )
+        except TelegramError:
+            pass
+
+    header = f"🆔 البوت v{BOT_VERSION}\n\n"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        reply_to_message_id=reply_to,
+        text=(header + message)[:_MAX_MSG],
+        parse_mode=None,
+        reply_markup=kb,
+    )
+    _stat("requests_ok")
 
 # =============================================================================
 # دوال مساعدة
@@ -871,18 +967,13 @@ async def handle_unsupported_photo(update: Update, context: ContextTypes.DEFAULT
         return
     await _reply(
         update,
-        "📸 التعرف على الصور غير متاح.\n\n"
-        "🔗 أرسل *رابط منتج أمازون* — أرد عليك بصورة المنتج + السعر + زر شراء!",
+        "📸 أرسل *رابط منتج أمازون* — أجيبك بالصورة والسعر والأزرار فوراً.",
         parse_mode=None,
     )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يعالج أي نص ليس رابطاً.
-    - إذا كان اسم/وصف منتج → Claude يستخرجه ويبحث عنه في أمازون.
-    - غير ذلك → Claude يرد محادثياً.
-    """
+    """نص عادي: اسم منتج → بحث فوري بصورة وسعر. تحية → رد قصير."""
     if not update.message or not update.message.text:
         return
 
@@ -891,56 +982,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
         return
 
-    await _typing(update, context)
-
     text = update.message.text.strip()
     _add_to_history(user_id, "user", text)
 
-    loop = asyncio.get_running_loop()
-
-    # ── هل النص يحتوي على نية شراء؟ ─────────────────────────────────────────
-    try:
-        from claude_utils import extract_product_intent, chat_response
-        product_query = await loop.run_in_executor(None, extract_product_intent, text)
-    except Exception as e:
-        logger.warning("Claude intent فشل: %s", e)
-        product_query = None
-
-    if product_query:
-        # ← مستخدم يريد منتجاً: ابحث عنه في أمازون
-        await _typing(update, context)
+    if _GREETING_RE.match(text):
         await _reply(
             update,
-            f"🔍 جاري البحث عن: *{product_query}*",
+            f"👋 هلا!\n\n"
+            f"🆔 v{BOT_VERSION}\n"
+            "اكتب *اسم منتج* أو أرسل *رابط أمازون* — أجيبك بالصورة والسعر والأزرار فوراً.",
         )
-        async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
-            try:
-                offers  = await asyncio.wait_for(
-                    loop.run_in_executor(None, search_amazon_by_keywords, product_query),
-                    timeout=25.0,
-                )
-                message, search_url, image_url = format_search_results(product_query, offers)
-            except asyncio.TimeoutError:
-                message, search_url, image_url = format_search_results(product_query, [])
-            except Exception as e:
-                logger.error("فشل البحث عن '%s': %s", product_query, e)
-                message, search_url, image_url = "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", "", ""
-
-        search_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🛒 شوف العروض واطلب ↗", url=search_url)
-        ]]) if search_url and search_url.startswith("http") else None
-        if not image_url and offers:
-            first = offers[0]
-            asin = (first.get("asin") or "").strip()
-            if asin:
-                image_url = build_product_image_url(asin, AMAZON_DOMAIN, first)
-        sent = await _reply_photo(update, image_url, message, reply_markup=search_kb)
-        if not sent:
-            await _reply(update, message, reply_markup=search_kb)
-        _add_to_history(user_id, "assistant", message[:300])
         return
 
-    # ← رسالة عامة: Claude يرد محادثياً
+    loop = asyncio.get_running_loop()
+    product_query = None
+    try:
+        from claude_utils import extract_product_intent
+        product_query = await loop.run_in_executor(None, extract_product_intent, text)
+    except Exception as e:
+        logger.warning("extract_product_intent فشل: %s", e)
+
+    if not product_query:
+        product_query = _guess_product_query(text)
+
+    if product_query:
+        await _search_and_deliver_product(update, context, product_query)
+        _add_to_history(user_id, "assistant", product_query[:200])
+        return
+
     async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
         try:
             from claude_utils import chat_response
@@ -949,20 +1018,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 loop.run_in_executor(None, chat_response, text, history),
                 timeout=15.0,
             )
-        except asyncio.TimeoutError:
-            response = None
         except Exception as e:
-            logger.warning("Claude chat فشل: %s", e)
+            logger.warning("chat_response فشل: %s", e)
             response = None
 
-    if not response:
-        response = (
-            "أرسل لي 🔗 رابط منتج أمازون "
-            "وأجيبك بصورة المنتج + أفضل سعر + زر شراء مباشر 🛒"
-        )
+    if response:
+        await _reply(update, response, parse_mode=None)
+        _add_to_history(user_id, "assistant", response)
+        _stat("requests_ok")
+        return
 
-    await _reply(update, response, parse_mode=None)
-    _add_to_history(user_id, "assistant", response)
+    # آخر محاولة: ابحث بالنص نفسه
+    if len(text) >= 3:
+        await _search_and_deliver_product(update, context, text)
+        return
+
+    await _reply(update, "📝 اكتب اسم المنتج أو أرسل رابط أمازون.", parse_mode=None)
     _stat("requests_ok")
 
 

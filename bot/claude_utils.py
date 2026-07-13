@@ -73,7 +73,7 @@ _SYSTEM_EXTRACT = """\
   "كيف الحال؟"        → NONE\
 """
 
-_FALLBACK_CHAT = "أرسل لي 🔗 رابط منتج أمازون وأجيبك بصورة المنتج + أفضل سعر فوراً 🛒"
+_FALLBACK_CHAT = None  # لا نرسل نص توجيهي — البوت يبحث مباشرة
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -188,7 +188,7 @@ def chat_response(text: str, history: list[dict]) -> str:
         return msg.content[0].text.strip()
     except Exception as e:
         logger.warning("Claude chat فشل: %s", e)
-        return _FALLBACK_CHAT
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════
