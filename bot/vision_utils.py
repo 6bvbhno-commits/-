@@ -1,10 +1,10 @@
 """
 دوال التعرف على المنتج من صورة، والبحث عنه داخل أمازون.
 الأولوية على Railway:
-  1. DeepSeek V4 Vision (DEEPSEEK_API_KEY)
-  2. Gemini API (GEMINI_API_KEY)
-  3. SerpAPI Google Lens
-  4. OpenAI GPT-4o-mini vision (Replit)
+  1. OpenAI GPT-4o-mini (OPENAI_API_KEY / ChatGPT)
+  2. DeepSeek V4 Vision (DEEPSEEK_API_KEY)
+  3. Gemini API (GEMINI_API_KEY)
+  4. SerpAPI Google Lens
   5. Hugging Face BLIP
 """
 import base64
@@ -18,9 +18,8 @@ import os
 from config import (
     get_gemini_api_key,
     get_deepseek_api_key,
+    get_openai_vision_config,
     SERPAPI_KEY,
-    OPENAI_BASE_URL,
-    OPENAI_API_KEY,
     AFFILIATE_TAG,
     AMAZON_DOMAIN,
 )
@@ -96,26 +95,24 @@ _HEADERS = {
 
 
 def _call_openai_vision(image_bytes: bytes) -> str | None:
-    """
-    يستخدم GPT-4o-mini عبر Replit OpenAI Integration للتعرف على المنتج.
-    لا يحتاج مفتاح خاص — مدار عبر Replit.
-    """
-    if not OPENAI_BASE_URL or not OPENAI_API_KEY:
+    """GPT-4o-mini vision — يدعم OPENAI_API_KEY على Railway أو Replit integration."""
+    base_url, api_key = get_openai_vision_config()
+    if not api_key:
         return None
-    # حد الطلبات المتزامنة — timeout 30s منعاً للانتظار الأبدي
     if not _OPENAI_SEM.acquire(timeout=30):
         logger.warning("OpenAI SEM timeout — تخطي التحليل")
         return None
     try:
-        return _call_openai_vision_inner(image_bytes)
+        return _call_openai_vision_inner(image_bytes, base_url, api_key)
     finally:
         _OPENAI_SEM.release()
 
 
-def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
+def _call_openai_vision_inner(image_bytes: bytes, base_url: str, api_key: str) -> str | None:
     """الجسم الفعلي لطلب OpenAI — يُستدعى داخل السيمافور فقط."""
     try:
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        mime_type = _image_mime_type(image_bytes)
         payload = {
             "model": "gpt-4o-mini",
             "messages": [{
@@ -123,7 +120,7 @@ def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
                 "content": [
                     {"type": "text", "text": _VISION_PROMPT},
                     {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_b64}",
+                        "url": f"data:{mime_type};base64,{image_b64}",
                         "detail": "high",
                     }},
                 ],
@@ -131,13 +128,13 @@ def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
             "max_tokens": 100,
         }
         resp = requests.post(
-            f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
+            f"{base_url}/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=20,
+            timeout=25,
         )
         if resp.status_code != 200:
             logger.warning("OpenAI vision HTTP %s: %s", resp.status_code, resp.text[:200])
@@ -155,6 +152,32 @@ def _call_openai_vision_inner(image_bytes: bytes) -> str | None:
     except Exception as exc:
         logger.error("OpenAI vision exception: %s", exc)
         return None
+
+
+def test_openai_vision() -> str:
+    """اختبار OpenAI/ChatGPT vision — يُستخدم في /debug."""
+    base_url, api_key = get_openai_vision_config()
+    if not api_key:
+        return "❌ المفتاح غير موجود"
+    try:
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "قل: ok"}],
+                "max_tokens": 10,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return "✅ يعمل (gpt-4o-mini)"
+        return f"❌ HTTP {resp.status_code}: {resp.text[:100]}"
+    except Exception as exc:
+        return f"❌ خطأ: {exc}"
 
 
 def _google_lens(image_url: str) -> str | None:
@@ -643,11 +666,16 @@ def _call_huggingface_vision(image_bytes: bytes) -> str | None:
 def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str | None:
     """
     يتعرف على المنتج من الصورة.
-    على Railway: DeepSeek Vision → Gemini → SerpAPI Lens → OpenAI → BLIP
+    على Railway: OpenAI → DeepSeek → Gemini → SerpAPI Lens → BLIP
     على Replit:  OpenAI → SerpAPI Lens → Gemini → DeepSeek → BLIP
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
     if _ON_RAILWAY:
+        result = _call_openai_vision(image_bytes)
+        if result:
+            return result
+        logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل لـ DeepSeek")
+
         result = _call_deepseek_vision(image_bytes)
         if result:
             return result
@@ -662,12 +690,7 @@ def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str 
             result = _google_lens(image_url)
             if result:
                 return result
-            logger.info("Google Lens لم يتعرف — أنتقل لـ OpenAI")
-
-        result = _call_openai_vision(image_bytes)
-        if result:
-            return result
-        logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+            logger.info("Google Lens لم يتعرف — أنتقل لـ HuggingFace")
     else:
         result = _call_openai_vision(image_bytes)
         if result:

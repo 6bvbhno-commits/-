@@ -27,6 +27,20 @@ def get_deepseek_api_key() -> str:
     """مفتاح DeepSeek — يُقرأ وقت التشغيل."""
     return _first_env("DEEPSEEK_API_KEY")
 
+
+def get_openai_vision_config() -> tuple[str, str]:
+    """(base_url, api_key) لـ ChatGPT/OpenAI Vision على Railway أو Replit."""
+    api_key = _first_env(
+        "OPENAI_API_KEY",
+        "CHATGPT_API_KEY",
+        "AI_INTEGRATIONS_OPENAI_API_KEY",
+    )
+    base_url = _first_env(
+        "OPENAI_BASE_URL",
+        "AI_INTEGRATIONS_OPENAI_BASE_URL",
+    ) or "https://api.openai.com/v1"
+    return base_url.rstrip("/"), api_key
+
 # توكن البوت — تحصل عليه من @BotFather في تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -49,9 +63,10 @@ GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 # مفتاح SerpAPI — البديل الجذري للكشط (serpapi.com)
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
-# Replit OpenAI Integration — vision عبر GPT-4o بدون مفتاح خاص
-OPENAI_BASE_URL = os.getenv("AI_INTEGRATIONS_OPENAI_BASE_URL", "")
-OPENAI_API_KEY  = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
+# Replit/OpenAI — يُقرأ أيضاً عبر get_openai_vision_config() للصور
+_openai_base, _openai_key = get_openai_vision_config()
+OPENAI_BASE_URL = _openai_base
+OPENAI_API_KEY  = _openai_key
 
 # Replit Anthropic Integration — Claude للمحادثة وتحليل الأسعار
 ANTHROPIC_BASE_URL = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
