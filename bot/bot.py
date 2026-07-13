@@ -38,6 +38,7 @@ from vision_utils import (
     identify_product_from_image,
     search_amazon_by_keywords,
     format_search_results,
+    test_gemini_connection,
 )
 
 logging.basicConfig(
@@ -621,6 +622,7 @@ def _build_myalerts_content(alerts: list[dict]) -> tuple[str, list]:
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعرض حالة مفاتيح API المتاحة — للتشخيص فقط (لا يكشف القيم)."""
+    import os
     from config import (
         OPENAI_BASE_URL, OPENAI_API_KEY,
         GEMINI_API_KEY, SERPAPI_KEY,
@@ -631,15 +633,20 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     def _status(val: str) -> str:
         return "✅ متوفر" if val else "❌ غير موجود"
 
+    gemini_test = test_gemini_connection() if GEMINI_API_KEY else "❌ المفتاح غير موجود"
+    railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+
     msg = (
         "🔧 *حالة مفاتيح API:*\n\n"
         f"• OpenAI Vision (Replit): {_status(OPENAI_BASE_URL and OPENAI_API_KEY)}\n"
         f"• Gemini API: {_status(GEMINI_API_KEY)}\n"
+        f"• Gemini اختبار: {gemini_test}\n"
         f"• SerpAPI (Lens): {_status(SERPAPI_KEY)}\n"
         f"• DeepSeek: {_status(DEEPSEEK_API_KEY)}\n"
         f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
-        f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n\n"
-        "⚠️ _للتعرف على الصور يجب توفر Gemini أو OpenAI أو SerpAPI_"
+        f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n"
+        f"• خدمة Railway: `{railway_svc}`\n\n"
+        "⚠️ _DeepSeek للنص فقط — للصور: Gemini أو SerpAPI_"
     )
     await _reply(update, msg)
 
@@ -826,9 +833,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not GEMINI_API_KEY and not OPENAI_API_KEY and not SERPAPI_KEY:
             await _reply(
                 update,
-                "❌ مفاتيح التعرف على الصور غير مضبوطة على السيرفر.\n\n"
-                "🔧 الحل: أضف GEMINI\\_API\\_KEY في متغيرات Railway، "
-                "أو أرسل اسم المنتج نصياً وأبحث عنه مباشرة.",
+                "❌ التعرف على الصور غير مفعّل على السيرفر.\n\n"
+                "🔧 DeepSeek يدعم النص فقط — للصور أضف في Railway:\n"
+                "• `GEMINI_API_KEY` (مجاني من Google AI Studio)\n"
+                "• أو `SERPAPI_KEY` (Google Lens)\n\n"
+                "ثم اربط المتغير بخدمة البوت واضغط Deploy.\n"
+                "أو أرسل اسم المنتج/رابط أمازون نصياً.",
                 parse_mode=None,
             )
         else:

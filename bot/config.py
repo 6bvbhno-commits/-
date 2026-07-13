@@ -17,7 +17,7 @@ AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY")
 
 # مفتاح Gemini API (مجاني من Google AI Studio) — للتعرف على المنتجات في الصور
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 
 # مفتاح Google Cloud Vision API (قديم — استُبدل بـ Gemini)
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")

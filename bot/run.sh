@@ -11,6 +11,13 @@ if [ -z "$RAILWAY_ENVIRONMENT" ]; then
     exit 0
 fi
 
+# ── خدمة واحدة فقط: monorepo ينشر عدة خدمات بنفس Dockerfile ──
+BOT_SERVICE="${BOT_SERVICE_NAME:-charming-strength}"
+if [ -n "$RAILWAY_SERVICE_NAME" ] && [ "$RAILWAY_SERVICE_NAME" != "$BOT_SERVICE" ]; then
+    echo "⛔ خدمة $RAILWAY_SERVICE_NAME — البوت يعمل على $BOT_SERVICE فقط."
+    exit 0
+fi
+
 # ── إعداد Python: استخدم النظام إذا كانت المكتبات متوفرة (Railway)، وإلا أنشئ venv (Replit) ──
 if python3 -c "import telegram" 2>/dev/null; then
     echo "✅ المكتبات جاهزة في Python النظام"

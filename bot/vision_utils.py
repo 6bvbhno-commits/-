@@ -12,7 +12,12 @@ import re
 import threading
 import requests
 from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
+import os
+
 from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+
+# على Railway لا يوجد Replit OpenAI — Gemini/SerpAPI أولوية للصور
+_ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
 
 # حد Gemini: طلبان متزامنان — ضغط عالي يستحق 2 (429 تُعالج بالتجربة التالية)
 _GEMINI_SEM = threading.Semaphore(2)
@@ -21,6 +26,17 @@ _GEMINI_SEM = threading.Semaphore(2)
 _OPENAI_SEM = threading.Semaphore(5)
 
 logger = logging.getLogger(__name__)
+
+
+def _image_mime_type(image_bytes: bytes) -> str:
+    """يحدد نوع الصورة من البايتات الأولى — Gemini يرفض mimeType خاطئ."""
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if image_bytes[:3] == b"GIF":
+        return "image/gif"
+    if image_bytes[:4] == b"RIFF" and len(image_bytes) > 11 and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 # برومبت موحّد للتعرف على المنتج — مُحسّن لإخراج عبارة بحث دقيقة تصلح لأمازون مباشرة
 _VISION_PROMPT = (
@@ -164,11 +180,12 @@ def _call_gemini(image_bytes: bytes) -> str | None:
     ]
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = _image_mime_type(image_bytes)
     payload = {
         "contents": [{
             "parts": [
                 {"text": _VISION_PROMPT},
-                {"inlineData": {"mimeType": "image/jpeg", "data": image_b64}},
+                {"inlineData": {"mimeType": mime_type, "data": image_b64}},
             ]
         }]
     }
@@ -186,10 +203,21 @@ def _call_gemini(image_bytes: bytes) -> str | None:
             try:
                 response = requests.post(url, json=payload, timeout=20)
                 if response.status_code == 200:
+                    data = response.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        logger.warning(
+                            "Gemini 200 بدون candidates (%s): %s",
+                            model, str(data)[:300],
+                        )
+                        continue
+                    cand = candidates[0]
+                    finish = cand.get("finishReason", "")
+                    if finish and finish not in ("STOP", "MAX_TOKENS"):
+                        logger.warning("Gemini blocked (%s): finishReason=%s", model, finish)
+                        continue
                     text = (
-                        response.json()
-                        .get("candidates", [{}])[0]
-                        .get("content", {})
+                        cand.get("content", {})
                         .get("parts", [{}])[0]
                         .get("text", "")
                         .strip()
@@ -197,11 +225,15 @@ def _call_gemini(image_bytes: bytes) -> str | None:
                     if text:
                         logger.info("Gemini نجح: %s", model)
                         return text
+                    logger.warning("Gemini 200 بنص فارغ (%s)", model)
                 elif response.status_code == 429:
                     logger.warning("Gemini 429 (%s) — تجربة الموديل التالي فوراً", model)
                     time.sleep(1)   # ثانية واحدة فقط بين الموديلات
                 else:
-                    logger.warning("Gemini %s للموديل %s", response.status_code, model)
+                    logger.warning(
+                        "Gemini %s للموديل %s: %s",
+                        response.status_code, model, response.text[:300],
+                    )
             except Exception as e:
                 logger.error("خطأ في Gemini (%s): %s", model, e)
 
@@ -209,6 +241,28 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         return None
     finally:
         _GEMINI_SEM.release()
+
+
+def test_gemini_connection() -> str:
+    """اختبار سريع لصلاحية GEMINI_API_KEY — يُستخدم في /debug."""
+    if not GEMINI_API_KEY:
+        return "❌ المفتاح غير موجود"
+    try:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        )
+        resp = requests.post(
+            url,
+            json={"contents": [{"parts": [{"text": "قل: ok"}]}]},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return "✅ يعمل"
+        body = resp.text[:180].replace("\n", " ")
+        return f"❌ HTTP {resp.status_code}: {body}"
+    except Exception as exc:
+        return f"❌ خطأ: {exc}"
 
 
 def _scrape_amazon_search(query: str, domain: str = AMAZON_DOMAIN) -> list[dict]:
@@ -375,33 +429,45 @@ def _call_huggingface_vision(image_bytes: bytes) -> str | None:
 def identify_product_from_image(image_bytes: bytes, image_url: str = "") -> str | None:
     """
     يتعرف على المنتج من الصورة.
-    الأولوية:
-      1. OpenAI GPT-4o-mini vision (Replit integration — موثوق وسريع)
-      2. SerpAPI Google Lens (إذا وُجد SERPAPI_KEY + image_url)
-      3. Gemini API (إذا وُجد GEMINI_API_KEY)
-      4. Hugging Face BLIP (مجاني بلا مفتاح — يعمل دائماً كـ fallback)
+    على Railway: Gemini → SerpAPI Lens → OpenAI → BLIP
+    على Replit:  OpenAI → SerpAPI Lens → Gemini → BLIP
     استدعاء متزامن — يجب تشغيله عبر run_in_executor.
     """
-    # ── OpenAI Vision (الأولوية الأولى) ──────────────────────────────────────
-    result = _call_openai_vision(image_bytes)
-    if result:
-        return result
-    logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل للخطوة التالية")
-
-    # ── Google Lens (الأولوية الثانية) ───────────────────────────────────────
-    if image_url and SERPAPI_KEY:
-        result = _google_lens(image_url)
+    if _ON_RAILWAY:
+        # ── Gemini (الأولوية على Railway — DeepSeek لا يدعم الصور) ─────────
+        result = _call_gemini(image_bytes)
         if result:
             return result
-        logger.info("Google Lens لم يتعرف — أنتقل لـ Gemini")
+        logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ Google Lens")
 
-    # ── Gemini (الأولوية الثالثة) ─────────────────────────────────────────────
-    result = _call_gemini(image_bytes)
-    if result:
-        return result
-    logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+        if image_url and SERPAPI_KEY:
+            result = _google_lens(image_url)
+            if result:
+                return result
+            logger.info("Google Lens لم يتعرف — أنتقل لـ OpenAI")
 
-    # ── Hugging Face BLIP (fallback مجاني — لا يحتاج مفتاح) ─────────────────
+        result = _call_openai_vision(image_bytes)
+        if result:
+            return result
+        logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+    else:
+        result = _call_openai_vision(image_bytes)
+        if result:
+            return result
+        logger.info("OpenAI vision لم يُنتج نتيجة — أنتقل للخطوة التالية")
+
+        if image_url and SERPAPI_KEY:
+            result = _google_lens(image_url)
+            if result:
+                return result
+            logger.info("Google Lens لم يتعرف — أنتقل لـ Gemini")
+
+        result = _call_gemini(image_bytes)
+        if result:
+            return result
+        logger.info("Gemini لم يُنتج نتيجة — أنتقل لـ HuggingFace")
+
+    # ── Hugging Face BLIP (fallback مجاني — غير موثوق على Railway) ───────────
     return _call_huggingface_vision(image_bytes)
 
 
