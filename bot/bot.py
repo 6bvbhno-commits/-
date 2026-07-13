@@ -842,10 +842,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=None,
             )
         else:
+            gemini_hint = ""
+            if GEMINI_API_KEY:
+                gemini_hint = f"\n\n🔧 Gemini: {test_gemini_connection()}"
             await _reply(
                 update,
                 "❌ ما قدرت أتعرف على المنتج.\n"
-                "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة.",
+                "تأكد من وضوح الصورة أو أرسل رابط المنتج مباشرة."
+                f"{gemini_hint}",
                 parse_mode=None,
             )
         return
