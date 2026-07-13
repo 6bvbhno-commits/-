@@ -50,7 +50,11 @@ AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "rashedalhano-21")
 # نطاق أمازون المستهدف (بدون www — مطلوب لصحة عنوان PAAPI)
 AMAZON_DOMAIN = os.getenv("AMAZON_DOMAIN", "amazon.sa")
 
-# مفاتيح الوصول لـ PA API v5 الرسمي — تُسحب تلقائياً من Replit Secrets
+# مفاتيح الوصول لـ PA API v5 الرسمي
+# LWA (Login with Amazon) — من ملف credentials CSV (Credential Id + Secret)
+AMAZON_LWA_CLIENT_ID = os.getenv("AMAZON_LWA_CLIENT_ID", "")
+AMAZON_LWA_CLIENT_SECRET = os.getenv("AMAZON_LWA_CLIENT_SECRET", "")
+# AWS SigV4 — احتياطي (Access Key + Secret Key القديمة)
 AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY")
 
