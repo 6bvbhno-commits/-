@@ -773,10 +773,10 @@ def _escape_md(text: str) -> str:
 import random as _random
 
 _SEARCH_TEASERS = [
-    "🔥 *لقيت لك أفضل عروض هذا المنتج — تفضّل!*",
-    "⚡ *عروض قوية بأسعار مغرية — لا تفوّتها!*",
-    "🎯 *قارنا الأسعار وجبت لك الأفضل على أمازون!*",
-    "🛍️ *خيارات ممتازة بانتظارك — اطلب الحين!*",
+    "🔥 لقيت لك أفضل عروض بأقل أسعار!",
+    "⚡ عروض قوية جاهزة — اختر اللي يناسبك!",
+    "🎯 قارنا الأسعار وجبت لك الأفضل!",
+    "🛍️ خيارات ممتازة بانتظارك!",
 ]
 
 _SEARCH_CTA = [
@@ -791,7 +791,6 @@ def format_search_results(product_name: str, offers: list[dict]) -> tuple[str, s
 
     يرجع (النص، رابط البحث، رابط صورة المنتج). رابط الصورة قد يكون فارغاً.
     """
-    safe_name = _escape_md(product_name)
     search_url = build_affiliate_search_link(product_name, AMAZON_DOMAIN)
 
     # صورة أول عرض يحتوي على رابط صورة صالح
@@ -803,9 +802,8 @@ def format_search_results(product_name: str, offers: list[dict]) -> tuple[str, s
             break
 
     teaser = (
-        f"🔍 *بحثت لك عن:* {safe_name}\n\n"
-        f"{_random.choice(_SEARCH_TEASERS)}\n\n"
-        f"{_random.choice(_SEARCH_CTA)}\n\n"
-        f"🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"
+        f"🔍 {product_name[:80]}\n\n"
+        f"{_random.choice(_SEARCH_TEASERS)}\n"
+        f"👇 اضغط الزر وشوف أقل الأسعار"
     )
     return teaser, search_url, image_url

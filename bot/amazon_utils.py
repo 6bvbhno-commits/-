@@ -1017,52 +1017,27 @@ def format_product_reply_plain(
     asin: str = "",
     version: str = "",
 ) -> str:
-    """رسالة نصية عادية — بدون Markdown لتجنب أخطاء تيليجرام."""
+    """رسالة قصيرة تحت صورة المنتج — بدون سعر ولا وصف طويل."""
+    _ = version
     if not offer:
-        return "❌ ما قدرت ألقى عروض متاحة لهذا المنتج."
+        return "❌ ما لقيت المنتج — جرّب رابط ثاني."
 
     title = (offer.get("title") or fallback_title or "").strip()
     if not title and asin:
         title = f"منتج {asin}"
+    if len(title) > 90:
+        title = title[:87] + "…"
 
-    lines = [f"🆔 البوت v{version or '?'}", "", f"📦 {title}", ""]
-
-    description = (offer.get("description") or "").strip()
-    if description:
-        lines.append(f"📝 {description[:400]}")
-        lines.append("")
-
+    cta_lines = [
+        "✨ لقيته لك بأقل سعر — اضغط «اشتري الآن» 👇",
+        "🏷️ أرخص عرض من الرابط — اضغط الزر تحت 👇",
+        "🔥 جاهز بأقل سعر — اضغط «اشتري الآن» وشوف التفاصيل 👇",
+    ]
+    cta = _random.choice(cta_lines)
     if offer.get("blocked"):
-        lines += [
-            "🔥 لقيت لك المنتج على أمازون السعودية!",
-            "",
-            "👇 اضغط زر «اشتري الآن» تحت وشوف السعر الحي",
-            "🔔 فعّل «نبّهني» لما يتوفر سعر وأرسلك إشعار فور الانخفاض",
-        ]
-    else:
-        lines.append(
-            (_random.choice(_OFFER_TEASERS_NAMED).format(name=title) if title else _random.choice(_OFFER_TEASERS))
-            .replace("*", "")
-        )
-        lines.append("")
-        price_txt = (offer.get("price") or "").strip()
-        if not price_txt and offer.get("price_val"):
-            price_txt = f"{offer['price_val']:.2f} SAR"
-        if price_txt:
-            lines.append(f"💰 السعر الآن: {price_txt}")
-        seller = (offer.get("seller_name") or "").strip()
-        if seller:
-            lines.append(f"🏪 البائع: {seller[:40]}")
-        if offer.get("is_prime"):
-            lines.append("🚀 Prime — توصيل سريع")
-        lines.append("")
-        lines.append(_random.choice(_OFFER_CTA).replace("*", ""))
-        if offer.get("price_val"):
-            lines.append("")
-            lines.append(_random.choice(_ALERT_HINTS).replace("*", ""))
+        cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇"
 
-    lines += ["", "🔒 شراء آمن من أمازون — رابط تسويق بالعمولة"]
-    return "\n".join(lines)
+    return f"📦 {title}\n\n{cta}\n🔔 تبي تنبيه؟ اضغط «نبّهني»"
 
 
 def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:

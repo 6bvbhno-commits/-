@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.7"
+BOT_VERSION = "2.8"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -301,24 +301,12 @@ async def _search_and_deliver_product(
     if image_url:
         photo_bytes = await loop.run_in_executor(None, download_image_bytes, image_url)
 
-    if photo_bytes:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                reply_to_message_id=reply_to,
-                photo=BytesIO(photo_bytes),
-                caption=f"📦 {product_query[:80]}",
-                parse_mode=None,
-            )
-        except TelegramError:
-            pass
-
-    header = f"🆔 البوت v{BOT_VERSION}\n\n"
-    await context.bot.send_message(
+    await _send_offer_card(
+        context,
         chat_id=chat_id,
-        reply_to_message_id=reply_to,
-        text=(header + message)[:_MAX_MSG],
-        parse_mode=None,
+        reply_to=reply_to,
+        photo_bytes=photo_bytes,
+        caption=message,
         reply_markup=kb,
     )
     _stat("requests_ok")
@@ -378,6 +366,42 @@ async def _reply(
 
 # حد أقصى لطول تسمية الصورة في تيليجرام
 _MAX_CAPTION = 1024
+
+
+async def _send_offer_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int,
+    photo_bytes: bytes | None,
+    caption: str,
+    reply_markup=None,
+) -> None:
+    """صورة + نص + أزرار في رسالة واحدة — أو نص فقط إن تعذّر تحميل الصورة."""
+    cap = caption[:_MAX_CAPTION]
+    if photo_bytes:
+        for attempt in range(2):
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to,
+                    photo=BytesIO(photo_bytes),
+                    caption=cap,
+                    parse_mode=None,
+                    reply_markup=reply_markup,
+                )
+                return
+            except TelegramError as e:
+                logger.warning("صورة المنتج فشلت: %s", e)
+                if attempt == 0:
+                    await asyncio.sleep(1)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        reply_to_message_id=reply_to,
+        text=cap[:_MAX_MSG],
+        parse_mode=None,
+        reply_markup=reply_markup,
+    )
 
 
 async def _reply_photo(
@@ -510,7 +534,7 @@ async def _send_product_offer(
         context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
     kb = InlineKeyboardMarkup([
         [buy_btn],
-        [InlineKeyboardButton("🔔 نبّهني عند نزول السعر", callback_data=cb_data)],
+        [InlineKeyboardButton("🔔 نبّهني", callback_data=cb_data)],
     ])
 
     message = format_product_reply_plain(
@@ -525,29 +549,12 @@ async def _send_product_offer(
         None, fetch_product_image_bytes, asin, domain, offer, source_url
     )
 
-    # 1) صورة في نفس المحادثة (بدون أزرار — تيليجرام أحياناً يحذفها مع الصورة)
-    if photo_bytes:
-        for attempt in range(2):
-            try:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    reply_to_message_id=reply_to,
-                    photo=BytesIO(photo_bytes),
-                    caption=f"📦 {(offer.get('title') or fallback_title or asin)[:80]}",
-                    parse_mode=None,
-                )
-                break
-            except TelegramError as e:
-                logger.warning("صورة المنتج فشلت: %s", e)
-                if attempt == 0:
-                    await asyncio.sleep(1)
-
-    # 2) دائماً: الوصف + السعر + زر اشتري + زر نبّهني
-    await context.bot.send_message(
+    await _send_offer_card(
+        context,
         chat_id=chat_id,
-        reply_to_message_id=reply_to,
-        text=message[:_MAX_MSG],
-        parse_mode=None,
+        reply_to=reply_to,
+        photo_bytes=photo_bytes,
+        caption=message,
         reply_markup=kb,
     )
     _stat("requests_ok")
