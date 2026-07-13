@@ -3,6 +3,7 @@
 #  Watchdog — مراقبة البوت كل ثانية وإعادة التشغيل الفوري
 # ══════════════════════════════════════════════════════════════
 cd "$(dirname "$0")"
+export BOT_VERSION="2.6"
 
 # ── منع التشغيل المزدوج: إذا لم نكن على Railway، لا تشغّل البوت ──
 if [ -z "$RAILWAY_ENVIRONMENT" ]; then
@@ -45,6 +46,7 @@ log() {
 }
 
 start_bot() {
+    echo "🆔 BOT_VERSION=${BOT_VERSION:-unknown}"
     python3 bot.py &
     BOT_PID=$!
     log "▶️  تشغيل البوت — PID=$BOT_PID (محاولة رقم $((RESTART_COUNT + 1)))"

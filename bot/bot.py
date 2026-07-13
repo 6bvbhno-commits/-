@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.5"
+BOT_VERSION = "2.6"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60

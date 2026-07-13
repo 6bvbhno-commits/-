@@ -1025,7 +1025,7 @@ def format_product_reply_plain(
     if not title and asin:
         title = f"منتج {asin}"
 
-    lines = [f"📦 {title}", ""]
+    lines = [f"🆔 البوت v{version or '?'}", "", f"📦 {title}", ""]
 
     description = (offer.get("description") or "").strip()
     if description:
@@ -1062,8 +1062,6 @@ def format_product_reply_plain(
             lines.append(_random.choice(_ALERT_HINTS).replace("*", ""))
 
     lines += ["", "🔒 شراء آمن من أمازون — رابط تسويق بالعمولة"]
-    if version:
-        lines.append(f"🆔 v{version}")
     return "\n".join(lines)
 
 
