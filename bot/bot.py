@@ -51,7 +51,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.9"
+BOT_VERSION = "3.0"
+
+# نص زر تنبيه السعر — واضح للمستخدم
+ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -459,16 +462,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_history[user_id].clear()   # بداية محادثة جديدة
 
         welcome_text = (
-            "👋 *أهلاً في بوت الأسعار — وفّر فلوسك على أمازون السعودية!*\n\n"
-            "🏷️ *وش يسوي البوت؟*\n"
-            "يجيب لك *أقل سعر* لأي منتج — مع صورة المنتج وتوصية شراء ذكية.\n\n"
+            "👋 *أهلاً في بوت الأسعار — وفّر فلوسك على أمازون!*\n\n"
             "📌 *كيف تستخدمه؟*\n"
-            "• 🔗 أرسل *رابط منتج* ← أرد عليك بصورة + سعر + زر شراء\n"
-            "• 💬 اكتب *اسم منتج* ← أبحث لك عن أفضل العروض\n\n"
-            "🔔 *ميزة نبّهني:*\n"
-            "بعد أي سعر، اضغط زر *🔔 نبّهني* — وأرسل لك إشعار *فوراً* لما ينزل السعر!\n"
-            "📋 تنبيهاتك النشطة: /myalerts\n\n"
-            "💡 _نصيحة: أرسل رابط المنتج مباشرة للحصول على أفضل نتيجة._\n\n"
+            "• 🔗 أرسل *رابط منتج* ← صورة + أقل سعر + زر شراء\n"
+            "• 💬 اكتب *اسم منتج* ← أبحث لك فوراً\n\n"
+            "🔔 *تنبيه انخفاض السعر:*\n"
+            f"اضغط زر *{ALERT_BTN_LABEL.replace('🔔 ', '')}* — وأرسلك إشعار أول ما ينزل السعر!\n"
+            "📋 تنبيهاتك: /myalerts\n\n"
             "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._\n\n"
             f"🆔 إصدار البوت: `{BOT_VERSION}`"
         )
@@ -483,15 +483,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         help_text = (
             "🆘 *المساعدة*\n\n"
-            "• 🔗 *رابط أمازون* ← صورة المنتج + أقل سعر + زر شراء مباشر\n"
-            "• 💬 *اسم منتج* ← أبحث لك عن أفضل العروض\n"
-            "• 🔔 *نبّهني* ← إشعار فوري عند نزول السعر (بعد أي نتيجة سعر)\n"
-            "• 💡 اسألني عن التسوق — أساعدك باختصار\n\n"
-            "📋 *الأوامر:*\n"
-            "/start — بداية جديدة\n"
-            "/myalerts — تنبيهاتك النشطة\n"
-            "/help — هذه الرسالة\n\n"
-            "⚠️ _الأسعار حية — تحقق من صفحة المنتج قبل الشراء._"
+            "• 🔗 *رابط أمازون* ← صورة + أقل سعر + زر شراء\n"
+            "• 💬 *اسم منتج* ← بحث فوري\n"
+            f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n\n"
+            "📋 *الأوامر:* /start · /myalerts · /version\n\n"
+            "⚠️ _تحقق من السعر على أمازون قبل الشراء._"
         )
         await _reply(update, help_text)
     except Exception as _e:
@@ -534,7 +530,7 @@ async def _send_product_offer(
         context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
     kb = InlineKeyboardMarkup([
         [buy_btn],
-        [InlineKeyboardButton("🔔 نبّهني", callback_data=cb_data)],
+        [InlineKeyboardButton(ALERT_BTN_LABEL, callback_data=cb_data)],
     ])
 
     message = format_product_reply_plain(
@@ -653,7 +649,7 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     if not query or not query.message:
         return
-    await query.answer()
+    await query.answer("جاري تفعيل التنبيه…", show_alert=False)
 
     data   = query.data or ""
     uid    = query.from_user.id if query.from_user else 0
@@ -713,14 +709,13 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
         if result in ("added", "updated"):
             verb = "تم تحديث" if result == "updated" else "تم تفعيل"
             if current_price <= 0:
-                price_line = "💰 راح أحدد السعر الحالي أول ما يتوفر وأنبّهك عند أي انخفاض"
+                price_line = "راح أحدد السعر الحالي أول ما يتوفر وأنبّهك عند أي انخفاض"
             else:
-                price_line = f"💰 وأنبّهك فوراً لما ينزل عن `{current_price:.2f} SAR`"
+                price_line = f"راح أنبّهك لما ينزل عن `{current_price:.2f} SAR`"
             await query.message.reply_text(
-                f"✅ *{verb} تنبيه السعر بنجاح!*\n\n"
-                f"📦 راح أراقب المنتج لك كل يوم\n"
-                f"{price_line}\n\n"
-                f"🛒 لما يجيك الإشعار — اضغط واشتري قبل ما يرتفع السعر!\n\n"
+                f"✅ *{verb} تنبيه انخفاض السعر!*\n\n"
+                f"📦 {product_name[:60] or req_asin}\n"
+                f"🔔 {price_line}\n\n"
                 f"📋 تنبيهاتك: /myalerts",
                 parse_mode="Markdown",
             )
@@ -822,7 +817,7 @@ async def myalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             update,
             "📭 ما عندك تنبيهات نشطة.\n\n"
             "🔗 أرسل رابط منتج أمازون\n"
-            "ثم اضغط زر *🔔 نبّهني* — وأرسل لك إشعار فور نزول السعر!",
+            "ثم اضغط زر *نبّهني عند انخفاض السعر* — وأرسل لك إشعار فور نزول السعر!",
         )
         return
 
@@ -842,13 +837,11 @@ async def _send_alert_notification(app, alert: dict, offer: dict, new_price: flo
     safe_name = raw_name.replace("*", "").replace("_", "").replace("`", "")
     link     = build_affiliate_link(alert["asin"], alert["domain"])
     caption = (
-        f"🔔 *انخفض السعر — فرصة شراء!*\n\n"
-        f"📦 {safe_name}\n\n"
-        f"💰 *السعر الجديد:* `{new_price:.2f} SAR`\n"
-        f"📉 كان: `{alert['last_known']:.2f} SAR`\n"
-        f"✅ وفّرت: `{saving:.2f} SAR` ({pct:.0f}%)\n\n"
-        f"⚡ *الحق عليه قبل ما يرتفع!*\n"
-        f"👇 اضغط *اشتري من أمازون* تحت"
+        f"🔔 *انخفض السعر!*\n\n"
+        f"📦 {safe_name}\n"
+        f"💰 `{new_price:.2f} SAR` (كان `{alert['last_known']:.2f}`)\n"
+        f"✅ وفّرت `{saving:.2f} SAR` ({pct:.0f}%)\n\n"
+        f"👇 اضغط «اشتري الآن» قبل ما يرتفع"
     )
     buy_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🛒 اشتري الآن ↗", url=link),
