@@ -1037,7 +1037,7 @@ def format_product_reply_plain(
     if offer.get("blocked"):
         cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇"
 
-    return f"📦 {title}\n\n{cta}\n🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»\n\nv{version or '?'}"
+    return f"📦 {title}\n\n{cta}\n🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
 
 
 def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:

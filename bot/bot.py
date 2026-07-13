@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.0"
+BOT_VERSION = "3.1"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -469,8 +469,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔔 *تنبيه انخفاض السعر:*\n"
             f"اضغط زر *{ALERT_BTN_LABEL.replace('🔔 ', '')}* — وأرسلك إشعار أول ما ينزل السعر!\n"
             "📋 تنبيهاتك: /myalerts\n\n"
-            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._\n\n"
-            f"🆔 إصدار البوت: `{BOT_VERSION}`"
+            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
         )
         if MOCK_MODE:
             welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
@@ -989,8 +988,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(
             update,
             f"👋 هلا!\n\n"
-            f"🆔 v{BOT_VERSION}\n"
-            "اكتب *اسم منتج* أو أرسل *رابط أمازون* — أجيبك بالصورة والسعر والأزرار فوراً.",
+            "اكتب *اسم منتج* أو أرسل *رابط أمازون* — أجيبك بالصورة والأزرار فوراً.",
         )
         return
 
