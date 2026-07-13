@@ -162,23 +162,56 @@ def _google_lens(image_url: str) -> str | None:
         return None
 
 
-def _call_gemini(image_bytes: bytes) -> str | None:
-    """
-    استدعاء متزامن لـ Gemini — محاولة واحدة فقط لكل موديل بدون انتظار طويل.
-    يستخدم semaphore لمنع الطلبات المتزامنة التي تسبب 429.
-    """
-    api_key = get_gemini_api_key()
-    if not api_key:
+def _gemini_models() -> list[str]:
+    return [
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+    ]
+
+
+def _call_gemini_sdk(image_bytes: bytes, api_key: str) -> str | None:
+    """Gemini عبر Interactions API (google-genai SDK) — الطريقة الجديدة."""
+    try:
+        from google import genai
+    except ImportError:
+        logger.warning("google-genai غير مثبت — أنتقل لـ REST")
         return None
 
-    import time
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = _image_mime_type(image_bytes)
+    client = genai.Client(api_key=api_key)
 
-    models = [
-        "gemini-2.0-flash",       # مستقر ومتاح — الأولوية
-        "gemini-2.0-flash-lite",  # أخف وأسرع
-        "gemini-1.5-flash",       # احتياط قديم لكن موثوق
-        "gemini-2.5-flash",       # قد يكون متاحاً في بعض المناطق
-    ]
+    for model in _gemini_models():
+        try:
+            interaction = client.interactions.create(
+                model=model,
+                input=[
+                    {"type": "text", "text": _VISION_PROMPT},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "data": image_b64,
+                        "resolution": "high",
+                    },
+                ],
+            )
+            text = (getattr(interaction, "output_text", None) or "").strip()
+            if text:
+                logger.info("Gemini SDK نجح: %s", model)
+                return text
+            logger.warning("Gemini SDK بنص فارغ (%s)", model)
+        except Exception as exc:
+            logger.warning("Gemini SDK (%s): %s", model, exc)
+
+    return None
+
+
+def _call_gemini_rest(image_bytes: bytes, api_key: str) -> str | None:
+    """Gemini عبر REST — احتياط إذا فشل SDK."""
+    import time
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime_type = _image_mime_type(image_bytes)
@@ -191,55 +224,69 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         }]
     }
 
-    # semaphore — timeout 40s منعاً للانتظار الأبدي
+    for model in _gemini_models():
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    logger.warning(
+                        "Gemini REST 200 بدون candidates (%s): %s",
+                        model, str(data)[:300],
+                    )
+                    continue
+                cand = candidates[0]
+                finish = cand.get("finishReason", "")
+                if finish and finish not in ("STOP", "MAX_TOKENS"):
+                    logger.warning("Gemini REST blocked (%s): finishReason=%s", model, finish)
+                    continue
+                text = (
+                    cand.get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    .strip()
+                )
+                if text:
+                    logger.info("Gemini REST نجح: %s", model)
+                    return text
+                logger.warning("Gemini REST 200 بنص فارغ (%s)", model)
+            elif response.status_code == 429:
+                logger.warning("Gemini REST 429 (%s)", model)
+                time.sleep(1)
+            else:
+                logger.warning(
+                    "Gemini REST %s (%s): %s",
+                    response.status_code, model, response.text[:300],
+                )
+        except Exception as e:
+            logger.error("خطأ في Gemini REST (%s): %s", model, e)
+
+    return None
+
+
+def _call_gemini(image_bytes: bytes) -> str | None:
+    """
+    التعرف على المنتج عبر Gemini.
+    الأولوية: Interactions API (SDK) ثم REST.
+    """
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return None
+
     if not _GEMINI_SEM.acquire(timeout=40):
         logger.warning("Gemini SEM timeout — تخطي التحليل")
         return None
     try:
-        for model in models:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
-            )
-            try:
-                response = requests.post(url, json=payload, timeout=20)
-                if response.status_code == 200:
-                    data = response.json()
-                    candidates = data.get("candidates") or []
-                    if not candidates:
-                        logger.warning(
-                            "Gemini 200 بدون candidates (%s): %s",
-                            model, str(data)[:300],
-                        )
-                        continue
-                    cand = candidates[0]
-                    finish = cand.get("finishReason", "")
-                    if finish and finish not in ("STOP", "MAX_TOKENS"):
-                        logger.warning("Gemini blocked (%s): finishReason=%s", model, finish)
-                        continue
-                    text = (
-                        cand.get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                        .strip()
-                    )
-                    if text:
-                        logger.info("Gemini نجح: %s", model)
-                        return text
-                    logger.warning("Gemini 200 بنص فارغ (%s)", model)
-                elif response.status_code == 429:
-                    logger.warning("Gemini 429 (%s) — تجربة الموديل التالي فوراً", model)
-                    time.sleep(1)   # ثانية واحدة فقط بين الموديلات
-                else:
-                    logger.warning(
-                        "Gemini %s للموديل %s: %s",
-                        response.status_code, model, response.text[:300],
-                    )
-            except Exception as e:
-                logger.error("خطأ في Gemini (%s): %s", model, e)
-
-        logger.error("Gemini: فشلت جميع الموديلات")
-        return None
+        result = _call_gemini_sdk(image_bytes, api_key)
+        if result:
+            return result
+        logger.info("Gemini SDK لم يُنتج نتيجة — أنتقل لـ REST")
+        return _call_gemini_rest(image_bytes, api_key)
     finally:
         _GEMINI_SEM.release()
 
@@ -249,6 +296,21 @@ def test_gemini_connection() -> str:
     api_key = get_gemini_api_key()
     if not api_key:
         return "❌ المفتاح غير موجود"
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        interaction = client.interactions.create(
+            model="gemini-3.5-flash",
+            input="قل: ok",
+        )
+        text = (getattr(interaction, "output_text", None) or "").strip()
+        if text:
+            return "✅ يعمل (Interactions API)"
+    except ImportError:
+        pass
+    except Exception as exc:
+        return f"❌ SDK: {exc}"
+
     try:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -260,7 +322,7 @@ def test_gemini_connection() -> str:
             timeout=15,
         )
         if resp.status_code == 200:
-            return "✅ يعمل"
+            return "✅ يعمل (REST)"
         body = resp.text[:180].replace("\n", " ")
         return f"❌ HTTP {resp.status_code}: {body}"
     except Exception as exc:
