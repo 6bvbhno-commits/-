@@ -147,9 +147,19 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         if best_text and currency not in best_text:
             best_text = f"{best_val:.2f} {currency}"
 
+        desc_parts: list[str] = []
+        for key in ("feature_bullets", "about_this_item", "description"):
+            val = product.get(key)
+            if isinstance(val, list):
+                desc_parts.extend(str(x) for x in val[:5])
+            elif isinstance(val, str) and val.strip():
+                desc_parts.append(val.strip())
+        description = " • ".join(desc_parts)[:500] if desc_parts else ""
+
         return {
             "asin":           asin,
             "title":          title,
+            "description":    description,
             "price":          best_text,
             "price_val":      best_val,
             "currency":       currency,

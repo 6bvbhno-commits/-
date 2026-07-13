@@ -237,6 +237,57 @@ def _extract_product_image(soup) -> str:
     return ""
 
 
+def _parse_product_details_html(html: str) -> dict:
+    """يستخرج العنوان والوصف والصورة من HTML صفحة أمازون."""
+    out: dict = {}
+    if not html:
+        return out
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        title_el = soup.find(id="productTitle")
+        if title_el:
+            out["title"] = title_el.get_text(strip=True)[:200]
+        if not out.get("title"):
+            og = soup.select_one('meta[property="og:title"]')
+            if og and og.get("content"):
+                out["title"] = og["content"].strip()[:200]
+
+        bullets: list[str] = []
+        for li in soup.select("#feature-bullets li, #poExpander li"):
+            t = li.get_text(" ", strip=True)
+            if t and len(t) > 4 and t not in bullets:
+                bullets.append(t)
+        if bullets:
+            out["description"] = " • ".join(bullets[:5])[:500]
+        else:
+            for sel in ("#productDescription p", "#aplus_feature_div p"):
+                el = soup.select_one(sel)
+                if el:
+                    txt = el.get_text(" ", strip=True)
+                    if txt and len(txt) > 15:
+                        out["description"] = txt[:500]
+                        break
+            if not out.get("description"):
+                meta = soup.select_one('meta[name="description"]')
+                if meta and meta.get("content"):
+                    out["description"] = meta["content"].strip()[:500]
+
+        img = _extract_product_image(soup)
+        if img:
+            out["image"] = img
+
+        price_val, price_text = _extract_price_desktop(soup)
+        if not price_val:
+            price_val, price_text = _extract_price_from_json(html)
+        if price_val:
+            out["price_val"] = price_val
+            out["price"] = price_text or f"{price_val:.2f} SAR"
+    except Exception as exc:
+        logger.info("_parse_product_details_html: %s", exc)
+    return out
+
+
 def _scrape_desktop(asin: str, domain: str) -> dict | None:
     """يجلب نسخة سطح المكتب ويستخرج البيانات."""
     url = f"https://www.{domain}/dp/{asin}"
@@ -267,14 +318,16 @@ def _scrape_desktop(asin: str, domain: str) -> dict | None:
         seller_el   = soup.select_one("#sellerProfileTriggerId") or soup.select_one("#merchant-info a")
         seller_name = seller_el.get_text(strip=True) if seller_el else "Amazon.sa"
         is_prime    = bool(soup.select_one(".a-icon-prime, [aria-label*='Prime']"))
+        details     = _parse_product_details_html(resp.text)
 
         return {
-            "title": title,
+            "title": title or details.get("title"),
             "price_val": price_val,
             "price_text": price_text,
             "seller_name": seller_name,
             "is_prime": is_prime,
-            "image": _extract_product_image(soup),
+            "image": _extract_product_image(soup) or details.get("image", ""),
+            "description": details.get("description", ""),
         }
     except Exception as e:
         logger.error("Desktop scrape خطأ للـ ASIN %s: %s", asin, e)
@@ -308,14 +361,16 @@ def _scrape_mobile(asin: str, domain: str) -> dict | None:
             price_val, price_text = _extract_price_from_json(resp.text)
 
         is_prime = bool(soup.select_one(".a-icon-prime, [aria-label*='Prime']"))
+        details  = _parse_product_details_html(resp.text)
 
         return {
-            "title": title,
+            "title": title or details.get("title"),
             "price_val": price_val,
             "price_text": price_text,
             "seller_name": "Amazon.sa",
             "is_prime": is_prime,
-            "image": _extract_product_image(soup),
+            "image": _extract_product_image(soup) or details.get("image", ""),
+            "description": details.get("description", ""),
         }
     except Exception as e:
         logger.error("Mobile scrape خطأ للـ ASIN %s: %s", asin, e)
@@ -565,9 +620,34 @@ def get_lowest_offer(
 
     affiliate_link = build_affiliate_link(asin, domain)
 
-    # ── على Railway: جلب صورة/عنوان ثم رابط الأفلييت ───────────────────────
+    # ── على Railway: كشط خفيف ثم preview ───────────────────────────────────
     if _ON_RAILWAY:
-        logger.info("Railway — preview للـ ASIN %s", asin)
+        logger.info("Railway — محاولة جلب بيانات ASIN %s", asin)
+        page_data = _scrape_mobile(asin, domain)
+        if page_data and not page_data.get("blocked"):
+            price_val = page_data.get("price_val")
+            affiliate_link = build_affiliate_link(asin, domain)
+            display_price = (page_data.get("price_text") or "").strip()
+            if price_val and display_price and "SAR" not in display_price:
+                display_price = f"{display_price} SAR"
+            result = {
+                "asin": asin,
+                "title": page_data.get("title"),
+                "description": page_data.get("description", ""),
+                "price": display_price or (f"{price_val:.2f} SAR" if price_val else ""),
+                "price_val": price_val,
+                "currency": "SAR",
+                "seller_name": page_data.get("seller_name", "Amazon.sa"),
+                "is_prime": page_data.get("is_prime", False),
+                "offer_count": 1,
+                "affiliate_link": affiliate_link,
+                "image": page_data.get("image", ""),
+            }
+            if price_val:
+                return _record_and_return(result)
+            if result.get("title") or result.get("description"):
+                result["blocked"] = True
+                return result
         return _railway_product_preview(asin, domain, source_url=source_url)
 
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
@@ -664,6 +744,7 @@ def get_lowest_offer(
             "offer_count": offer_count,
             "affiliate_link": affiliate_link,
             "image":       page_data.get("image", ""),
+            "description": page_data.get("description", ""),
         }
 
         return _record_and_return(result)
@@ -912,20 +993,17 @@ def _railway_product_preview(asin: str, domain: str = AMAZON_DOMAIN, source_url:
             },
         )
         if resp.status_code == 200 and "captcha" not in resp.text.lower()[:8000]:
-            if not result.get("title"):
-                og_title = re.search(
-                    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-                    resp.text,
-                )
-                if og_title:
-                    result["title"] = og_title.group(1).strip()[:120]
-            if not result.get("image"):
-                og_img = re.search(
-                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-                    resp.text,
-                )
-                if og_img and og_img.group(1).startswith("http"):
-                    result["image"] = og_img.group(1)
+            details = _parse_product_details_html(resp.text)
+            if not result.get("title") and details.get("title"):
+                result["title"] = details["title"]
+            if details.get("description"):
+                result["description"] = details["description"]
+            if not result.get("image") and details.get("image"):
+                result["image"] = details["image"]
+            if details.get("price_val"):
+                result["price_val"] = details["price_val"]
+                result["price"] = details.get("price") or f"{details['price_val']:.2f} SAR"
+                result["blocked"] = False
     except Exception as exc:
         logger.info("railway preview: %s", exc)
 
@@ -948,6 +1026,11 @@ def format_product_reply_plain(
         title = f"منتج {asin}"
 
     lines = [f"📦 {title}", ""]
+
+    description = (offer.get("description") or "").strip()
+    if description:
+        lines.append(f"📝 {description[:400]}")
+        lines.append("")
 
     if offer.get("blocked"):
         lines += [

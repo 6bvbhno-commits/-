@@ -35,7 +35,6 @@ from amazon_utils import (
     extract_domain,
     extract_product_title,
     fetch_product_image_bytes,
-    list_product_image_urls,
     resolve_short_link,
     get_lowest_offer,
     format_offer_message,
@@ -52,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.4"
+BOT_VERSION = "2.5"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -401,24 +400,22 @@ async def _send_product_offer(
         offer = dict(offer)
         offer["title"] = fallback_title
 
+    if context.user_data is None:
+        context.user_data = {}
+    context.user_data[f"pdomain_{asin}"] = domain
+
     affiliate_url = build_affiliate_link(asin, domain)
     buy_btn = InlineKeyboardButton("🛒 اشتري الآن ↗", url=affiliate_url)
 
     price_val = offer.get("price_val") if offer else None
     price_int = int(float(price_val) * 100) if price_val else 0
-    cb_data = f"al:{asin}:{domain}:{price_int}"
-    rows = [[buy_btn]]
-    if len(cb_data.encode()) <= 64:
-        if offer.get("title"):
-            if context.user_data is None:
-                context.user_data = {}
-            ptitle_keys = [k for k in context.user_data if k.startswith("ptitle_")]
-            if len(ptitle_keys) >= 10:
-                for old_k in ptitle_keys[:5]:
-                    context.user_data.pop(old_k, None)
-            context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
-        rows.append([InlineKeyboardButton("🔔 نبّهني عند نزول السعر", callback_data=cb_data)])
-    kb = InlineKeyboardMarkup(rows)
+    cb_data = f"al:{asin}:{price_int}"
+    if offer.get("title"):
+        context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
+    kb = InlineKeyboardMarkup([
+        [buy_btn],
+        [InlineKeyboardButton("🔔 نبّهني عند نزول السعر", callback_data=cb_data)],
+    ])
 
     message = format_product_reply_plain(
         offer,
@@ -426,77 +423,30 @@ async def _send_product_offer(
         asin=asin,
         version=BOT_VERSION,
     )
-    caption = message[:_MAX_CAPTION]
 
     loop = asyncio.get_running_loop()
     photo_bytes = await loop.run_in_executor(
         None, fetch_product_image_bytes, asin, domain, offer, source_url
     )
-    image_urls = await loop.run_in_executor(
-        None, list_product_image_urls, asin, domain, offer, source_url
-    )
 
-    send_kwargs = dict(
-        chat_id=chat_id,
-        reply_to_message_id=reply_to,
-        caption=caption,
-        parse_mode=None,
-        reply_markup=kb,
-    )
-
-    # 1) رفع بايتات الصورة — الأضمن في نفس المحادثة
+    # 1) صورة في نفس المحادثة (بدون أزرار — تيليجرام أحياناً يحذفها مع الصورة)
     if photo_bytes:
-        for attempt in range(3):
-            try:
-                await context.bot.send_photo(
-                    photo=BytesIO(photo_bytes),
-                    **send_kwargs,
-                )
-                _stat("requests_ok")
-                return
-            except RetryAfter as e:
-                await asyncio.sleep(min(int(e.retry_after) + 1, 30))
-            except (TimedOut, NetworkError):
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-            except TelegramError as e:
-                logger.warning("send_photo bytes فشل: %s", e)
-                break
-
-    # 2) تيليجرام يحمّل الرابط مباشرة — نفس المحادثة
-    for img_url in image_urls:
         for attempt in range(2):
             try:
-                await context.bot.send_photo(photo=img_url, **send_kwargs)
-                _stat("requests_ok")
-                return
-            except RetryAfter as e:
-                await asyncio.sleep(min(int(e.retry_after) + 1, 30))
-            except (TimedOut, NetworkError):
-                if attempt < 1:
-                    await asyncio.sleep(1)
-            except TelegramError as e:
-                logger.info("send_photo url فشل (%s): %s", img_url[:60], e)
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to,
+                    photo=BytesIO(photo_bytes),
+                    caption=f"📦 {(offer.get('title') or fallback_title or asin)[:80]}",
+                    parse_mode=None,
+                )
                 break
+            except TelegramError as e:
+                logger.warning("صورة المنتج فشلت: %s", e)
+                if attempt == 0:
+                    await asyncio.sleep(1)
 
-    # 3) آخر محاولة: صورة بدون تسمية طويلة
-    short_cap = caption[:400] if len(caption) > 400 else caption
-    if photo_bytes:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                reply_to_message_id=reply_to,
-                photo=BytesIO(photo_bytes),
-                caption=short_cap,
-                parse_mode=None,
-                reply_markup=kb,
-            )
-            _stat("requests_ok")
-            return
-        except TelegramError as e:
-            logger.warning("send_photo short caption فشل: %s", e)
-
-    # 4) بدون صورة — نص + أزرار في نفس المحادثة
+    # 2) دائماً: الوصف + السعر + زر اشتري + زر نبّهني
     await context.bot.send_message(
         chat_id=chat_id,
         reply_to_message_id=reply_to,
@@ -639,9 +589,10 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
     # ── إضافة تنبيه ──────────────────────────────────────────────────────────
     if data.startswith("al:"):
         parts = data.split(":")
-        if len(parts) < 4:
+        if len(parts) < 3:
             return
-        _, req_asin, req_domain, price_str = parts[0], parts[1], parts[2], parts[3]
+        _, req_asin, price_str = parts[0], parts[1], parts[2]
+        req_domain = (context.user_data or {}).get(f"pdomain_{req_asin}", AMAZON_DOMAIN)
         try:
             current_price = int(price_str) / 100
         except ValueError:
