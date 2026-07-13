@@ -624,8 +624,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """يعرض حالة مفاتيح API المتاحة — للتشخيص فقط (لا يكشف القيم)."""
     import os
     from config import (
+        get_gemini_api_key,
         OPENAI_BASE_URL, OPENAI_API_KEY,
-        GEMINI_API_KEY, SERPAPI_KEY,
+        SERPAPI_KEY,
         DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
     )
@@ -633,19 +634,28 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     def _status(val: str) -> str:
         return "✅ متوفر" if val else "❌ غير موجود"
 
-    gemini_test = test_gemini_connection() if GEMINI_API_KEY else "❌ المفتاح غير موجود"
+    gemini_key = get_gemini_api_key()
+    gemini_test = test_gemini_connection() if gemini_key else "❌ المفتاح غير موجود"
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+    vision_env = [
+        n for n in (
+            "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GEMINI_KEY", "SERPAPI_KEY", "AI_INTEGRATIONS_OPENAI_API_KEY",
+        )
+        if (os.getenv(n) or "").strip()
+    ]
 
     msg = (
         "🔧 *حالة مفاتيح API:*\n\n"
         f"• OpenAI Vision (Replit): {_status(OPENAI_BASE_URL and OPENAI_API_KEY)}\n"
-        f"• Gemini API: {_status(GEMINI_API_KEY)}\n"
+        f"• Gemini API: {_status(gemini_key)}\n"
         f"• Gemini اختبار: {gemini_test}\n"
         f"• SerpAPI (Lens): {_status(SERPAPI_KEY)}\n"
         f"• DeepSeek: {_status(DEEPSEEK_API_KEY)}\n"
         f"• Anthropic Claude: {_status(ANTHROPIC_API_KEY)}\n"
         f"• Telegram Token: {_status(TELEGRAM_BOT_TOKEN)}\n"
-        f"• خدمة Railway: `{railway_svc}`\n\n"
+        f"• خدمة Railway: `{railway_svc}`\n"
+        f"• متغيرات الصور: `{', '.join(vision_env) or 'لا شيء'}`\n\n"
         "⚠️ _DeepSeek للنص فقط — للصور: Gemini أو SerpAPI_"
     )
     await _reply(update, msg)
@@ -829,21 +839,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not product_name:
-        from config import GEMINI_API_KEY, OPENAI_API_KEY, SERPAPI_KEY
-        if not GEMINI_API_KEY and not OPENAI_API_KEY and not SERPAPI_KEY:
+        import os
+        from config import get_gemini_api_key, OPENAI_API_KEY, SERPAPI_KEY
+        gemini_key = get_gemini_api_key()
+        railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+        if not gemini_key and not OPENAI_API_KEY and not SERPAPI_KEY:
             await _reply(
                 update,
                 "❌ التعرف على الصور غير مفعّل على السيرفر.\n\n"
-                "🔧 DeepSeek يدعم النص فقط — للصور أضف في Railway:\n"
-                "• `GEMINI_API_KEY` (مجاني من Google AI Studio)\n"
-                "• أو `SERPAPI_KEY` (Google Lens)\n\n"
-                "ثم اربط المتغير بخدمة البوت واضغط Deploy.\n"
-                "أو أرسل اسم المنتج/رابط أمازون نصياً.",
+                f"🔧 الخدمة الحالية: `{railway_svc}`\n"
+                "أضف في Railway على خدمة *charming-strength*:\n"
+                "• `GEMINI_API_KEY` (من Google AI Studio)\n"
+                "• أو `SERPAPI_KEY`\n\n"
+                "ثم اربط المتغير واضغط **Deploy**.\n"
+                "أرسل `/debug` للتأكد.",
                 parse_mode=None,
             )
         else:
             gemini_hint = ""
-            if GEMINI_API_KEY:
+            if gemini_key:
                 gemini_hint = f"\n\n🔧 Gemini: {test_gemini_connection()}"
             await _reply(
                 update,
@@ -1051,6 +1065,14 @@ def main():
     print("=" * 50)
 
     import os as _os
+    from config import get_gemini_api_key
+
+    _svc = _os.getenv("RAILWAY_SERVICE_NAME", "local")
+    _gemini = get_gemini_api_key()
+    print(f"🤖 Railway service: {_svc}")
+    print(f"🔑 GEMINI_API_KEY: {'✅ موجود (' + str(len(_gemini)) + ' حرف)' if _gemini else '❌ غير موجود'}")
+    print(f"🔑 DEEPSEEK_API_KEY: {'✅' if _os.getenv('DEEPSEEK_API_KEY') else '❌'}")
+    print(f"🔑 TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
 
     _DEV_DOMAIN  = _os.getenv("REPLIT_DEV_DOMAIN", "")
     _WEBHOOK_URL = f"https://{_DEV_DOMAIN}/api/tgwh" if _DEV_DOMAIN else ""

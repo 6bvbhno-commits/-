@@ -3,6 +3,25 @@
 """
 import os
 
+
+def _first_env(*names: str) -> str:
+    """يرجع أول متغير بيئة موجود وغير فارغ."""
+    for name in names:
+        val = (os.getenv(name) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def get_gemini_api_key() -> str:
+    """مفتاح Gemini — يُقرأ وقت التشغيل ليدعم تحديث Railway بدون إعادة import."""
+    return _first_env(
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GEMINI_KEY",
+    )
+
 # توكن البوت — تحصل عليه من @BotFather في تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -17,7 +36,7 @@ AMAZON_ACCESS_KEY = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY = os.getenv("AMAZON_SECRET_KEY")
 
 # مفتاح Gemini API (مجاني من Google AI Studio) — للتعرف على المنتجات في الصور
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_API_KEY = get_gemini_api_key()
 
 # مفتاح Google Cloud Vision API (قديم — استُبدل بـ Gemini)
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")

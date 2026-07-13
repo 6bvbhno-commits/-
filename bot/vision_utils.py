@@ -14,7 +14,7 @@ import requests
 from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
 import os
 
-from config import GEMINI_API_KEY, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
+from config import get_gemini_api_key, SERPAPI_KEY, OPENAI_BASE_URL, OPENAI_API_KEY, AFFILIATE_TAG, AMAZON_DOMAIN
 
 # على Railway لا يوجد Replit OpenAI — Gemini/SerpAPI أولوية للصور
 _ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
@@ -167,7 +167,8 @@ def _call_gemini(image_bytes: bytes) -> str | None:
     استدعاء متزامن لـ Gemini — محاولة واحدة فقط لكل موديل بدون انتظار طويل.
     يستخدم semaphore لمنع الطلبات المتزامنة التي تسبب 429.
     """
-    if not GEMINI_API_KEY:
+    api_key = get_gemini_api_key()
+    if not api_key:
         return None
 
     import time
@@ -198,7 +199,7 @@ def _call_gemini(image_bytes: bytes) -> str | None:
         for model in models:
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={GEMINI_API_KEY}"
+                f"{model}:generateContent?key={api_key}"
             )
             try:
                 response = requests.post(url, json=payload, timeout=20)
@@ -245,12 +246,13 @@ def _call_gemini(image_bytes: bytes) -> str | None:
 
 def test_gemini_connection() -> str:
     """اختبار سريع لصلاحية GEMINI_API_KEY — يُستخدم في /debug."""
-    if not GEMINI_API_KEY:
+    api_key = get_gemini_api_key()
+    if not api_key:
         return "❌ المفتاح غير موجود"
     try:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+            f"gemini-2.0-flash:generateContent?key={api_key}"
         )
         resp = requests.post(
             url,
