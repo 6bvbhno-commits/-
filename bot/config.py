@@ -14,13 +14,18 @@ def _first_env(*names: str) -> str:
 
 
 def get_gemini_api_key() -> str:
-    """مفتاح Gemini — يُقرأ وقت التشغيل ليدعم تحديث Railway بدون إعادة import."""
+    """مفتاح Gemini — يُقرأ وقت التشغيل."""
     return _first_env(
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
         "GOOGLE_GENERATIVE_AI_API_KEY",
         "GEMINI_KEY",
     )
+
+
+def get_deepseek_api_key() -> str:
+    """مفتاح DeepSeek — يُقرأ وقت التشغيل."""
+    return _first_env("DEEPSEEK_API_KEY")
 
 # توكن البوت — تحصل عليه من @BotFather في تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -52,8 +57,8 @@ OPENAI_API_KEY  = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
 ANTHROPIC_BASE_URL = os.getenv("AI_INTEGRATIONS_ANTHROPIC_BASE_URL", "")
 ANTHROPIC_API_KEY  = os.getenv("AI_INTEGRATIONS_ANTHROPIC_API_KEY", "")
 
-# DeepSeek API — الطبقة الأولى للذكاء الاصطناعي (V3 للمحادثة، R1 لتحليل الأسعار)
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+# DeepSeek API — الطبقة الأولى للذكاء الاصطناعي
+DEEPSEEK_API_KEY = get_deepseek_api_key()
 
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False

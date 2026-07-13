@@ -11,9 +11,10 @@ if [ -z "$RAILWAY_ENVIRONMENT" ]; then
     exit 0
 fi
 
-# ── خدمة واحدة فقط: monorepo ينشر عدة خدمات بنفس Dockerfile ──
-if [ -n "$RAILWAY_SERVICE_NAME" ] && [[ "$RAILWAY_SERVICE_NAME" == @workspace/* ]]; then
-    echo "⛔ خدمة $RAILWAY_SERVICE_NAME — البوت يعمل على charming-strength فقط."
+# ── خدمة واحدة فقط على Railway ──
+BOT_SERVICE="${BOT_SERVICE_NAME:-charming-strength}"
+if [ -n "$RAILWAY_SERVICE_NAME" ] && [ "$RAILWAY_SERVICE_NAME" != "$BOT_SERVICE" ]; then
+    echo "⛔ خدمة $RAILWAY_SERVICE_NAME — البوت يعمل على $BOT_SERVICE فقط."
     exit 0
 fi
 

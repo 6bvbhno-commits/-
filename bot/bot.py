@@ -626,9 +626,11 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     import os
     from config import (
         get_gemini_api_key,
-        OPENAI_BASE_URL, OPENAI_API_KEY,
+        get_deepseek_api_key,
+        OPENAI_BASE_URL,
+        OPENAI_API_KEY,
         SERPAPI_KEY,
-        DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
+        ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
     )
 
@@ -636,8 +638,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return "✅ متوفر" if val else "❌ غير موجود"
 
     gemini_key = get_gemini_api_key()
+    deepseek_key = get_deepseek_api_key()
     gemini_test = test_gemini_connection() if gemini_key else "❌ المفتاح غير موجود"
-    deepseek_test = test_deepseek_vision() if DEEPSEEK_API_KEY else "❌ المفتاح غير موجود"
+    deepseek_test = test_deepseek_vision() if deepseek_key else "❌ المفتاح غير موجود"
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
     vision_env = [
         n for n in (
@@ -650,7 +653,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = (
         "🔧 *حالة مفاتيح API:*\n\n"
-        f"• DeepSeek (نص): {_status(DEEPSEEK_API_KEY)}\n"
+        f"• DeepSeek (نص): {_status(deepseek_key)}\n"
         f"• DeepSeek (صور): {deepseek_test}\n"
         f"• OpenAI Vision (Replit): {_status(OPENAI_BASE_URL and OPENAI_API_KEY)}\n"
         f"• Gemini API: {_status(gemini_key)}\n"
@@ -844,10 +847,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not product_name:
         import os
-        from config import get_gemini_api_key, OPENAI_API_KEY, SERPAPI_KEY, DEEPSEEK_API_KEY
+        from config import get_gemini_api_key, get_deepseek_api_key, OPENAI_API_KEY, SERPAPI_KEY
         gemini_key = get_gemini_api_key()
-        deepseek_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
+        deepseek_key = get_deepseek_api_key()
         railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+        logger.info(
+            "vision_fail service=%s deepseek=%s gemini=%s",
+            railway_svc, bool(deepseek_key), bool(gemini_key),
+        )
         if not deepseek_key and not gemini_key and not OPENAI_API_KEY and not SERPAPI_KEY:
             await _reply(
                 update,
@@ -1059,6 +1066,15 @@ async def _post_init(application) -> None:
 
 
 def main():
+    import os as _os
+    from config import get_deepseek_api_key, get_gemini_api_key
+
+    _svc = _os.getenv("RAILWAY_SERVICE_NAME", "")
+    _bot_svc = _os.getenv("BOT_SERVICE_NAME", "charming-strength")
+    if _svc and _svc != _bot_svc:
+        print(f"⛔ خدمة {_svc} — البوت يعمل على {_bot_svc} فقط.")
+        return
+
     if not TELEGRAM_BOT_TOKEN:
         print("⚠️  حط توكن البوت في Replit Secrets تحت اسم TELEGRAM_BOT_TOKEN")
         return
@@ -1071,13 +1087,14 @@ def main():
     print("=" * 50)
 
     import os as _os
-    from config import get_gemini_api_key
+    from config import get_deepseek_api_key, get_gemini_api_key
 
     _svc = _os.getenv("RAILWAY_SERVICE_NAME", "local")
     _gemini = get_gemini_api_key()
+    _deepseek = get_deepseek_api_key()
     print(f"🤖 Railway service: {_svc}")
-    print(f"🔑 GEMINI_API_KEY: {'✅ موجود (' + str(len(_gemini)) + ' حرف)' if _gemini else '❌ غير موجود'}")
-    print(f"🔑 DEEPSEEK_API_KEY: {'✅' if _os.getenv('DEEPSEEK_API_KEY') else '❌'}")
+    print(f"🔑 DEEPSEEK_API_KEY: {'✅ (' + str(len(_deepseek)) + ' حرف)' if _deepseek else '❌ غير موجود'}")
+    print(f"🔑 GEMINI_API_KEY: {'✅ (' + str(len(_gemini)) + ' حرف)' if _gemini else '❌ غير موجود'}")
     print(f"🔑 TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
 
     _DEV_DOMAIN  = _os.getenv("REPLIT_DEV_DOMAIN", "")

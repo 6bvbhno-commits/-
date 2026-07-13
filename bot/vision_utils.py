@@ -17,7 +17,7 @@ import os
 
 from config import (
     get_gemini_api_key,
-    DEEPSEEK_API_KEY,
+    get_deepseek_api_key,
     SERPAPI_KEY,
     OPENAI_BASE_URL,
     OPENAI_API_KEY,
@@ -33,6 +33,32 @@ _GEMINI_SEM = threading.Semaphore(2)
 
 # حد DeepSeek Vision: طلبان متزامنان
 _DEEPSEEK_SEM = threading.Semaphore(2)
+_DEEPSEEK_URLS = (
+    "https://api.deepseek.com/chat/completions",
+    "https://api.deepseek.com/v1/chat/completions",
+)
+
+# صورة PNG صغيرة لاختبار vision في /debug
+_TINY_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf"
+    b"\xc0\x00\x00\x03\x01\x01\x00\xc4\xfe\xc6\xdb\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _deepseek_post(api_key: str, payload: dict) -> requests.Response | None:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for url in _DEEPSEEK_URLS:
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=25)
+            if resp.status_code != 404:
+                return resp
+        except Exception as exc:
+            logger.warning("DeepSeek POST %s: %s", url, exc)
+    return None
 
 # حد OpenAI Vision: أقصى 5 طلبات متزامنة (رُفع من 3 لاستيعاب الضغط العالي)
 _OPENAI_SEM = threading.Semaphore(5)
@@ -184,7 +210,7 @@ def _deepseek_vision_models() -> list[str]:
 
 def _call_deepseek_vision(image_bytes: bytes) -> str | None:
     """التعرف على المنتج عبر DeepSeek V4 Vision (OpenAI-compatible)."""
-    api_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
+    api_key = get_deepseek_api_key()
     if not api_key:
         return None
 
@@ -203,6 +229,7 @@ def _call_deepseek_vision(image_bytes: bytes) -> str | None:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:{mime_type};base64,{image_b64}",
+                            "detail": "high",
                         },
                     },
                 ],
@@ -210,19 +237,12 @@ def _call_deepseek_vision(image_bytes: bytes) -> str | None:
             "max_tokens": 120,
             "stream": False,
         }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
 
         for model in _deepseek_vision_models():
+            resp = _deepseek_post(api_key, {**payload_base, "model": model})
+            if resp is None:
+                continue
             try:
-                resp = requests.post(
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers=headers,
-                    json={**payload_base, "model": model},
-                    timeout=25,
-                )
                 if resp.status_code == 200:
                     text = (
                         resp.json()
@@ -243,7 +263,7 @@ def _call_deepseek_vision(image_bytes: bytes) -> str | None:
                         resp.status_code, model, resp.text[:200],
                     )
             except Exception as exc:
-                logger.error("DeepSeek vision exception (%s): %s", model, exc)
+                logger.error("DeepSeek vision parse (%s): %s", model, exc)
 
         return None
     finally:
@@ -251,30 +271,45 @@ def _call_deepseek_vision(image_bytes: bytes) -> str | None:
 
 
 def test_deepseek_vision() -> str:
-    """اختبار DeepSeek vision — يُستخدم في /debug."""
-    api_key = (DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")).strip()
+    """اختبار DeepSeek vision — نص + صورة صغيرة."""
+    api_key = get_deepseek_api_key()
     if not api_key:
         return "❌ المفتاح غير موجود"
-    try:
-        resp = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "deepseek-v4-flash",
-                "messages": [{"role": "user", "content": "قل: ok"}],
-                "max_tokens": 10,
-                "stream": False,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return "✅ يعمل (deepseek-v4-flash)"
-        return f"❌ HTTP {resp.status_code}: {resp.text[:120]}"
-    except Exception as exc:
-        return f"❌ خطأ: {exc}"
+
+    # 1) اختبار نص
+    resp = _deepseek_post(api_key, {
+        "model": "deepseek-v4-flash",
+        "messages": [{"role": "user", "content": "قل: ok"}],
+        "max_tokens": 10,
+        "stream": False,
+    })
+    if resp is None:
+        return "❌ لا اتصال بـ DeepSeek"
+    if resp.status_code != 200:
+        return f"❌ نص HTTP {resp.status_code}: {resp.text[:100]}"
+
+    # 2) اختبار صورة
+    img_b64 = base64.b64encode(_TINY_PNG).decode("utf-8")
+    resp2 = _deepseek_post(api_key, {
+        "model": "deepseek-v4-flash",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ما لون الصورة؟ جاوب كلمة واحدة"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                },
+            ],
+        }],
+        "max_tokens": 20,
+        "stream": False,
+    })
+    if resp2 is None:
+        return "✅ نص يعمل | ❌ صورة: لا اتصال"
+    if resp2.status_code == 200:
+        return "✅ يعمل (نص + صور)"
+    return f"✅ نص يعمل | ❌ صور HTTP {resp2.status_code}: {resp2.text[:80]}"
 
 
 def _gemini_models() -> list[str]:
