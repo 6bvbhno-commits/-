@@ -506,7 +506,11 @@ def _cache_set(key: str, value: dict) -> None:
         _CACHE[key] = (time.time(), value)
 
 
-def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
+def get_lowest_offer(
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    source_url: str = "",
+) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
     الأولوية:
@@ -564,7 +568,7 @@ def get_lowest_offer(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     # ── على Railway: جلب صورة/عنوان ثم رابط الأفلييت ───────────────────────
     if _ON_RAILWAY:
         logger.info("Railway — preview للـ ASIN %s", asin)
-        return _railway_product_preview(asin, domain)
+        return _railway_product_preview(asin, domain, source_url=source_url)
 
     # ── كشط مباشر (fallback) — semaphore يحد الطلبات المتزامنة ──────────────
     if not _SCRAPE_SEMAPHORE.acquire(timeout=45):
@@ -726,8 +730,117 @@ def build_product_image_url(asin: str, domain: str = AMAZON_DOMAIN, offer: dict 
     )
 
 
+def extract_product_title(url: str, asin: str = "") -> str:
+    """يستخرج اسم المنتج من slug الرابط — مثل /اسم-المنتج/dp/ASIN."""
+    if not url:
+        return ""
+    asin = (asin or extract_asin(url) or "").upper()
+    patterns = [
+        rf"/([^/?#]+)/dp/{re.escape(asin)}" if asin else r"/([^/?#]+)/dp/[A-Z0-9]{10}",
+        rf"/([^/?#]+)/gp/product/{re.escape(asin)}" if asin else r"/([^/?#]+)/gp/product/[A-Z0-9]{10}",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url, re.IGNORECASE)
+        if not m:
+            continue
+        slug = m.group(1).strip()
+        if slug.lower() in ("dp", "gp", "product", "www.amazon.sa"):
+            continue
+        if re.fullmatch(r"[A-Z0-9]{10}", slug.upper()):
+            continue
+        title = slug.replace("-", " ").replace("_", " ").strip()
+        if len(title) >= 3:
+            return title[:120]
+    return ""
+
+
+def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url: str = "") -> list[str]:
+    """قائمة روابط صور نجرّبها بالترتيب."""
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(u: str) -> None:
+        u = (u or "").strip()
+        if u.startswith("http") and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    if offer:
+        _add(offer.get("image") or "")
+
+    mp = _normalize_domain(domain)
+    for host in ("ws-eu", "ws-na"):
+        _add(
+            f"https://{host}.amazon-adsystem.com/widgets/q?"
+            f"ServiceVersion=20070822&MarketPlace=www.{mp}&ASIN={asin}"
+            f"&Format=_SL500_&ID=AsinImage&tag={AFFILIATE_TAG}"
+        )
+
+    page_urls = []
+    if source_url and "amazon." in source_url:
+        page_urls.append(source_url.split("?")[0])
+    page_urls.append(f"https://www.{mp}/dp/{asin}")
+
+    for page_url in page_urls:
+        try:
+            resp = requests.get(
+                page_url,
+                timeout=12,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                        "Mobile/15E148 Safari/604.1"
+                    ),
+                    "Accept-Language": "ar,en;q=0.9",
+                },
+            )
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            for pat in (
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+                r'"hiRes"\s*:\s*"([^"]+)"',
+                r'"large"\s*:\s*"([^"]+)"',
+                r'data-old-hires=["\']([^"\']+)',
+            ):
+                for m in re.finditer(pat, html, re.IGNORECASE):
+                    _add(m.group(1).replace("\\u0026", "&"))
+        except Exception as exc:
+            logger.info("image scrape %s: %s", page_url, exc)
+
+    return urls
+
+
+def list_product_image_urls(
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    offer: dict | None = None,
+    source_url: str = "",
+) -> list[str]:
+    """روابط صور المنتج بالترتيب — للإرسال المباشر في تيليجرام."""
+    return _image_candidate_urls(asin, domain, offer, source_url)
+
+
+def fetch_product_image_bytes(
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    offer: dict | None = None,
+    source_url: str = "",
+) -> bytes | None:
+    """يجرب عدة مصادر ويرجع بايتات الصورة."""
+    for url in _image_candidate_urls(asin, domain, offer, source_url):
+        data = download_image_bytes(url, timeout=12)
+        if data:
+            logger.info("صورة المنتج OK من: %s", url[:90])
+            return data
+    return None
+
+
 def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
-    """يحمّل بايتات الصورة — تيليجرام يرفض بعض روابط أمازون المباشرة."""
+    """يحمّل بايتات الصورة — متساهل مع content-type."""
     if not url or not url.startswith("http"):
         return None
     try:
@@ -741,37 +854,53 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                "Accept": "image/*,*/*",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             },
         )
-        if resp.status_code != 200 or not resp.content or len(resp.content) < 500:
+        if resp.status_code != 200 or not resp.content or len(resp.content) < 300:
             return None
         ctype = (resp.headers.get("content-type") or "").lower()
-        if ctype and "image" not in ctype and "octet-stream" not in ctype:
+        if ctype.startswith("text/") or "html" in ctype:
             return None
+        # PNG/JPEG/GIF/WEBP — أو أي بايتات كافية بدون HTML
+        if ctype and "image" not in ctype and "octet-stream" not in ctype:
+            head = resp.content[:16]
+            if not (
+                head[:3] == b"GIF"
+                or head[:8] == b"\x89PNG\r\n\x1a\n"
+                or head[:2] == b"\xff\xd8"
+                or (head[:4] == b"RIFF" and b"WEBP" in resp.content[:16])
+            ):
+                return None
         return resp.content
     except Exception as exc:
         logger.warning("download_image_bytes فشل: %s", exc)
         return None
 
 
-def _railway_product_preview(asin: str, domain: str = AMAZON_DOMAIN) -> dict:
+def _railway_product_preview(asin: str, domain: str = AMAZON_DOMAIN, source_url: str = "") -> dict:
     """على Railway: جلب صورة/عنوان خفيف قبل إرجاع رابط الأفلييت فقط."""
     affiliate_link = build_affiliate_link(asin, domain)
+    title = extract_product_title(source_url, asin)
     result: dict = {
         "blocked": True,
         "affiliate_link": affiliate_link,
         "asin": asin,
     }
-    widget_url = build_product_image_url(asin, domain)
-    if download_image_bytes(widget_url, timeout=10):
-        result["image"] = widget_url
+    if title:
+        result["title"] = title
 
+    img_bytes = fetch_product_image_bytes(asin, domain, None, source_url)
+    candidates = _image_candidate_urls(asin, domain, None, source_url)
+    if img_bytes and candidates:
+        result["image"] = candidates[0]
+
+    mp = _normalize_domain(domain)
     try:
-        page_url = f"https://www.{domain}/dp/{asin}"
+        page_url = source_url if source_url and "amazon." in source_url else f"https://www.{mp}/dp/{asin}"
         resp = requests.get(
             page_url,
-            timeout=10,
+            timeout=12,
             allow_redirects=True,
             headers={
                 "User-Agent": (
@@ -783,91 +912,79 @@ def _railway_product_preview(asin: str, domain: str = AMAZON_DOMAIN) -> dict:
             },
         )
         if resp.status_code == 200 and "captcha" not in resp.text.lower()[:8000]:
-            og_img = re.search(
-                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-                resp.text,
-            )
-            if og_img and og_img.group(1).startswith("http"):
-                result["image"] = og_img.group(1)
-            og_title = re.search(
-                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-                resp.text,
-            )
-            if og_title:
-                result["title"] = og_title.group(1).strip()[:120]
+            if not result.get("title"):
+                og_title = re.search(
+                    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                    resp.text,
+                )
+                if og_title:
+                    result["title"] = og_title.group(1).strip()[:120]
+            if not result.get("image"):
+                og_img = re.search(
+                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                    resp.text,
+                )
+                if og_img and og_img.group(1).startswith("http"):
+                    result["image"] = og_img.group(1)
     except Exception as exc:
         logger.info("railway preview: %s", exc)
 
     return result
 
 
-def format_offer_message(offer: dict, *, include_alert_hint: bool = True) -> str:
-    """يبني رسالة تيليجرام تحفيزية مع السعر ودعوة للشراء والتنبيه."""
+def format_product_reply_plain(
+    offer: dict | None,
+    *,
+    fallback_title: str = "",
+    asin: str = "",
+    version: str = "",
+) -> str:
+    """رسالة نصية عادية — بدون Markdown لتجنب أخطاء تيليجرام."""
     if not offer:
-        return (
-            "❌ ما قدرت ألقى عروض متاحة لهذا المنتج.\n"
-            "تأكد من توفر المنتج في المتجر أو جرّب لاحقًا."
-        )
+        return "❌ ما قدرت ألقى عروض متاحة لهذا المنتج."
 
-    raw_title = (offer.get("title") or "")[:70]
-    if not raw_title and offer.get("blocked"):
-        raw_link = offer.get("affiliate_link", "")
-        slug_m = re.search(r"/([A-Za-z0-9][^/]{5,80})/dp/", raw_link)
-        if slug_m:
-            slug = slug_m.group(1).replace("-", " ").title()
-            if "." not in slug and not re.fullmatch(r"[A-Z0-9]{10}", slug.replace(" ", "")):
-                raw_title = slug[:70]
+    title = (offer.get("title") or fallback_title or "").strip()
+    if not title and asin:
+        title = f"منتج {asin}"
 
-    if raw_title:
-        disp_name = raw_title.strip()
-        if len(disp_name) > 55:
-            disp_name = disp_name[:55].rsplit(" ", 1)[0].strip(" -–—") + "…"
-        headline = _random.choice(_OFFER_TEASERS_NAMED).format(name=_esc(disp_name))
-    else:
-        headline = _random.choice(_OFFER_TEASERS)
-
-    lines = [headline, ""]
+    lines = [f"📦 {title}", ""]
 
     if offer.get("blocked"):
         lines += [
-            "🔗 *المنتج جاهز على أمازون*",
+            "🔥 لقيت لك المنتج على أمازون السعودية!",
             "",
-            "👇 اضغط *اشتري الآن* تحت وشوف السعر الحي مباشرة",
-            "",
-            "🔔 فعّل *نبّهني* لما يتوفر سعر — وأرسل لك إشعار فور الانخفاض",
-            "",
-            "🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_",
+            "👇 اضغط زر «اشتري الآن» تحت وشوف السعر الحي",
+            "🔔 فعّل «نبّهني» لما يتوفر سعر وأرسلك إشعار فور الانخفاض",
         ]
-        return "\n".join(lines)
-
-    price_val = offer.get("price_val")
-    price_txt = (offer.get("price") or "").strip()
-    if price_val and not price_txt:
-        price_txt = f"{price_val:.2f} SAR"
-    if price_txt:
-        lines.append(f"💰 *السعر الآن:* `{_esc(price_txt)}`")
-
-    seller = (offer.get("seller_name") or "").strip()
-    if seller:
-        lines.append(f"🏪 *البائع:* {_esc(seller[:40])}")
-
-    offer_count = offer.get("offer_count")
-    if offer_count and int(offer_count) > 1:
-        lines.append(f"📦 *{int(offer_count)} عروض* — قارناها واخترنا لك الأرخص")
-
-    if offer.get("is_prime"):
-        lines.append("🚀 *Prime* — توصيل سريع من أمازون")
-
-    if offer.get("stale"):
-        age = offer.get("stale_age_min", 0)
-        lines.append(f"⏱️ _آخر تحديث للسعر: منذ {age} دقيقة — تحقق من الرابط قبل الشراء_")
-
-    lines.append("")
-    lines.append(_random.choice(_OFFER_CTA))
-
-    if include_alert_hint and price_val:
+    else:
+        lines.append(
+            (_random.choice(_OFFER_TEASERS_NAMED).format(name=title) if title else _random.choice(_OFFER_TEASERS))
+            .replace("*", "")
+        )
         lines.append("")
-        lines.append(_random.choice(_ALERT_HINTS))
+        price_txt = (offer.get("price") or "").strip()
+        if not price_txt and offer.get("price_val"):
+            price_txt = f"{offer['price_val']:.2f} SAR"
+        if price_txt:
+            lines.append(f"💰 السعر الآن: {price_txt}")
+        seller = (offer.get("seller_name") or "").strip()
+        if seller:
+            lines.append(f"🏪 البائع: {seller[:40]}")
+        if offer.get("is_prime"):
+            lines.append("🚀 Prime — توصيل سريع")
+        lines.append("")
+        lines.append(_random.choice(_OFFER_CTA).replace("*", ""))
+        if offer.get("price_val"):
+            lines.append("")
+            lines.append(_random.choice(_ALERT_HINTS).replace("*", ""))
 
-    lines += ["", "🔒 _شراء آمن من أمازون — رابط تسويق بالعمولة_"]
+    lines += ["", "🔒 شراء آمن من أمازون — رابط تسويق بالعمولة"]
+    if version:
+        lines.append(f"🆔 v{version}")
     return "\n".join(lines)
+
+
+def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:
+    """واجهة متوافقة — تُعيد نصاً عادياً بدون Markdown."""
+    _ = include_alert_hint
+    return format_product_reply_plain(offer, fallback_title=fallback_title)

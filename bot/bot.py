@@ -33,9 +33,13 @@ from amazon_utils import (
     download_image_bytes,
     extract_asin,
     extract_domain,
+    extract_product_title,
+    fetch_product_image_bytes,
+    list_product_image_urls,
     resolve_short_link,
     get_lowest_offer,
     format_offer_message,
+    format_product_reply_plain,
 )
 from vision_utils import (
     search_amazon_by_keywords,
@@ -48,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.2"
+BOT_VERSION = "2.4"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
@@ -375,6 +379,134 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("help_command فشل: %s", _e, exc_info=True)
 
 
+async def _send_product_offer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    asin: str,
+    domain: str,
+    offer: dict | None,
+    source_url: str,
+) -> None:
+    """صورة + وصف + أزرار في رسالة واحدة — رد على رسالة المستخدم في نفس المحادثة."""
+    if not update.message or not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    reply_to = update.message.message_id
+
+    fallback_title = extract_product_title(source_url, asin)
+    if offer is None:
+        offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
+    elif not offer.get("title") and fallback_title:
+        offer = dict(offer)
+        offer["title"] = fallback_title
+
+    affiliate_url = build_affiliate_link(asin, domain)
+    buy_btn = InlineKeyboardButton("🛒 اشتري الآن ↗", url=affiliate_url)
+
+    price_val = offer.get("price_val") if offer else None
+    price_int = int(float(price_val) * 100) if price_val else 0
+    cb_data = f"al:{asin}:{domain}:{price_int}"
+    rows = [[buy_btn]]
+    if len(cb_data.encode()) <= 64:
+        if offer.get("title"):
+            if context.user_data is None:
+                context.user_data = {}
+            ptitle_keys = [k for k in context.user_data if k.startswith("ptitle_")]
+            if len(ptitle_keys) >= 10:
+                for old_k in ptitle_keys[:5]:
+                    context.user_data.pop(old_k, None)
+            context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
+        rows.append([InlineKeyboardButton("🔔 نبّهني عند نزول السعر", callback_data=cb_data)])
+    kb = InlineKeyboardMarkup(rows)
+
+    message = format_product_reply_plain(
+        offer,
+        fallback_title=fallback_title,
+        asin=asin,
+        version=BOT_VERSION,
+    )
+    caption = message[:_MAX_CAPTION]
+
+    loop = asyncio.get_running_loop()
+    photo_bytes = await loop.run_in_executor(
+        None, fetch_product_image_bytes, asin, domain, offer, source_url
+    )
+    image_urls = await loop.run_in_executor(
+        None, list_product_image_urls, asin, domain, offer, source_url
+    )
+
+    send_kwargs = dict(
+        chat_id=chat_id,
+        reply_to_message_id=reply_to,
+        caption=caption,
+        parse_mode=None,
+        reply_markup=kb,
+    )
+
+    # 1) رفع بايتات الصورة — الأضمن في نفس المحادثة
+    if photo_bytes:
+        for attempt in range(3):
+            try:
+                await context.bot.send_photo(
+                    photo=BytesIO(photo_bytes),
+                    **send_kwargs,
+                )
+                _stat("requests_ok")
+                return
+            except RetryAfter as e:
+                await asyncio.sleep(min(int(e.retry_after) + 1, 30))
+            except (TimedOut, NetworkError):
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            except TelegramError as e:
+                logger.warning("send_photo bytes فشل: %s", e)
+                break
+
+    # 2) تيليجرام يحمّل الرابط مباشرة — نفس المحادثة
+    for img_url in image_urls:
+        for attempt in range(2):
+            try:
+                await context.bot.send_photo(photo=img_url, **send_kwargs)
+                _stat("requests_ok")
+                return
+            except RetryAfter as e:
+                await asyncio.sleep(min(int(e.retry_after) + 1, 30))
+            except (TimedOut, NetworkError):
+                if attempt < 1:
+                    await asyncio.sleep(1)
+            except TelegramError as e:
+                logger.info("send_photo url فشل (%s): %s", img_url[:60], e)
+                break
+
+    # 3) آخر محاولة: صورة بدون تسمية طويلة
+    short_cap = caption[:400] if len(caption) > 400 else caption
+    if photo_bytes:
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                reply_to_message_id=reply_to,
+                photo=BytesIO(photo_bytes),
+                caption=short_cap,
+                parse_mode=None,
+                reply_markup=kb,
+            )
+            _stat("requests_ok")
+            return
+        except TelegramError as e:
+            logger.warning("send_photo short caption فشل: %s", e)
+
+    # 4) بدون صورة — نص + أزرار في نفس المحادثة
+    await context.bot.send_message(
+        chat_id=chat_id,
+        reply_to_message_id=reply_to,
+        text=message[:_MAX_MSG],
+        parse_mode=None,
+        reply_markup=kb,
+    )
+    _stat("requests_ok")
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج أي رسالة نصية فيها رابط منتج أمازون."""
     if not update.message or not update.message.text:
@@ -418,84 +550,32 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _typing(update, context)
+    offer = None
 
     async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
         try:
-            loop  = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
             try:
                 offer = await asyncio.wait_for(
-                    loop.run_in_executor(None, get_lowest_offer, asin, domain),
-                    timeout=22.0,
+                    loop.run_in_executor(
+                        None,
+                        lambda: get_lowest_offer(asin, domain, resolved_url),
+                    ),
+                    timeout=25.0,
                 )
             except asyncio.TimeoutError:
-                logger.warning("get_lowest_offer timeout للـ ASIN %s — إرجاع رابط مباشر", asin)
-                offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
-            message = format_offer_message(offer)
-
-            # تاريخ السعر + توصية Claude
-            if offer and not offer.get("blocked"):
-                try:
-                    from price_history import format_history_message, get_history
-                    from claude_utils   import price_advice
-
-                    history_task  = loop.run_in_executor(None, format_history_message, asin, domain)
-                    records_task  = loop.run_in_executor(None, get_history, asin, domain, 30)
-
-                    history_msg, records = await asyncio.gather(history_task, records_task)
-
-                    if history_msg:
-                        message = message + "\n\n" + history_msg
-
-                    # توصية Claude إذا كان عندنا بيانات كافية
-                    if records and len(records) >= 3 and offer.get("price_val"):
-                        advice = await loop.run_in_executor(
-                            None, price_advice, offer["price_val"], records
-                        )
-                        if advice:
-                            message = message + "\n" + advice
-
-                except Exception as _ph_err:
-                    logger.warning("price/claude block فشل: %s", _ph_err)
-
+                logger.warning("get_lowest_offer timeout للـ ASIN %s", asin)
+                offer = {
+                    "blocked": True,
+                    "affiliate_link": build_affiliate_link(asin, domain),
+                    "title": extract_product_title(resolved_url, asin),
+                }
         except Exception as e:
             logger.error("خطأ في جلب السعر للـ ASIN %s: %s", asin, e, exc_info=True)
             await _reply(update, "❌ حصل خطأ أثناء البحث. حاول مرة ثانية.", parse_mode=None)
             return
 
-    # ── أزرار: شراء (URL → متصفح خارجي) + تنبيه ────────────────────────────
-    # نبني الرابط هنا مباشرة — لا نعتمد على offer/cache/API (صيغة Associates الرسمية)
-    affiliate_url = build_affiliate_link(asin, domain)
-    buy_btn  = InlineKeyboardButton("🛒 اشتري الآن ↗", url=affiliate_url)
-    alert_btn = None
-
-    if offer and offer.get("price_val"):
-        price_int = int(offer["price_val"] * 100)
-        cb_data = f"al:{asin}:{domain}:{price_int}"
-        if len(cb_data.encode()) <= 64:
-            if offer.get("title"):
-                ptitle_keys = [k for k in context.user_data if k.startswith("ptitle_")]
-                if len(ptitle_keys) >= 10:
-                    for old_k in ptitle_keys[:5]:
-                        context.user_data.pop(old_k, None)
-                context.user_data[f"ptitle_{asin}"] = offer["title"][:80]
-            alert_btn = InlineKeyboardButton("🔔 نبّهني إذا نزل السعر", callback_data=cb_data)
-
-    # بناء الكيبورد: زر الشراء أولاً (أهم)، ثم زر التنبيه
-    rows = []
-    if buy_btn:
-        rows.append([buy_btn])
-    if alert_btn:
-        rows.append([alert_btn])
-    kb = InlineKeyboardMarkup(rows) if rows else None
-
-    # صورة المنتج مع النص التحفيزي — دائماً نحاول الإرسال كصورة
-    image_url = build_product_image_url(asin, domain, offer)
-    sent = await _reply_photo(update, image_url, message, reply_markup=kb)
-    if not sent and (offer or {}).get("image"):
-        sent = await _reply_photo(update, offer["image"], message, reply_markup=kb)
-    if not sent:
-        await _reply(update, message, reply_markup=kb)
-    _stat("requests_ok")
+    await _send_product_offer(update, context, asin, domain, offer, resolved_url)
 
 
 # =============================================================================
@@ -578,10 +658,14 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
 
         if result in ("added", "updated"):
             verb = "تم تحديث" if result == "updated" else "تم تفعيل"
+            if current_price <= 0:
+                price_line = "💰 راح أحدد السعر الحالي أول ما يتوفر وأنبّهك عند أي انخفاض"
+            else:
+                price_line = f"💰 وأنبّهك فوراً لما ينزل عن `{current_price:.2f} SAR`"
             await query.message.reply_text(
                 f"✅ *{verb} تنبيه السعر بنجاح!*\n\n"
                 f"📦 راح أراقب المنتج لك كل يوم\n"
-                f"💰 وأنبّهك *فوراً* لما ينزل عن `{current_price:.2f} SAR`\n\n"
+                f"{price_line}\n\n"
                 f"🛒 لما يجيك الإشعار — اضغط واشتري قبل ما يرتفع السعر!\n\n"
                 f"📋 تنبيهاتك: /myalerts",
                 parse_mode="Markdown",
@@ -802,6 +886,10 @@ async def _price_alert_check_loop(app) -> None:
 
                     new_price = offer.get("price_val")
                     if not new_price:
+                        continue
+
+                    if alert["last_known"] <= 0:
+                        _pa.update_last_price(alert["id"], new_price, notified=False)
                         continue
 
                     if _pa.check_drop(new_price, alert["last_known"]):
