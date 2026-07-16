@@ -925,18 +925,22 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
     if not url or not url.startswith("http"):
         return None
     try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        # أمازون يرفض تحميل الصور أحياناً بدون Referer
+        if "amazon" in url.lower() or "ssl-images-amazon" in url.lower() or "media-amazon" in url.lower():
+            headers["Referer"] = f"https://www.{AMAZON_DOMAIN}/"
         resp = requests.get(
             url,
             timeout=timeout,
             allow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            },
+            headers=headers,
         )
         if resp.status_code != 200 or not resp.content or len(resp.content) < 300:
             return None

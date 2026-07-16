@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.3"
+BOT_VERSION = "3.4"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -383,12 +383,15 @@ async def _send_offer_card(
     """صورة + نص + أزرار في رسالة واحدة — أو نص فقط إن تعذّر تحميل الصورة."""
     cap = caption[:_MAX_CAPTION]
     if photo_bytes:
+        photo_file = BytesIO(photo_bytes)
+        photo_file.name = "product.jpg"
         for attempt in range(2):
             try:
+                photo_file.seek(0)
                 await context.bot.send_photo(
                     chat_id=chat_id,
                     reply_to_message_id=reply_to,
-                    photo=BytesIO(photo_bytes),
+                    photo=photo_file,
                     caption=cap,
                     parse_mode=None,
                     reply_markup=reply_markup,
@@ -539,10 +542,25 @@ async def _send_product_offer(
         version=BOT_VERSION,
     )
 
+    # تأكد من وجود عنوان واضح للعرض
+    if not (offer.get("title") or "").strip():
+        offer = dict(offer)
+        offer["title"] = fallback_title or f"منتج {asin}"
+        message = format_product_reply_plain(
+            offer,
+            fallback_title=fallback_title,
+            asin=asin,
+            version=BOT_VERSION,
+        )
+
     loop = asyncio.get_running_loop()
     photo_bytes = await loop.run_in_executor(
         None, fetch_product_image_bytes, asin, domain, offer, source_url
     )
+    if not photo_bytes and (offer.get("image") or "").startswith("http"):
+        photo_bytes = await loop.run_in_executor(
+            None, download_image_bytes, offer["image"]
+        )
 
     await _send_offer_card(
         context,

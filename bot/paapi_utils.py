@@ -269,9 +269,29 @@ def _parse_item(item: dict, asin: str) -> dict | None:
     summaries   = item.get("Offers", {}).get("Summaries", [])
     offer_count = summaries[0].get("OfferCount", 1) if summaries else 1
 
+    image_url = (
+        item.get("Images", {})
+            .get("Primary", {})
+            .get("Medium", {})
+            .get("URL", "")
+        or item.get("Images", {})
+            .get("Primary", {})
+            .get("Large", {})
+            .get("URL", "")
+    )
+
     if not listings:
-        logger.info("PA API: لا توجد listings للـ ASIN %s", asin)
-        return None
+        logger.info("PA API: لا توجد listings للـ ASIN %s — أُرجع الاسم/الصورة", asin)
+        if not title and not image_url:
+            return None
+        return {
+            "asin": asin,
+            "title": title,
+            "image": image_url,
+            "affiliate_link": aff_link,
+            "seller_name": "Amazon.sa",
+            "blocked": True,
+        }
 
     best = min(listings,
                key=lambda x: x.get("Price", {}).get("Amount", float("inf")))
@@ -285,14 +305,16 @@ def _parse_item(item: dict, asin: str) -> dict | None:
     seller_name = best.get("MerchantInfo", {}).get("Name", "Amazon.sa")
 
     if price_val is None:
-        return None
-
-    image_url = (
-        item.get("Images", {})
-            .get("Primary", {})
-            .get("Medium", {})
-            .get("URL", "")
-    )
+        if not title and not image_url:
+            return None
+        return {
+            "asin": asin,
+            "title": title,
+            "image": image_url,
+            "affiliate_link": aff_link,
+            "seller_name": seller_name,
+            "blocked": True,
+        }
 
     return {
         "asin":           asin,
