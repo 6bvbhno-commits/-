@@ -30,6 +30,7 @@ from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
 from amazon_utils import (
     build_affiliate_link,
     build_product_image_url,
+    clear_offer_cache,
     download_image_bytes,
     extract_asin,
     extract_domain,
@@ -51,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.5"
+BOT_VERSION = "3.6"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -96,6 +97,9 @@ _stats: dict = {
     "requests_ok":    0,
     "requests_error": 0,
     "flood_waits":    0,
+    "photo_ok":       0,
+    "photo_miss":     0,
+    "title_fallback": 0,
     "last_request_ts": 0.0,
 }
 
@@ -111,6 +115,9 @@ class _StatsHandler(BaseHTTPRequestHandler):
                 "requests_ok":    _stats.get("requests_ok",    0),
                 "requests_error": _stats.get("requests_error", 0),
                 "flood_waits":    _stats.get("flood_waits",    0),
+                "photo_ok":       _stats.get("photo_ok", 0),
+                "photo_miss":     _stats.get("photo_miss", 0),
+                "title_fallback": _stats.get("title_fallback", 0),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -515,7 +522,7 @@ async def _send_product_offer(
     offer: dict | None,
     source_url: str,
 ) -> None:
-    """صورة + وصف + أزرار في رسالة واحدة — رد على رسالة المستخدم في نفس المحادثة."""
+    """صورة + وصف + أزرار — مع ضمانات ضد اختفاء الاسم/الصورة."""
     if not update.message or not update.effective_chat:
         return
 
@@ -527,6 +534,7 @@ async def _send_product_offer(
         offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
     else:
         offer = dict(offer)
+    offer.setdefault("asin", asin)
 
     # إثراء الاسم/الصورة من SerpAPI بحث إذا ناقصين
     weak_title = not (offer.get("title") or "").strip() or (offer.get("title") or "").strip().upper() == asin.upper()
@@ -556,10 +564,21 @@ async def _send_product_offer(
         except Exception as e:
             logger.warning("إثراء SerpAPI فشل: %s", e)
 
+    used_fallback_title = False
     if not (offer.get("title") or "").strip() and fallback_title:
         offer["title"] = fallback_title
+        used_fallback_title = True
     if not (offer.get("title") or "").strip():
         offer["title"] = f"منتج {asin}"
+        used_fallback_title = True
+    if used_fallback_title:
+        _stat("title_fallback")
+
+    # ضمان رابط صورة CDN دائماً قبل التحميل
+    if not (offer.get("image") or "").startswith("http"):
+        offer["image"] = build_product_image_url(asin, domain, offer) or (
+            f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
+        )
 
     if context.user_data is None:
         context.user_data = {}
@@ -571,8 +590,7 @@ async def _send_product_offer(
     price_val = offer.get("price_val") if offer else None
     price_int = int(float(price_val) * 100) if price_val else 0
     cb_data = f"al:{asin}:{price_int}"
-    if offer.get("title"):
-        context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
+    context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
     kb = InlineKeyboardMarkup([
         [buy_btn],
         [InlineKeyboardButton(ALERT_BTN_LABEL, callback_data=cb_data)],
@@ -584,6 +602,14 @@ async def _send_product_offer(
         asin=asin,
         version=BOT_VERSION,
     )
+    # حماية نهائية: الرسالة لازم تحتوي اسم المنتج
+    if "📦" not in message or not (offer.get("title") or "").strip():
+        message = (
+            f"📦 {offer.get('title') or fallback_title or asin}\n\n"
+            f"🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇\n"
+            f"🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
+        )
+        logger.error("CARD_GUARD: أُعيد بناء الرسالة للـ ASIN %s", asin)
 
     loop = asyncio.get_running_loop()
     photo_bytes = await loop.run_in_executor(
@@ -592,6 +618,17 @@ async def _send_product_offer(
     if not photo_bytes and (offer.get("image") or "").startswith("http"):
         photo_bytes = await loop.run_in_executor(
             None, download_image_bytes, offer["image"]
+        )
+
+    if photo_bytes:
+        _stat("photo_ok")
+    else:
+        _stat("photo_miss")
+        logger.error(
+            "PHOTO_MISS ASIN=%s title=%s image=%s",
+            asin,
+            (offer.get("title") or "")[:60],
+            (offer.get("image") or "")[:80],
         )
 
     await _send_offer_card(
@@ -839,7 +876,10 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• PA API (سعر+صورة): {'✅' if paapi_available() else '❌'}\n"
         f"• DeepSeek (نص): {_status(deepseek_key)}\n"
         f"• Anthropic: {_status(ANTHROPIC_API_KEY)}\n"
-        f"• Telegram: {_status(TELEGRAM_BOT_TOKEN)}\n\n"
+        f"• Telegram: {_status(TELEGRAM_BOT_TOKEN)}\n"
+        f"• صور ناجحة: `{_stats.get('photo_ok', 0)}`\n"
+        f"• صور ناقصة: `{_stats.get('photo_miss', 0)}`\n"
+        f"• عنوان احتياطي: `{_stats.get('title_fallback', 0)}`\n\n"
         "💡 _بدون SerpAPI أو PA API على Railway يظهر الرابط والصورة فقط بدون سعر حي._"
     )
     await _reply(update, msg)
@@ -1150,6 +1190,20 @@ async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     global _GLOBAL_SEM
     _GLOBAL_SEM = asyncio.Semaphore(8)   # حد أقصى 8 طلب ثقيل متزامن
+    cleared = clear_offer_cache()
+    if cleared:
+        logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
+    try:
+        from serpapi_utils import serpapi_available
+        if not serpapi_available():
+            logger.error(
+                "⚠️ SERPAPI_KEY غير موجود — الاسم/الصورة/السعر قد يضعفون على Railway"
+            )
+        else:
+            logger.info("✅ SerpAPI جاهز — مسار الاسم والصورة مفعّل")
+    except Exception as e:
+        logger.warning("فحص SerpAPI عند الإقلاع فشل: %s", e)
+    logger.info("🛡️ حماية البطاقة: عنوان إلزامي + CDN صورة + TTL قصير للعروض الناقصة")
     _start_stats_server()
     asyncio.create_task(_memory_cleanup_loop())
     asyncio.create_task(_health_monitor_loop())

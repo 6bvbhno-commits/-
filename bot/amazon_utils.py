@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 # ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
 _CACHE: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL  = 3 * 60 * 60  # 3 ساعات (رُفع من 90 دقيقة — الأسعار مستقرة غالباً)
+_CACHE_TTL  = 3 * 60 * 60  # 3 ساعات للعروض الكاملة
+_CACHE_TTL_WEAK = 10 * 60  # 10 دقائق إذا الاسم أو الصورة ناقصين
 _CACHE_MAX  = 500
 _CACHE_LOCK = threading.Lock()
 
@@ -550,6 +551,31 @@ def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
         return build_affiliate_search_link("", domain)
 
 
+def _offer_is_weak(value: dict | None) -> bool:
+    """عرض ضعيف = بدون اسم حقيقي أو بدون صورة."""
+    if not value:
+        return True
+    title = (value.get("title") or "").strip()
+    asin = (value.get("asin") or "").strip().upper()
+    weak_title = (not title) or (asin and title.upper() == asin) or title.startswith("منتج ")
+    weak_image = not (value.get("image") or "").startswith("http")
+    return weak_title or weak_image
+
+
+def _attach_cdn_image(offer: dict, asin: str, domain: str = AMAZON_DOMAIN) -> dict:
+    """يضمن وجود رابط صورة CDN حتى لو المصدر الأصلي فشل."""
+    if not offer:
+        return offer
+    if (offer.get("image") or "").startswith("http"):
+        return offer
+    asin = (asin or offer.get("asin") or "").upper().strip()
+    if not asin:
+        return offer
+    offer = dict(offer)
+    offer["image"] = f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
+    return offer
+
+
 def _cache_set(key: str, value: dict) -> None:
     """يحفظ في الكاش — يتجاهل النتائج الفاضية (بدون عنوان ولا صورة)."""
     if not value:
@@ -569,6 +595,14 @@ def _cache_set(key: str, value: dict) -> None:
         _CACHE[key] = (time.time(), value)
 
 
+def clear_offer_cache() -> int:
+    """يمسح كاش العروض — يُستدعى عند الإقلاع لمنع نتائج قديمة فاضية."""
+    with _CACHE_LOCK:
+        n = len(_CACHE)
+        _CACHE.clear()
+    return n
+
+
 def get_lowest_offer(
     asin: str,
     domain: str = AMAZON_DOMAIN,
@@ -577,9 +611,8 @@ def get_lowest_offer(
     """
     يجلب أرخص سعر متاح للمنتج.
     الأولوية:
-      1. PA API الرسمي (إذا وُجدت المفاتيح) — بلا حجب
-      2. كشط Desktop → Mobile → offer-listing (fallback)
-    نتيجة ناجحة تُخزَّن 90 دقيقة في الـ cache (حد أقصى 500 إدخال).
+      1. SerpAPI ثم PA API ثم كشط/preview
+    نتيجة ناجحة تُخزَّن في الـ cache (TTL أقصر للعروض الناقصة).
     """
     cache_key = f"{domain}:{asin}"
 
@@ -587,16 +620,34 @@ def get_lowest_offer(
     with _CACHE_LOCK:
         if cache_key in _CACHE:
             ts, cached = _CACHE[cache_key]
-            if time.time() - ts < _CACHE_TTL:
-                logger.info("Cache hit للـ ASIN %s", asin)
-                return _with_fresh_affiliate_link(cached, asin, domain)
+            ttl = _CACHE_TTL_WEAK if _offer_is_weak(cached) else _CACHE_TTL
+            if time.time() - ts < ttl:
+                # لا نعيد عروض فاضية من الكاش — نجبر إعادة الجلب
+                if _offer_is_weak(cached) and not (cached.get("title") or cached.get("image")):
+                    logger.info("Cache miss قسري (عرض فاضي) للـ ASIN %s", asin)
+                else:
+                    logger.info("Cache hit للـ ASIN %s", asin)
+                    return _attach_cdn_image(
+                        _with_fresh_affiliate_link(cached, asin, domain), asin, domain
+                    )
+            else:
+                _CACHE.pop(cache_key, None)
 
     # ── دالة مساعدة: تسجيل + cache + إعادة ─────────────────────────────────
     def _record_and_return(res: dict) -> dict:
+        res = dict(res or {})
+        res.setdefault("asin", asin)
+        res = _attach_cdn_image(res, asin, domain)
+        # لا نخزّن عروض بلا اسم نهائياً إن وُجد عنوان في الرابط
+        if not (res.get("title") or "").strip() and source_url:
+            t = extract_product_title(source_url, asin)
+            if t:
+                res["title"] = t
         _cache_set(cache_key, res)
         try:
             from price_history import record_price
-            record_price(asin, domain, res["price_val"], res.get("seller_name", ""))
+            if res.get("price_val"):
+                record_price(asin, domain, res["price_val"], res.get("seller_name", ""))
         except Exception as _ph:
             logger.warning("price_history: فشل التسجيل — %s", _ph)
         return res
