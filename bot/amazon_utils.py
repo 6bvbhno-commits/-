@@ -551,11 +551,19 @@ def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
 
 
 def _cache_set(key: str, value: dict) -> None:
-    """يُخزّن في الـ cache مع حذف الإدخالات القديمة إذا تجاوز الحد الأقصى."""
+    """يحفظ في الكاش — يتجاهل النتائج الفاضية (بدون عنوان ولا صورة)."""
+    if not value:
+        return
+    has_signal = bool(
+        (value.get("title") or "").strip()
+        or (value.get("image") or "").strip()
+        or value.get("price_val")
+    )
+    if not has_signal and value.get("blocked"):
+        return
     with _CACHE_LOCK:
         if len(_CACHE) >= _CACHE_MAX:
-            # احذف أقدم 10% من الإدخالات (الأقدم بالوقت)
-            to_delete = sorted(_CACHE, key=lambda k: _CACHE[k][0])[: _CACHE_MAX // 10]
+            to_delete = sorted(_CACHE, key=lambda k: _CACHE[k][0])[: max(1, _CACHE_MAX // 10)]
             for k in to_delete:
                 del _CACHE[k]
         _CACHE[key] = (time.time(), value)
@@ -836,7 +844,7 @@ def extract_product_title(url: str, asin: str = "") -> str:
 
 
 def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url: str = "") -> list[str]:
-    """قائمة روابط صور نجرّبها بالترتيب."""
+    """قائمة روابط صور نجرّبها بالترتيب — السريع أولاً بدون كشط ثقيل."""
     urls: list[str] = []
     seen: set[str] = set()
 
@@ -849,7 +857,19 @@ def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url
     if offer:
         _add(offer.get("image") or "")
 
+    asin = (asin or "").upper().strip()
     mp = _normalize_domain(domain)
+
+    # روابط CDN مباشرة بالـ ASIN (سريعة وغالباً تشتغل)
+    if asin:
+        for u in (
+            f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg",
+            f"https://images-eu.ssl-images-amazon.com/images/P/{asin}.01.LZZZZZZZ.jpg",
+            f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01.LZZZZZZZ.jpg",
+            f"https://images-eu.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_.jpg",
+        ):
+            _add(u)
+
     for host in ("ws-eu", "ws-na"):
         _add(
             f"https://{host}.amazon-adsystem.com/widgets/q?"
@@ -857,40 +877,41 @@ def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url
             f"&Format=_SL500_&ID=AsinImage&tag={AFFILIATE_TAG}"
         )
 
-    page_urls = []
-    if source_url and "amazon." in source_url:
-        page_urls.append(source_url.split("?")[0])
-    page_urls.append(f"https://www.{mp}/dp/{asin}")
-
-    for page_url in page_urls:
-        try:
-            resp = requests.get(
-                page_url,
-                timeout=12,
-                allow_redirects=True,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                        "Mobile/15E148 Safari/604.1"
-                    ),
-                    "Accept-Language": "ar,en;q=0.9",
-                },
-            )
-            if resp.status_code != 200:
-                continue
-            html = resp.text
-            for pat in (
-                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
-                r'"hiRes"\s*:\s*"([^"]+)"',
-                r'"large"\s*:\s*"([^"]+)"',
-                r'data-old-hires=["\']([^"\']+)',
-            ):
-                for m in re.finditer(pat, html, re.IGNORECASE):
-                    _add(m.group(1).replace("\\u0026", "&"))
-        except Exception as exc:
-            logger.info("image scrape %s: %s", page_url, exc)
+    # كشط og:image أخيراً وبمهلة قصيرة — على Railway غالباً محجوب
+    if not _ON_RAILWAY:
+        page_urls = []
+        if source_url and "amazon." in source_url:
+            page_urls.append(source_url.split("?")[0])
+        page_urls.append(f"https://www.{mp}/dp/{asin}")
+        for page_url in page_urls[:1]:
+            try:
+                resp = requests.get(
+                    page_url,
+                    timeout=6,
+                    allow_redirects=True,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                            "Mobile/15E148 Safari/604.1"
+                        ),
+                        "Accept-Language": "ar,en;q=0.9",
+                    },
+                )
+                if resp.status_code != 200:
+                    continue
+                html = resp.text
+                for pat in (
+                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+                    r'"hiRes"\s*:\s*"([^"]+)"',
+                    r'"large"\s*:\s*"([^"]+)"',
+                    r'data-old-hires=["\']([^"\']+)',
+                ):
+                    for m in re.finditer(pat, html, re.IGNORECASE):
+                        _add(m.group(1).replace("\\u0026", "&"))
+            except Exception as exc:
+                logger.info("image scrape %s: %s", page_url, exc)
 
     return urls
 
@@ -913,8 +934,8 @@ def fetch_product_image_bytes(
 ) -> bytes | None:
     """يجرب عدة مصادر ويرجع بايتات الصورة."""
     for url in _image_candidate_urls(asin, domain, offer, source_url):
-        data = download_image_bytes(url, timeout=12)
-        if data:
+        data = download_image_bytes(url, timeout=8)
+        if data and len(data) >= 800:
             logger.info("صورة المنتج OK من: %s", url[:90])
             return data
     return None

@@ -7,6 +7,7 @@ SerpAPI — واجهة بيانات أمازون الجاهزة.
 """
 
 import logging
+import os
 import re
 from urllib.parse import urlencode, urlparse, parse_qs, urljoin
 
@@ -36,7 +37,12 @@ _DOMAIN_CURRENCY = {
 
 
 def serpapi_available() -> bool:
-    return bool(SERPAPI_KEY)
+    # اقرأ وقت التشغيل — عشان متغير Railway يظهر حتى بعد إعادة التحميل
+    return bool((os.getenv("SERPAPI_KEY") or SERPAPI_KEY or "").strip())
+
+
+def _serpapi_key() -> str:
+    return (os.getenv("SERPAPI_KEY") or SERPAPI_KEY or "").strip()
 
 
 # ─── مساعدات ──────────────────────────────────────────────────────────────────
@@ -146,7 +152,7 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
                 "engine":        "amazon_product",
                 "asin":          asin,
                 "amazon_domain": domain,
-                "api_key":       SERPAPI_KEY,
+                "api_key":       _serpapi_key(),
             },
             timeout=_TIMEOUT,
         )
@@ -193,6 +199,9 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             }
 
         product = data.get("product_results") or {}
+        # بعض الردود تضع البيانات في الجذر
+        if not product:
+            product = data if data.get("title") or data.get("images") else {}
         title = (product.get("title") or "").strip()
         image = _extract_image(product)
 
@@ -289,7 +298,7 @@ def search_items(keywords: str, domain: str = AMAZON_DOMAIN, max_results: int = 
                 "engine":        "amazon",
                 "k":             keywords,
                 "amazon_domain": domain,
-                "api_key":       SERPAPI_KEY,
+                "api_key":       _serpapi_key(),
             },
             timeout=_TIMEOUT,
         )

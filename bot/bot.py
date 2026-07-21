@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.4"
+BOT_VERSION = "3.5"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -398,9 +398,20 @@ async def _send_offer_card(
                 )
                 return
             except TelegramError as e:
-                logger.warning("صورة المنتج فشلت: %s", e)
+                logger.warning("صورة+نص فشلت: %s", e)
                 if attempt == 0:
                     await asyncio.sleep(1)
+        # محاولة أخيرة: صورة بدون كابشن ثم رسالة نصية
+        try:
+            photo_file.seek(0)
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                reply_to_message_id=reply_to,
+                photo=photo_file,
+                parse_mode=None,
+            )
+        except TelegramError as e:
+            logger.warning("صورة بدون كابشن فشلت: %s", e)
     await context.bot.send_message(
         chat_id=chat_id,
         reply_to_message_id=reply_to,
@@ -514,9 +525,41 @@ async def _send_product_offer(
     fallback_title = extract_product_title(source_url, asin)
     if offer is None:
         offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
-    elif not offer.get("title") and fallback_title:
+    else:
         offer = dict(offer)
+
+    # إثراء الاسم/الصورة من SerpAPI بحث إذا ناقصين
+    weak_title = not (offer.get("title") or "").strip() or (offer.get("title") or "").strip().upper() == asin.upper()
+    weak_image = not (offer.get("image") or "").startswith("http")
+    if weak_title or weak_image:
+        try:
+            from serpapi_utils import search_items, serpapi_available
+            if serpapi_available():
+                loop = asyncio.get_running_loop()
+                results = await loop.run_in_executor(
+                    None, lambda: search_items(asin, domain=domain, max_results=5)
+                )
+                for item in results or []:
+                    link = (item.get("link") or "")
+                    item_asin = (item.get("asin") or "").upper()
+                    if item_asin == asin.upper() or asin.upper() in link.upper() or not item_asin:
+                        if weak_title and item.get("title"):
+                            offer["title"] = item["title"]
+                            weak_title = False
+                        if weak_image and (item.get("image") or "").startswith("http"):
+                            offer["image"] = item["image"]
+                            weak_image = False
+                        if item.get("seller_name") and not offer.get("seller_name"):
+                            offer["seller_name"] = item["seller_name"]
+                        if not weak_title and not weak_image:
+                            break
+        except Exception as e:
+            logger.warning("إثراء SerpAPI فشل: %s", e)
+
+    if not (offer.get("title") or "").strip() and fallback_title:
         offer["title"] = fallback_title
+    if not (offer.get("title") or "").strip():
+        offer["title"] = f"منتج {asin}"
 
     if context.user_data is None:
         context.user_data = {}
@@ -541,17 +584,6 @@ async def _send_product_offer(
         asin=asin,
         version=BOT_VERSION,
     )
-
-    # تأكد من وجود عنوان واضح للعرض
-    if not (offer.get("title") or "").strip():
-        offer = dict(offer)
-        offer["title"] = fallback_title or f"منتج {asin}"
-        message = format_product_reply_plain(
-            offer,
-            fallback_title=fallback_title,
-            asin=asin,
-            version=BOT_VERSION,
-        )
 
     loop = asyncio.get_running_loop()
     photo_bytes = await loop.run_in_executor(
