@@ -894,13 +894,230 @@ def extract_product_title(url: str, asin: str = "") -> str:
     return ""
 
 
+def _fetch_og_meta(asin: str, domain: str, source_url: str = "") -> dict:
+    """يجلب og:title و og:image من صفحة المنتج — يعمل حتى على Railway أحياناً."""
+    mp = _normalize_domain(domain)
+    page_urls = []
+    if source_url and "amazon." in source_url:
+        page_urls.append(source_url.split("?")[0].rstrip("/") )
+    page_urls.append(f"https://www.{mp}/dp/{asin}")
+    page_urls.append(f"https://www.{mp}/gp/aw/d/{asin}")  # نسخة الجوال
+
+    out: dict = {}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
+    }
+    for page_url in page_urls:
+        try:
+            resp = requests.get(page_url, timeout=8, allow_redirects=True, headers=headers)
+            if resp.status_code != 200:
+                continue
+            html = resp.text or ""
+            if "captcha" in html.lower()[:5000] or "robot check" in html.lower()[:5000]:
+                continue
+            details = _parse_product_details_html(html)
+            if details.get("title"):
+                out["title"] = details["title"]
+            if details.get("image"):
+                out["image"] = details["image"]
+            if details.get("description") and not out.get("description"):
+                out["description"] = details["description"]
+            if details.get("price_val") and not out.get("price_val"):
+                out["price_val"] = details["price_val"]
+                out["price"] = details.get("price")
+            # og fallbacks مباشرة
+            if not out.get("title"):
+                m = re.search(
+                    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                    html, re.I,
+                ) or re.search(
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title',
+                    html, re.I,
+                )
+                if m:
+                    out["title"] = m.group(1).strip()[:200]
+            if not out.get("image"):
+                m = re.search(
+                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                    html, re.I,
+                ) or re.search(
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+                    html, re.I,
+                )
+                if m:
+                    out["image"] = m.group(1).strip()
+            if out.get("title") or out.get("image"):
+                logger.info("OG meta OK للـ ASIN %s من %s", asin, page_url[:60])
+                return out
+        except Exception as exc:
+            logger.info("OG meta فشل %s: %s", page_url[:50], exc)
+    return out
+
+
+def _fetch_associates_widget_meta(asin: str, domain: str = AMAZON_DOMAIN) -> dict:
+    """يجلب عنوان وصورة من ويدجت Associates (غالباً يشتغل من السيرفرات)."""
+    mp = _normalize_domain(domain)
+    # رمز السوق لـ SA وغيرها
+    market = "SA" if mp.endswith(".sa") else ("AE" if mp.endswith(".ae") else "US")
+    url = (
+        f"https://ws-eu.amazon-adsystem.com/widgets/q?"
+        f"ServiceVersion=20070822&OneJS=1&Operation=GetAdHtml"
+        f"&MarketPlace={market}&source=ss&ref=as_ss_li_til"
+        f"&ad_type=product_link&tracking_id={AFFILIATE_TAG}"
+        f"&marketplace=amazon&region={market}&placement={asin}"
+        f"&asins={asin}&linkId=&show_border=false&link_opens_in_new_window=true"
+    )
+    out: dict = {}
+    try:
+        resp = requests.get(
+            url,
+            timeout=8,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,*/*",
+            },
+        )
+        if resp.status_code != 200 or not resp.text:
+            return out
+        html = resp.text
+        # العنوان
+        m = re.search(r'class="[^"]*title[^"]*"[^>]*>([^<]+)', html, re.I)
+        if not m:
+            m = re.search(r'<a[^>]+class="[^"]*title[^"]*"[^>]*>([^<]+)', html, re.I)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1)).strip()
+            if len(title) >= 3:
+                out["title"] = title[:200]
+        # الصورة
+        for pat in (
+            r'<img[^>]+src=["\'](https?://[^"\']+)["\']',
+            r'src=["\'](https?://[^"\']*(?:media-amazon|ssl-images-amazon)[^"\']+)["\']',
+        ):
+            for im in re.finditer(pat, html, re.I):
+                img = im.group(1)
+                if "pixel" in img.lower() or "spacer" in img.lower():
+                    continue
+                if "amazon" in img.lower() or "media" in img.lower():
+                    out["image"] = img
+                    break
+            if out.get("image"):
+                break
+        if out:
+            logger.info("Widget meta OK للـ ASIN %s", asin)
+    except Exception as exc:
+        logger.info("Widget meta فشل: %s", exc)
+    return out
+
+
+def enrich_offer_display(
+    offer: dict | None,
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    source_url: str = "",
+) -> dict:
+    """
+    يضمن اسم + صورة للمنتج بكل الوسائل المتاحة.
+    يُستدعى قبل إرسال البطاقة لتيليجرام.
+    """
+    asin = (asin or "").upper().strip()
+    offer = dict(offer or {})
+    offer.setdefault("asin", asin)
+    offer.setdefault("affiliate_link", build_affiliate_link(asin, domain))
+
+    def _weak_title() -> bool:
+        t = (offer.get("title") or "").strip()
+        return (not t) or t.upper() == asin or t.startswith("منتج ")
+
+    def _weak_image() -> bool:
+        return not (offer.get("image") or "").startswith("http")
+
+    # 1) SerpAPI product + search
+    if _weak_title() or _weak_image():
+        try:
+            from serpapi_utils import get_item_by_asin as serp_get, search_items, serpapi_available
+            if serpapi_available():
+                serp = serp_get(asin, domain=domain)
+                if serp:
+                    if _weak_title() and serp.get("title"):
+                        offer["title"] = serp["title"]
+                    if _weak_image() and (serp.get("image") or "").startswith("http"):
+                        offer["image"] = serp["image"]
+                    if not offer.get("seller_name") and serp.get("seller_name"):
+                        offer["seller_name"] = serp["seller_name"]
+                    if offer.get("price_val") is None and serp.get("price_val"):
+                        offer["price_val"] = serp["price_val"]
+                        offer["price"] = serp.get("price")
+                        offer.pop("blocked", None)
+                if _weak_title() or _weak_image():
+                    for item in search_items(asin, domain=domain, max_results=5) or []:
+                        link = item.get("link") or ""
+                        item_asin = (item.get("asin") or "").upper()
+                        if item_asin == asin or asin in link.upper() or not item_asin:
+                            if _weak_title() and item.get("title"):
+                                offer["title"] = item["title"]
+                            if _weak_image() and (item.get("image") or "").startswith("http"):
+                                offer["image"] = item["image"]
+                            break
+        except Exception as exc:
+            logger.warning("enrich SerpAPI: %s", exc)
+
+    # 2) ويدجت Associates
+    if _weak_title() or _weak_image():
+        w = _fetch_associates_widget_meta(asin, domain)
+        if _weak_title() and w.get("title"):
+            offer["title"] = w["title"]
+        if _weak_image() and w.get("image"):
+            offer["image"] = w["image"]
+
+    # 3) OG من صفحة المنتج (حتى على Railway)
+    if _weak_title() or _weak_image():
+        og = _fetch_og_meta(asin, domain, source_url)
+        if _weak_title() and og.get("title"):
+            offer["title"] = og["title"]
+        if _weak_image() and og.get("image"):
+            offer["image"] = og["image"]
+        if offer.get("price_val") is None and og.get("price_val"):
+            offer["price_val"] = og["price_val"]
+            offer["price"] = og.get("price")
+            offer.pop("blocked", None)
+
+    # 4) عنوان من رابط المنتج
+    if _weak_title():
+        t = extract_product_title(source_url, asin)
+        if t:
+            offer["title"] = t
+
+    if _weak_title():
+        offer["title"] = f"منتج {asin}"
+
+    # 5) صورة CDN احتياطية
+    if _weak_image():
+        offer["image"] = (
+            f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
+        )
+
+    return offer
+
+
 def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url: str = "") -> list[str]:
-    """قائمة روابط صور نجرّبها بالترتيب — السريع أولاً بدون كشط ثقيل."""
+    """قائمة روابط صور نجرّبها بالترتيب — السريع أولاً."""
     urls: list[str] = []
     seen: set[str] = set()
 
     def _add(u: str) -> None:
         u = (u or "").strip()
+        if u.startswith("//"):
+            u = "https:" + u
         if u.startswith("http") and u not in seen:
             seen.add(u)
             urls.append(u)
@@ -911,7 +1128,6 @@ def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url
     asin = (asin or "").upper().strip()
     mp = _normalize_domain(domain)
 
-    # روابط CDN مباشرة بالـ ASIN (سريعة وغالباً تشتغل)
     if asin:
         for u in (
             f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg",
@@ -927,42 +1143,6 @@ def _image_candidate_urls(asin: str, domain: str, offer: dict | None, source_url
             f"ServiceVersion=20070822&MarketPlace=www.{mp}&ASIN={asin}"
             f"&Format=_SL500_&ID=AsinImage&tag={AFFILIATE_TAG}"
         )
-
-    # كشط og:image أخيراً وبمهلة قصيرة — على Railway غالباً محجوب
-    if not _ON_RAILWAY:
-        page_urls = []
-        if source_url and "amazon." in source_url:
-            page_urls.append(source_url.split("?")[0])
-        page_urls.append(f"https://www.{mp}/dp/{asin}")
-        for page_url in page_urls[:1]:
-            try:
-                resp = requests.get(
-                    page_url,
-                    timeout=6,
-                    allow_redirects=True,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                            "Mobile/15E148 Safari/604.1"
-                        ),
-                        "Accept-Language": "ar,en;q=0.9",
-                    },
-                )
-                if resp.status_code != 200:
-                    continue
-                html = resp.text
-                for pat in (
-                    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
-                    r'"hiRes"\s*:\s*"([^"]+)"',
-                    r'"large"\s*:\s*"([^"]+)"',
-                    r'data-old-hires=["\']([^"\']+)',
-                ):
-                    for m in re.finditer(pat, html, re.IGNORECASE):
-                        _add(m.group(1).replace("\\u0026", "&"))
-            except Exception as exc:
-                logger.info("image scrape %s: %s", page_url, exc)
 
     return urls
 
@@ -985,8 +1165,8 @@ def fetch_product_image_bytes(
 ) -> bytes | None:
     """يجرب عدة مصادر ويرجع بايتات الصورة."""
     for url in _image_candidate_urls(asin, domain, offer, source_url):
-        data = download_image_bytes(url, timeout=8)
-        if data and len(data) >= 800:
+        data = download_image_bytes(url, timeout=10)
+        if data and len(data) >= 400:
             logger.info("صورة المنتج OK من: %s", url[:90])
             return data
     return None
@@ -996,6 +1176,8 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
     """يحمّل بايتات الصورة — متساهل مع content-type."""
     if not url or not url.startswith("http"):
         return None
+    if url.startswith("//"):
+        url = "https:" + url
     try:
         headers = {
             "User-Agent": (
@@ -1004,10 +1186,11 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "ar,en;q=0.9",
         }
-        # أمازون يرفض تحميل الصور أحياناً بدون Referer
         if "amazon" in url.lower() or "ssl-images-amazon" in url.lower() or "media-amazon" in url.lower():
             headers["Referer"] = f"https://www.{AMAZON_DOMAIN}/"
+            headers["Origin"] = f"https://www.{AMAZON_DOMAIN}"
         resp = requests.get(
             url,
             timeout=timeout,
@@ -1019,7 +1202,6 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
         ctype = (resp.headers.get("content-type") or "").lower()
         if ctype.startswith("text/") or "html" in ctype:
             return None
-        # PNG/JPEG/GIF/WEBP — أو أي بايتات كافية بدون HTML
         if ctype and "image" not in ctype and "octet-stream" not in ctype:
             head = resp.content[:16]
             if not (

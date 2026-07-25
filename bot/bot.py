@@ -32,6 +32,7 @@ from amazon_utils import (
     build_product_image_url,
     clear_offer_cache,
     download_image_bytes,
+    enrich_offer_display,
     extract_asin,
     extract_domain,
     extract_product_title,
@@ -52,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.6"
+BOT_VERSION = "3.7"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -530,55 +531,20 @@ async def _send_product_offer(
     reply_to = update.message.message_id
 
     fallback_title = extract_product_title(source_url, asin)
-    if offer is None:
-        offer = {"blocked": True, "affiliate_link": build_affiliate_link(asin, domain)}
-    else:
-        offer = dict(offer)
-    offer.setdefault("asin", asin)
+    loop = asyncio.get_running_loop()
 
-    # إثراء الاسم/الصورة من SerpAPI بحث إذا ناقصين
-    weak_title = not (offer.get("title") or "").strip() or (offer.get("title") or "").strip().upper() == asin.upper()
-    weak_image = not (offer.get("image") or "").startswith("http")
-    if weak_title or weak_image:
-        try:
-            from serpapi_utils import search_items, serpapi_available
-            if serpapi_available():
-                loop = asyncio.get_running_loop()
-                results = await loop.run_in_executor(
-                    None, lambda: search_items(asin, domain=domain, max_results=5)
-                )
-                for item in results or []:
-                    link = (item.get("link") or "")
-                    item_asin = (item.get("asin") or "").upper()
-                    if item_asin == asin.upper() or asin.upper() in link.upper() or not item_asin:
-                        if weak_title and item.get("title"):
-                            offer["title"] = item["title"]
-                            weak_title = False
-                        if weak_image and (item.get("image") or "").startswith("http"):
-                            offer["image"] = item["image"]
-                            weak_image = False
-                        if item.get("seller_name") and not offer.get("seller_name"):
-                            offer["seller_name"] = item["seller_name"]
-                        if not weak_title and not weak_image:
-                            break
-        except Exception as e:
-            logger.warning("إثراء SerpAPI فشل: %s", e)
+    # إثراء إلزامي: SerpAPI → ويدجت → OG → slug
+    offer = await loop.run_in_executor(
+        None,
+        lambda: enrich_offer_display(offer, asin, domain, source_url),
+    )
 
-    used_fallback_title = False
-    if not (offer.get("title") or "").strip() and fallback_title:
-        offer["title"] = fallback_title
-        used_fallback_title = True
-    if not (offer.get("title") or "").strip():
-        offer["title"] = f"منتج {asin}"
-        used_fallback_title = True
+    used_fallback_title = (
+        not fallback_title
+        and ((offer.get("title") or "").startswith("منتج ") or (offer.get("title") or "").upper() == asin.upper())
+    )
     if used_fallback_title:
         _stat("title_fallback")
-
-    # ضمان رابط صورة CDN دائماً قبل التحميل
-    if not (offer.get("image") or "").startswith("http"):
-        offer["image"] = build_product_image_url(asin, domain, offer) or (
-            f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
-        )
 
     if context.user_data is None:
         context.user_data = {}
@@ -602,7 +568,6 @@ async def _send_product_offer(
         asin=asin,
         version=BOT_VERSION,
     )
-    # حماية نهائية: الرسالة لازم تحتوي اسم المنتج
     if "📦" not in message or not (offer.get("title") or "").strip():
         message = (
             f"📦 {offer.get('title') or fallback_title or asin}\n\n"
@@ -611,7 +576,6 @@ async def _send_product_offer(
         )
         logger.error("CARD_GUARD: أُعيد بناء الرسالة للـ ASIN %s", asin)
 
-    loop = asyncio.get_running_loop()
     photo_bytes = await loop.run_in_executor(
         None, fetch_product_image_bytes, asin, domain, offer, source_url
     )
