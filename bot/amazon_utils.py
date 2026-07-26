@@ -990,14 +990,22 @@ def _fetch_associates_widget_meta(asin: str, domain: str = AMAZON_DOMAIN) -> dic
         if resp.status_code != 200 or not resp.text:
             return out
         html = resp.text
-        # العنوان
-        m = re.search(r'class="[^"]*title[^"]*"[^>]*>([^<]+)', html, re.I)
-        if not m:
-            m = re.search(r'<a[^>]+class="[^"]*title[^"]*"[^>]*>([^<]+)', html, re.I)
-        if m:
+        # العنوان — عدة أنماط شائعة في ويدجت Associates
+        for pat in (
+            r'class="[^"]*\btitle\b[^"]*"[^>]*>([^<]+)',
+            r'<a[^>]+class="[^"]*\btitle\b[^"]*"[^>]*>([^<]+)',
+            r'<span[^>]+class="[^"]*\btitle\b[^"]*"[^>]*>([^<]+)',
+            r'title=["\']([^"\']{8,})["\']',
+            r'<a[^>]+href="[^"]*/dp/[A-Z0-9]{10}[^"]*"[^>]*>([^<]{8,})</a>',
+        ):
+            m = re.search(pat, html, re.I)
+            if not m:
+                continue
             title = re.sub(r"\s+", " ", m.group(1)).strip()
-            if len(title) >= 3:
-                out["title"] = title[:200]
+            title = _clean_product_title(title, asin)
+            if title:
+                out["title"] = title
+                break
         # الصورة
         for pat in (
             r'<img[^>]+src=["\'](https?://[^"\']+)["\']',
@@ -1005,7 +1013,7 @@ def _fetch_associates_widget_meta(asin: str, domain: str = AMAZON_DOMAIN) -> dic
         ):
             for im in re.finditer(pat, html, re.I):
                 img = im.group(1)
-                if "pixel" in img.lower() or "spacer" in img.lower():
+                if "pixel" in img.lower() or "spacer" in img.lower() or "transparent" in img.lower():
                     continue
                 if "amazon" in img.lower() or "media" in img.lower():
                     out["image"] = img
@@ -1013,10 +1021,44 @@ def _fetch_associates_widget_meta(asin: str, domain: str = AMAZON_DOMAIN) -> dic
             if out.get("image"):
                 break
         if out:
-            logger.info("Widget meta OK للـ ASIN %s", asin)
+            logger.info("Widget meta OK للـ ASIN %s title=%s", asin, (out.get("title") or "")[:40])
     except Exception as exc:
         logger.info("Widget meta فشل: %s", exc)
     return out
+
+
+def _clean_product_title(title: str | None, asin: str = "") -> str:
+    """ينظّف عنوان المنتج ويرفض الأكواد/العناوين الفارغة."""
+    if not title:
+        return ""
+    t = re.sub(r"\s+", " ", str(title)).strip()
+    # أزل بادئات أمازون الشائعة
+    t = re.sub(
+        r"^(amazon(?:\.[a-z.]+)?|أمازون)\s*[:|\-–]\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    ).strip()
+    t = re.sub(r"\s*[:|\-–]\s*amazon(?:\.[a-z.]+)?\s*$", "", t, flags=re.IGNORECASE).strip()
+    asin_u = (asin or "").upper().strip()
+    if not t:
+        return ""
+    # ارفض لو العنوان مجرد كود ASIN أو "منتج XXX"
+    if asin_u and t.upper() == asin_u:
+        return ""
+    if re.fullmatch(r"[A-Z0-9]{10}", t.upper()):
+        return ""
+    if re.fullmatch(rf"منتج\s*{re.escape(asin_u)}", t, flags=re.IGNORECASE):
+        return ""
+    if t.lower() in ("amazon", "amazon.sa", "amazon.ae", "amazon.com", "أمازون"):
+        return ""
+    if len(t) < 3:
+        return ""
+    return t[:200]
+
+
+def _is_weak_title(title: str | None, asin: str = "") -> bool:
+    return not _clean_product_title(title, asin)
 
 
 def enrich_offer_display(
@@ -1026,31 +1068,48 @@ def enrich_offer_display(
     source_url: str = "",
 ) -> dict:
     """
-    يضمن اسم + صورة للمنتج بكل الوسائل المتاحة.
-    يُستدعى قبل إرسال البطاقة لتيليجرام.
+    يضمن اسم حقيقي + صورة للمنتج.
+    لا يُرجع كود ASIN كاسم منتج.
     """
     asin = (asin or "").upper().strip()
     offer = dict(offer or {})
     offer.setdefault("asin", asin)
     offer.setdefault("affiliate_link", build_affiliate_link(asin, domain))
 
-    def _weak_title() -> bool:
-        t = (offer.get("title") or "").strip()
-        return (not t) or t.upper() == asin or t.startswith("منتج ")
+    # نظّف أي عنوان موجود مسبقاً (قد يكون كود)
+    cleaned = _clean_product_title(offer.get("title"), asin)
+    if cleaned:
+        offer["title"] = cleaned
+    else:
+        offer.pop("title", None)
 
-    def _weak_image() -> bool:
+    def _need_title() -> bool:
+        return _is_weak_title(offer.get("title"), asin)
+
+    def _need_image() -> bool:
         return not (offer.get("image") or "").startswith("http")
 
-    # 1) SerpAPI product + search
-    if _weak_title() or _weak_image():
+    def _apply_title(raw: str | None) -> bool:
+        t = _clean_product_title(raw, asin)
+        if t:
+            offer["title"] = t
+            return True
+        return False
+
+    # 1) SerpAPI — المنتج ثم البحث (خذ أول نتيجة عند البحث بالـ ASIN)
+    if _need_title() or _need_image():
         try:
             from serpapi_utils import get_item_by_asin as serp_get, search_items, serpapi_available
             if serpapi_available():
-                serp = serp_get(asin, domain=domain)
-                if serp:
-                    if _weak_title() and serp.get("title"):
-                        offer["title"] = serp["title"]
-                    if _weak_image() and (serp.get("image") or "").startswith("http"):
+                for try_domain in (domain, "amazon.com" if domain != "amazon.com" else None):
+                    if not try_domain:
+                        continue
+                    serp = serp_get(asin, domain=try_domain)
+                    if not serp:
+                        continue
+                    if _need_title():
+                        _apply_title(serp.get("title"))
+                    if _need_image() and (serp.get("image") or "").startswith("http"):
                         offer["image"] = serp["image"]
                     if not offer.get("seller_name") and serp.get("seller_name"):
                         offer["seller_name"] = serp["seller_name"]
@@ -1058,54 +1117,85 @@ def enrich_offer_display(
                         offer["price_val"] = serp["price_val"]
                         offer["price"] = serp.get("price")
                         offer.pop("blocked", None)
-                if _weak_title() or _weak_image():
-                    for item in search_items(asin, domain=domain, max_results=5) or []:
-                        link = item.get("link") or ""
+                    if not _need_title() and not _need_image():
+                        break
+
+                if _need_title() or _need_image():
+                    results = search_items(asin, domain=domain, max_results=8) or []
+                    exact = None
+                    first = None
+                    for item in results:
+                        if first is None:
+                            first = item
                         item_asin = (item.get("asin") or "").upper()
-                        if item_asin == asin or asin in link.upper() or not item_asin:
-                            if _weak_title() and item.get("title"):
-                                offer["title"] = item["title"]
-                            if _weak_image() and (item.get("image") or "").startswith("http"):
-                                offer["image"] = item["image"]
+                        link = (item.get("link") or "").upper()
+                        if item_asin == asin or asin in link:
+                            exact = item
                             break
+                    chosen = exact or first  # البحث بكود ASIN → أول نتيجة غالباً هي المنتج
+                    if chosen:
+                        if _need_title():
+                            _apply_title(chosen.get("title"))
+                        if _need_image() and (chosen.get("image") or "").startswith("http"):
+                            offer["image"] = chosen["image"]
+                        if not offer.get("seller_name") and chosen.get("seller_name"):
+                            offer["seller_name"] = chosen["seller_name"]
         except Exception as exc:
             logger.warning("enrich SerpAPI: %s", exc)
 
-    # 2) ويدجت Associates
-    if _weak_title() or _weak_image():
+    # 2) PA API
+    if _need_title() or _need_image():
+        try:
+            from paapi_utils import get_item_by_asin as pa_get, paapi_available
+            if paapi_available():
+                pa = pa_get(asin)
+                if pa:
+                    if _need_title():
+                        _apply_title(pa.get("title"))
+                    if _need_image() and (pa.get("image") or "").startswith("http"):
+                        offer["image"] = pa["image"]
+                    if not offer.get("seller_name") and pa.get("seller_name"):
+                        offer["seller_name"] = pa["seller_name"]
+        except Exception as exc:
+            logger.warning("enrich PA API: %s", exc)
+
+    # 3) ويدجت Associates
+    if _need_title() or _need_image():
         w = _fetch_associates_widget_meta(asin, domain)
-        if _weak_title() and w.get("title"):
-            offer["title"] = w["title"]
-        if _weak_image() and w.get("image"):
+        if _need_title():
+            _apply_title(w.get("title"))
+        if _need_image() and w.get("image"):
             offer["image"] = w["image"]
 
-    # 3) OG من صفحة المنتج (حتى على Railway)
-    if _weak_title() or _weak_image():
+    # 4) OG من صفحة المنتج
+    if _need_title() or _need_image():
         og = _fetch_og_meta(asin, domain, source_url)
-        if _weak_title() and og.get("title"):
-            offer["title"] = og["title"]
-        if _weak_image() and og.get("image"):
+        if _need_title():
+            _apply_title(og.get("title"))
+        if _need_image() and og.get("image"):
             offer["image"] = og["image"]
         if offer.get("price_val") is None and og.get("price_val"):
             offer["price_val"] = og["price_val"]
             offer["price"] = og.get("price")
             offer.pop("blocked", None)
 
-    # 4) عنوان من رابط المنتج
-    if _weak_title():
-        t = extract_product_title(source_url, asin)
-        if t:
-            offer["title"] = t
+    # 5) اسم من slug الرابط (بعد التنظيف)
+    if _need_title():
+        _apply_title(extract_product_title(source_url, asin))
 
-    if _weak_title():
-        offer["title"] = f"منتج {asin}"
+    # 6) لا تعرض كود ASIN للجمهور — اسم عام أفضل من كود
+    if _need_title():
+        offer["title"] = "منتج من أمازون"
+        logger.warning("TITLE_FALLBACK عام للـ ASIN %s (ما قدرنا نجيب الاسم الحقيقي)", asin)
 
-    # 5) صورة CDN احتياطية
-    if _weak_image():
+    if _need_image():
         offer["image"] = (
             f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
         )
 
+    # تأكيد أخير: نظّف العنوان قبل الإرجاع
+    final = _clean_product_title(offer.get("title"), asin)
+    offer["title"] = final or "منتج من أمازون"
     return offer
 
 
@@ -1281,8 +1371,9 @@ def format_product_reply_plain(
         return "❌ ما لقيت المنتج — جرّب رابط ثاني."
 
     title = (offer.get("title") or fallback_title or "").strip()
-    if not title and asin:
-        title = f"منتج {asin}"
+    title = _clean_product_title(title, asin) or _clean_product_title(fallback_title, asin)
+    if not title:
+        title = "منتج من أمازون"
     if len(title) > 90:
         title = title[:87] + "…"
 

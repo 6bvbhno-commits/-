@@ -53,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.7"
+BOT_VERSION = "3.8"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -539,10 +539,7 @@ async def _send_product_offer(
         lambda: enrich_offer_display(offer, asin, domain, source_url),
     )
 
-    used_fallback_title = (
-        not fallback_title
-        and ((offer.get("title") or "").startswith("منتج ") or (offer.get("title") or "").upper() == asin.upper())
-    )
+    used_fallback_title = (offer.get("title") or "") in ("منتج من أمازون", "")
     if used_fallback_title:
         _stat("title_fallback")
 

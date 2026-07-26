@@ -202,7 +202,13 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         # بعض الردود تضع البيانات في الجذر
         if not product:
             product = data if data.get("title") or data.get("images") else {}
-        title = (product.get("title") or "").strip()
+        title = (product.get("title") or product.get("name") or "").strip()
+        if not title:
+            # حقول بديلة شائعة في SerpAPI
+            for key in ("product_title", "item_title"):
+                if product.get(key):
+                    title = str(product.get(key)).strip()
+                    break
         image = _extract_image(product)
 
         # ── أرخص سعر من قائمة البائعين ──────────────────────────────────────
