@@ -874,6 +874,7 @@ def extract_product_title(url: str, asin: str = "") -> str:
     """يستخرج اسم المنتج من slug الرابط — مثل /اسم-المنتج/dp/ASIN."""
     if not url:
         return ""
+    from urllib.parse import unquote
     asin = (asin or extract_asin(url) or "").upper()
     patterns = [
         rf"/([^/?#]+)/dp/{re.escape(asin)}" if asin else r"/([^/?#]+)/dp/[A-Z0-9]{10}",
@@ -883,12 +884,13 @@ def extract_product_title(url: str, asin: str = "") -> str:
         m = re.search(pat, url, re.IGNORECASE)
         if not m:
             continue
-        slug = m.group(1).strip()
-        if slug.lower() in ("dp", "gp", "product", "www.amazon.sa"):
+        slug = unquote(m.group(1).strip())
+        if slug.lower() in ("dp", "gp", "product", "www.amazon.sa", "www.amazon.com"):
             continue
         if re.fullmatch(r"[A-Z0-9]{10}", slug.upper()):
             continue
         title = slug.replace("-", " ").replace("_", " ").strip()
+        title = re.sub(r"\s+", " ", title)
         if len(title) >= 3:
             return title[:120]
     return ""
@@ -942,6 +944,14 @@ def _fetch_og_meta(asin: str, domain: str, source_url: str = "") -> dict:
                 )
                 if m:
                     out["title"] = m.group(1).strip()[:200]
+            if not out.get("title"):
+                # وسم <title> في الصفحة
+                m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+                if m:
+                    raw = re.sub(r"\s+", " ", m.group(1)).strip()
+                    raw = re.split(r"\s+[-:|]\s+Amazon", raw, maxsplit=1, flags=re.I)[0].strip()
+                    if raw and "captcha" not in raw.lower() and len(raw) > 4:
+                        out["title"] = raw[:200]
             if not out.get("image"):
                 m = re.search(
                     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
@@ -1140,6 +1150,15 @@ def enrich_offer_display(
                             offer["image"] = chosen["image"]
                         if not offer.get("seller_name") and chosen.get("seller_name"):
                             offer["seller_name"] = chosen["seller_name"]
+
+                # Google عبر SerpAPI — مصدر قوي لاسم المنتج
+                if _need_title() or _need_image():
+                    from serpapi_utils import fetch_title_via_google
+                    g_title, g_image = fetch_title_via_google(asin, domain)
+                    if _need_title():
+                        _apply_title(g_title)
+                    if _need_image() and g_image.startswith("http"):
+                        offer["image"] = g_image
         except Exception as exc:
             logger.warning("enrich SerpAPI: %s", exc)
 
@@ -1193,9 +1212,14 @@ def enrich_offer_display(
             f"https://m.media-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg"
         )
 
-    # تأكيد أخير: نظّف العنوان قبل الإرجاع
+    # تأكيد أخير: نظّف العنوان قبل الإرجاع — لا كود ASIN أبداً
     final = _clean_product_title(offer.get("title"), asin)
     offer["title"] = final or "منتج من أمازون"
+    logger.info(
+        "TITLE_FINAL ASIN=%s title=%s serpapi_needed_was_checked",
+        asin,
+        offer["title"][:80],
+    )
     return offer
 
 

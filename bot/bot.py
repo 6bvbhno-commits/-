@@ -42,6 +42,7 @@ from amazon_utils import (
     format_offer_message,
     format_product_reply_plain,
 )
+from amazon_utils import _clean_product_title  # حماية عنوان البطاقة
 from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
@@ -53,7 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.8"
+BOT_VERSION = "3.9"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -565,13 +566,23 @@ async def _send_product_offer(
         asin=asin,
         version=BOT_VERSION,
     )
-    if "📦" not in message or not (offer.get("title") or "").strip():
-        message = (
-            f"📦 {offer.get('title') or fallback_title or asin}\n\n"
-            f"🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇\n"
-            f"🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
+    # حماية نهائية: لا تعرض كود ASIN كاسم أبداً
+    display_title = (offer.get("title") or "").strip()
+    if (
+        not display_title
+        or display_title.upper() == asin.upper()
+        or _re.fullmatch(r"[A-Z0-9]{10}", display_title.upper())
+        or _re.fullmatch(rf"منتج\s*{_re.escape(asin)}", display_title, flags=_re.I)
+    ):
+        display_title = _clean_product_title(fallback_title, asin) or "منتج من أمازون"
+        offer["title"] = display_title
+        message = format_product_reply_plain(
+            offer,
+            fallback_title=fallback_title,
+            asin=asin,
+            version=BOT_VERSION,
         )
-        logger.error("CARD_GUARD: أُعيد بناء الرسالة للـ ASIN %s", asin)
+        logger.error("CARD_GUARD: استُبدل كود/عنوان ضعيف للـ ASIN %s → %s", asin, display_title)
 
     photo_bytes = await loop.run_in_executor(
         None, fetch_product_image_bytes, asin, domain, offer, source_url

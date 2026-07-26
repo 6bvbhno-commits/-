@@ -131,6 +131,65 @@ def _search_fallback_by_asin(asin: str, domain: str) -> dict | None:
     return results[0] if results else None
 
 
+def fetch_title_via_google(asin: str, domain: str = AMAZON_DOMAIN) -> tuple[str, str]:
+    """
+    يجلب اسم المنتج (وصورة إن وُجدت) عبر بحث Google في SerpAPI.
+    يرجع (title, image_url).
+    """
+    if not serpapi_available() or not asin:
+        return "", ""
+    q = f"{asin} site:{domain}"
+    try:
+        resp = requests.get(
+            _BASE,
+            params={
+                "engine": "google",
+                "q": q,
+                "hl": "ar",
+                "gl": "sa" if domain.endswith(".sa") else "us",
+                "api_key": _serpapi_key(),
+                "num": 8,
+            },
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning("Google title HTTP %s", resp.status_code)
+            return "", ""
+        data = resp.json()
+        if "error" in data:
+            logger.warning("Google title error: %s", data["error"])
+            return "", ""
+
+        asin_u = asin.upper()
+        for item in data.get("organic_results") or []:
+            title = (item.get("title") or "").strip()
+            link = (item.get("link") or "").upper()
+            if asin_u not in link and asin_u not in title.upper():
+                # اقبل نتائج أمازون العامة إذا البحث بكود ASIN
+                if "AMAZON." not in link:
+                    continue
+            # نظّف عنوان Google: "Name - Amazon.sa" أو "Name | Amazon"
+            title = re.split(r"\s+[-|–]\s+Amazon", title, maxsplit=1, flags=re.I)[0].strip()
+            title = re.sub(r"\s+", " ", title).strip()
+            if len(title) < 4 or title.upper() == asin_u:
+                continue
+            image = ""
+            thumb = item.get("thumbnail") or item.get("serpapi_thumbnail") or ""
+            if isinstance(thumb, str) and thumb.startswith("http"):
+                image = thumb
+            logger.info("Google title OK للـ ASIN %s: %s", asin, title[:60])
+            return title[:200], image
+
+        # Knowledge graph أحياناً
+        kg = data.get("knowledge_graph") or {}
+        kg_title = (kg.get("title") or "").strip()
+        if kg_title and kg_title.upper() != asin_u:
+            return kg_title[:200], ""
+    except Exception as exc:
+        logger.warning("Google title فشل: %s", exc)
+    return "", ""
+
+
 # ─── جلب بيانات منتج بـ ASIN ──────────────────────────────────────────────────
 
 def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
@@ -146,14 +205,20 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
     aff_link = _affiliate_link(asin, "", domain)
 
     try:
+        params = {
+            "engine":        "amazon_product",
+            "asin":          asin,
+            "amazon_domain": domain,
+            "api_key":       _serpapi_key(),
+            "device":        "desktop",
+        }
+        # أمازون العربية تحتاج language وإلا العنوان/السعر يضيعان أحياناً
+        if domain in ("amazon.sa", "amazon.ae", "amazon.eg"):
+            params["language"] = "ar_AE"
+
         resp = requests.get(
             _BASE,
-            params={
-                "engine":        "amazon_product",
-                "asin":          asin,
-                "amazon_domain": domain,
-                "api_key":       _serpapi_key(),
-            },
+            params=params,
             timeout=_TIMEOUT,
         )
 
