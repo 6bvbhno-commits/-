@@ -44,7 +44,8 @@ def get_openai_vision_config() -> tuple[str, str]:
 # توكن البوت — تحصل عليه من @BotFather في تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# تاق الأفلييت الخاص بك
+# تاق الأفلييت — هذا اللي يحوّل أي نقرة/شراء إلى عمولتك في Associates
+# يجب أن يطابق Tracking ID في حسابك: rashedalhano-21
 AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "rashedalhano-21")
 
 # نطاق أمازون المستهدف (بدون www — مطلوب لصحة عنوان PAAPI)

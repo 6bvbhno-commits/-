@@ -14,7 +14,7 @@
 5. اضغط **Deploy** — Railway يقرأ `Dockerfile` تلقائياً
 6. في **Logs** تأكد من ظهور:
    ```
-   🔗 Link sample: https://www.amazon.sa/dp/B0GM947WC5/ref=nosim?tag=rashedalhano-21
+   🔗 Link sample: https://www.amazon.sa/dp/B0GM947WC5?linkCode=ll2&tag=rashedalhano-21&ref_=as_li_ss_tl
    ```
 
 ## Render (بديل مجاني)
