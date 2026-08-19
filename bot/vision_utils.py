@@ -803,7 +803,6 @@ def format_search_results(product_name: str, offers: list[dict]) -> tuple[str, s
 
     teaser = (
         f"🔍 {product_name[:80]}\n\n"
-        f"{_random.choice(_SEARCH_TEASERS)}\n"
-        f"👇 اضغط الزر وشوف أقل الأسعار"
+        f"بحثت لك في أمازون — شوف أقل الأسعار 👇"
     )
     return teaser, search_url, image_url

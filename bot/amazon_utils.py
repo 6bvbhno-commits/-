@@ -1407,7 +1407,7 @@ def format_product_reply_plain(
     asin: str = "",
     version: str = "",
 ) -> str:
-    """رسالة قصيرة تحت صورة المنتج — بدون سعر ولا وصف طويل."""
+    """رسالة قصيرة تحت صورة المنتج — نص طبيعي بدون حشو تسويقي."""
     _ = version
     if not offer:
         return "❌ ما لقيت المنتج — جرّب رابط ثاني."
@@ -1419,24 +1419,15 @@ def format_product_reply_plain(
     if len(title) > 90:
         title = title[:87] + "…"
 
-    cta_lines = [
-        "✨ لقيته لك بأقل سعر — اضغط «اشتري الآن» 👇",
-        "🏷️ أرخص عرض من الرابط — اضغط الزر تحت 👇",
-        "🔥 جاهز بأقل سعر — اضغط «اشتري الآن» وشوف التفاصيل 👇",
-    ]
-    cta = _random.choice(cta_lines)
     if offer.get("blocked"):
-        cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇"
+        body = "المنتج على أمازون — اضغط الزر وشوف السعر 👇"
+    else:
+        body = "هذا أقل سعر حصلته في أمازون 👇"
 
     seller = (offer.get("seller_name") or "").strip()
-    seller_line = f"🏪 البائع: {seller[:40]}\n" if seller else ""
+    seller_line = f"🏪 {seller[:40]}\n" if seller else ""
 
-    return (
-        f"📦 {title}\n"
-        f"{seller_line}\n"
-        f"{cta}\n"
-        f"🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
-    )
+    return f"📦 {title}\n{seller_line}\n{body}"
 
 
 def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:
