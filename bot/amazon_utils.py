@@ -13,7 +13,7 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
-from config import AFFILIATE_TAG, AMAZON_DOMAIN
+from config import AFFILIATE_TAG, AMAZON_DOMAIN, OFFER_CACHE_MAX, SCRAPE_CONCURRENCY
 
 # هل نعمل على Railway؟ — Amazon يحجب scraping من سيرفراتهم
 _ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
@@ -24,11 +24,16 @@ logger = logging.getLogger(__name__)
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL  = 3 * 60 * 60  # 3 ساعات للعروض الكاملة
 _CACHE_TTL_WEAK = 10 * 60  # 10 دقائق إذا الاسم أو الصورة ناقصين
-_CACHE_MAX  = 500
+_CACHE_MAX  = OFFER_CACHE_MAX
 _CACHE_LOCK = threading.Lock()
 
+# ---- دمج الطلبات المتزامنة لنفس ASIN (viral links) ----
+_INFLIGHT: dict[str, tuple[threading.Event, list]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_WAIT = 55  # ثوانٍ انتظار الطلبات المتابعة
+
 # ---- حد الطلبات المتزامنة لأمازون ----
-_SCRAPE_SEMAPHORE = threading.Semaphore(10)  # رُفع من 6 → 10 لاستيعاب الضغط العالي
+_SCRAPE_SEMAPHORE = threading.Semaphore(SCRAPE_CONCURRENCY)
 
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
@@ -610,28 +615,86 @@ def get_lowest_offer(
 ) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
+    يدمج الطلبات المتزامنة لنفس ASIN — مفيد عند انتشار رابط واحد لآلاف المستخدمين.
+    """
+    cache_key = f"{domain}:{asin.upper()}"
+
+    cached = _read_cache(cache_key, asin, domain)
+    if cached is not None:
+        return cached
+
+    leader = False
+    holder: list = [None, None]  # [result, exception]
+    event: threading.Event | None = None
+
+    with _INFLIGHT_LOCK:
+        entry = _INFLIGHT.get(cache_key)
+        if entry is None:
+            event = threading.Event()
+            _INFLIGHT[cache_key] = (event, holder)
+            leader = True
+        else:
+            event, holder = entry
+
+    if not leader:
+        logger.info("Coalesce wait ASIN %s — طلب متزامن ينتظر النتيجة", asin)
+        if not event.wait(timeout=_INFLIGHT_WAIT):
+            logger.warning("Coalesce timeout ASIN %s — إعادة جلب مستقل", asin)
+            return _fetch_lowest_offer(asin, domain, source_url)
+        if holder[1] is not None:
+            raise holder[1]
+        result = holder[0]
+        if result is None:
+            return _fetch_lowest_offer(asin, domain, source_url)
+        return _attach_cdn_image(
+            _with_fresh_affiliate_link(dict(result), asin, domain), asin, domain
+        )
+
+    try:
+        result = _fetch_lowest_offer(asin, domain, source_url)
+        holder[0] = result
+        return result
+    except Exception as exc:
+        holder[1] = exc
+        raise
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.pop(cache_key, None)
+        if event is not None:
+            event.set()
+
+
+def _read_cache(cache_key: str, asin: str, domain: str) -> dict | None:
+    """يرجع عرضاً من الكاش إن وُجد وصلاحيته سارية."""
+    with _CACHE_LOCK:
+        if cache_key not in _CACHE:
+            return None
+        ts, cached = _CACHE[cache_key]
+        ttl = _CACHE_TTL_WEAK if _offer_is_weak(cached) else _CACHE_TTL
+        if time.time() - ts >= ttl:
+            _CACHE.pop(cache_key, None)
+            return None
+        if _offer_is_weak(cached) and not (cached.get("title") or cached.get("image")):
+            logger.info("Cache miss قسري (عرض فاضي) للـ ASIN %s", asin)
+            return None
+        logger.info("Cache hit للـ ASIN %s", asin)
+        return _attach_cdn_image(
+            _with_fresh_affiliate_link(cached, asin, domain), asin, domain
+        )
+
+
+def _fetch_lowest_offer(
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    source_url: str = "",
+) -> dict | None:
+    """
+    يجلب أرخص سعر متاح للمنتج.
     الأولوية:
       1. SerpAPI ثم PA API ثم كشط/preview
     نتيجة ناجحة تُخزَّن في الـ cache (TTL أقصر للعروض الناقصة).
     """
-    cache_key = f"{domain}:{asin}"
-
-    # ── تحقق من الـ cache ─────────────────────────────────────────────────────
-    with _CACHE_LOCK:
-        if cache_key in _CACHE:
-            ts, cached = _CACHE[cache_key]
-            ttl = _CACHE_TTL_WEAK if _offer_is_weak(cached) else _CACHE_TTL
-            if time.time() - ts < ttl:
-                # لا نعيد عروض فاضية من الكاش — نجبر إعادة الجلب
-                if _offer_is_weak(cached) and not (cached.get("title") or cached.get("image")):
-                    logger.info("Cache miss قسري (عرض فاضي) للـ ASIN %s", asin)
-                else:
-                    logger.info("Cache hit للـ ASIN %s", asin)
-                    return _attach_cdn_image(
-                        _with_fresh_affiliate_link(cached, asin, domain), asin, domain
-                    )
-            else:
-                _CACHE.pop(cache_key, None)
+    cache_key = f"{domain}:{asin.upper()}"
 
     # ── دالة مساعدة: تسجيل + cache + إعادة ─────────────────────────────────
     def _record_and_return(res: dict) -> dict:

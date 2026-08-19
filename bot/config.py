@@ -81,3 +81,45 @@ DEEPSEEK_API_KEY = get_deepseek_api_key()
 
 # وضع تجريبي: False = أسعار حقيقية من PA API
 MOCK_MODE = False
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 10_000) -> int:
+    """يقرأ عدداً صحيحاً من متغير البيئة مع حدود آمنة."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# ── إعدادات تحمل الضغط العالي (حملات / زيارات كثيرة) ───────────────────────
+# يمكن ضبطها من Railway Variables بدون تعديل الكود
+HIGH_LOAD_MODE = _env_bool("HIGH_LOAD_MODE", True)
+
+# طلبات ثقيلة متزامنة (SerpAPI + scraping + LLM)
+GLOBAL_CONCURRENCY = _env_int("GLOBAL_CONCURRENCY", 16 if HIGH_LOAD_MODE else 8, minimum=4, maximum=32)
+
+# حد الطلبات لكل مستخدم في الدقيقة
+RATE_MAX_PER_USER = _env_int("RATE_MAX_PER_USER", 40 if HIGH_LOAD_MODE else 30, minimum=10, maximum=120)
+
+# حجم كاش الأسعار (ASIN → عرض)
+OFFER_CACHE_MAX = _env_int("OFFER_CACHE_MAX", 2500 if HIGH_LOAD_MODE else 500, minimum=100, maximum=10_000)
+
+# طلبات SerpAPI/كشط متزامنة
+SCRAPE_CONCURRENCY = _env_int("SCRAPE_CONCURRENCY", 14 if HIGH_LOAD_MODE else 10, minimum=2, maximum=30)
+
+# عند الضغط: تخطّي محادثة AI واستخدم البحث المباشر فقط
+SKIP_AI_CHAT_UNDER_LOAD = _env_bool("SKIP_AI_CHAT_UNDER_LOAD", HIGH_LOAD_MODE)
+
+# عدد المستخدمين النشطين الذي يُفعّل وضع تخفيف الحمل
+LOAD_SHED_ACTIVE_USERS = _env_int("LOAD_SHED_ACTIVE_USERS", 80, minimum=20, maximum=500)

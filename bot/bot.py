@@ -26,7 +26,18 @@ from telegram.ext import (
 )
 
 import price_alerts as _pa
-from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    MOCK_MODE,
+    AMAZON_DOMAIN,
+    AFFILIATE_TAG,
+    GLOBAL_CONCURRENCY,
+    RATE_MAX_PER_USER,
+    SKIP_AI_CHAT_UNDER_LOAD,
+    LOAD_SHED_ACTIVE_USERS,
+    HIGH_LOAD_MODE,
+    OFFER_CACHE_MAX,
+)
 from amazon_utils import (
     build_affiliate_link,
     build_product_image_url,
@@ -54,14 +65,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.9"
+BOT_VERSION = "4.0"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
-_RATE_MAX    = 30   # رُفع من 20 → 30 لاستيعاب ضغط الحملات التسويقية
+_RATE_MAX    = RATE_MAX_PER_USER
 
 # ─── Global backpressure — يحد الطلبات الثقيلة المتزامنة (LLM + scraping) ──
 # يُهيَّأ في _post_init بعد بدء event loop
@@ -78,6 +89,37 @@ def _is_rate_limited(user_id: int) -> bool:
         return True
     buf.append(now)
     return False
+
+
+def _is_under_load() -> bool:
+    """هل عدد المستخدمين النشطين يستدعي تخفيف الحمل؟"""
+    return len(_user_last_seen) >= LOAD_SHED_ACTIVE_USERS
+
+
+class _HeavySlot:
+    """مدير خانة طلب ثقيل — يرفض بسرعة إذا كان النظام ممتلئاً."""
+
+    __slots__ = ("_acquired",)
+
+    def __init__(self) -> None:
+        self._acquired = False
+
+    async def __aenter__(self) -> bool:
+        sem = _GLOBAL_SEM
+        if sem is None:
+            self._acquired = True
+            return True
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=2.0)
+            self._acquired = True
+            return True
+        except asyncio.TimeoutError:
+            _stat("load_shed")
+            return False
+
+    async def __aexit__(self, *_args) -> None:
+        if self._acquired and _GLOBAL_SEM is not None:
+            _GLOBAL_SEM.release()
 
 # ─── سجل المحادثات لكل مستخدم (آخر 8 رسائل للسياق) ─────────────────────────
 _MAX_HISTORY = 8
@@ -102,6 +144,8 @@ _stats: dict = {
     "photo_ok":       0,
     "photo_miss":     0,
     "title_fallback": 0,
+    "load_shed":      0,
+    "coalesce_waits": 0,
     "last_request_ts": 0.0,
 }
 
@@ -112,11 +156,16 @@ class _StatsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/stats":
             payload = _json.dumps({
+                "version":        BOT_VERSION,
+                "high_load_mode": HIGH_LOAD_MODE,
                 "active_users":   len(_user_last_seen),
+                "global_concurrency": GLOBAL_CONCURRENCY,
+                "rate_max_per_user":  _RATE_MAX,
                 "requests_total": _stats.get("requests_total", 0),
                 "requests_ok":    _stats.get("requests_ok",    0),
                 "requests_error": _stats.get("requests_error", 0),
                 "flood_waits":    _stats.get("flood_waits",    0),
+                "load_shed":      _stats.get("load_shed",      0),
                 "photo_ok":       _stats.get("photo_ok", 0),
                 "photo_miss":     _stats.get("photo_miss", 0),
                 "title_fallback": _stats.get("title_fallback", 0),
@@ -266,7 +315,14 @@ async def _search_and_deliver_product(
     await _typing(update, context)
     loop = asyncio.get_running_loop()
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            await _reply(
+                update,
+                "⏳ البوت مشغول بطلبات كثيرة الآن. انتظر ثوانٍ وحاول مرة أخرى.",
+                parse_mode=None,
+            )
+            return
         try:
             offers = await asyncio.wait_for(
                 loop.run_in_executor(None, search_amazon_by_keywords, product_query),
@@ -659,7 +715,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     offer = None
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            await _reply(
+                update,
+                "⏳ البوت مشغول بطلبات كثيرة الآن. انتظر ثوانٍ وحاول مرة أخرى.",
+                parse_mode=None,
+            )
+            return
         try:
             loop = asyncio.get_running_loop()
             try:
@@ -851,7 +914,10 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• Telegram: {_status(TELEGRAM_BOT_TOKEN)}\n"
         f"• صور ناجحة: `{_stats.get('photo_ok', 0)}`\n"
         f"• صور ناقصة: `{_stats.get('photo_miss', 0)}`\n"
-        f"• عنوان احتياطي: `{_stats.get('title_fallback', 0)}`\n\n"
+        f"• FloodWait: `{_stats.get('flood_waits', 0)}`\n"
+        f"• تخفيف حمل: `{_stats.get('load_shed', 0)}`\n"
+        f"• مستخدمون نشطون: `{len(_user_last_seen)}`\n"
+        f"• concurrency: `{GLOBAL_CONCURRENCY}`\n\n"
         "💡 _بدون SerpAPI أو PA API على Railway يظهر الرابط والصورة فقط بدون سعر حي._"
     )
     await _reply(update, msg)
@@ -1056,11 +1122,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_running_loop()
     product_query = None
-    try:
-        from claude_utils import extract_product_intent
-        product_query = await loop.run_in_executor(None, extract_product_intent, text)
-    except Exception as e:
-        logger.warning("extract_product_intent فشل: %s", e)
+    if not (SKIP_AI_CHAT_UNDER_LOAD and _is_under_load()):
+        try:
+            from claude_utils import extract_product_intent
+            product_query = await loop.run_in_executor(None, extract_product_intent, text)
+        except Exception as e:
+            logger.warning("extract_product_intent فشل: %s", e)
+    elif _is_under_load():
+        logger.info("load_shed: تخطّي extract_product_intent — %d مستخدم نشط", len(_user_last_seen))
+        _stat("load_shed")
 
     if not product_query:
         product_query = _guess_product_query(text)
@@ -1070,7 +1140,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _add_to_history(user_id, "assistant", product_query[:200])
         return
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    if SKIP_AI_CHAT_UNDER_LOAD and _is_under_load():
+        if len(text) >= 3:
+            await _search_and_deliver_product(update, context, text)
+        else:
+            await _reply(update, "📝 اكتب اسم المنتج أو أرسل رابط أمازون.", parse_mode=None)
+        return
+
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            if len(text) >= 3:
+                await _search_and_deliver_product(update, context, text)
+            else:
+                await _reply(
+                    update,
+                    "⏳ البوت مشغول. اكتب اسم منتج أو أرسل رابط أمازون.",
+                    parse_mode=None,
+                )
+            return
         try:
             from claude_utils import chat_response
             history  = _user_history[user_id][:-1]
@@ -1161,7 +1248,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     global _GLOBAL_SEM
-    _GLOBAL_SEM = asyncio.Semaphore(8)   # حد أقصى 8 طلب ثقيل متزامن
+    _GLOBAL_SEM = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+    logger.info(
+        "🚀 وضع الضغط: HIGH_LOAD=%s | concurrency=%d | rate/user=%d | cache=%d",
+        HIGH_LOAD_MODE,
+        GLOBAL_CONCURRENCY,
+        RATE_MAX_PER_USER,
+        OFFER_CACHE_MAX,
+    )
     cleared = clear_offer_cache()
     if cleared:
         logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
