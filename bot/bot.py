@@ -1315,9 +1315,10 @@ def main():
     _URL_PATH    = "/tgwh"
 
     # ── ضبط اتصال قوي يتحمّل تذبذب الشبكة بدون توقف ──────────────────────
-    # طلبات عامة: pool كبير + مهلات متوازنة
+    _pool_size = 512 if HIGH_LOAD_MODE else 256
+    _updates_pool = 64 if HIGH_LOAD_MODE else 32
     _req_general = HTTPXRequest(
-        connection_pool_size=256,   # يتحمّل عدد كبير من الطلبات المتزامنة
+        connection_pool_size=_pool_size,
         connect_timeout=15.0,
         read_timeout=30.0,
         write_timeout=30.0,
@@ -1325,7 +1326,7 @@ def main():
     )
     # طلب get_updates (polling): read_timeout أطول من long-polling نفسه
     _req_updates = HTTPXRequest(
-        connection_pool_size=32,
+        connection_pool_size=_updates_pool,
         connect_timeout=15.0,
         read_timeout=40.0,          # أطول من poll timeout عشان ما يقطع الاتصال
         write_timeout=30.0,
