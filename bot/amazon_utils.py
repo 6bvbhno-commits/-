@@ -496,12 +496,25 @@ def _normalize_domain(domain: str) -> str:
 
 def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
     """
-    صيغة Associates الرسمية لـ amazon.sa:
-    https://www.amazon.sa/dp/ASIN/ref=nosim?tag=YOURTAG-21
+    رابط عمولة Associates بنفس عناصر SiteStripe النصي:
+    tag= (تاق التتبع — هذا اللي يحدد العمولة)
+    linkCode=ll2 + ref_=as_li_ss_tl (نوع الرابط النصي)
+
+    مثال أمازون:
+    https://www.amazon.sa/dp/B0BRK8PR48?...&linkCode=ll2&tag=rashedalhano-21&...&ref_=as_li_ss_tl
     """
+    from urllib.parse import urlencode
+
     asin = (asin or "").upper().strip()
     d = _normalize_domain(domain)
-    url = f"https://www.{d}/dp/{asin}/ref=nosim?tag={AFFILIATE_TAG}"
+    qs = urlencode(
+        {
+            "linkCode": "ll2",
+            "tag": AFFILIATE_TAG,
+            "ref_": "as_li_ss_tl",
+        }
+    )
+    url = f"https://www.{d}/dp/{asin}?{qs}"
     logger.info("🔗 AFFILIATE_LINK | ASIN=%s | tag=%s | url=%s", asin, AFFILIATE_TAG, url)
     return url
 
@@ -516,12 +529,15 @@ def _with_fresh_affiliate_link(offer: dict, asin: str, domain: str) -> dict:
 
 
 def build_affiliate_search_link(keyword: str, domain: str = AMAZON_DOMAIN) -> str:
-    """رابط بحث أمازون مع tag= للعمولة."""
+    """رابط بحث أمازون مع تاق العمولة."""
     import urllib.parse
 
     d = _normalize_domain(domain)
     k = urllib.parse.quote_plus(keyword.strip())
-    return f"https://www.{d}/s?k={k}&tag={AFFILIATE_TAG}"
+    return (
+        f"https://www.{d}/s?k={k}"
+        f"&linkCode=ll2&tag={AFFILIATE_TAG}&ref_=as_li_ss_tl"
+    )
 
 
 def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
@@ -544,7 +560,9 @@ def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
         params = parse_qs(parsed.query, keep_blank_values=True)
         for bad in ("tag", "linkCode", "ref_", "ref"):
             params.pop(bad, None)
+        params["linkCode"] = ["ll2"]
         params["tag"] = [AFFILIATE_TAG]
+        params["ref_"] = ["as_li_ss_tl"]
         new_query = urlencode({k: v[0] for k, v in params.items() if v})
         return urlunparse(parsed._replace(netloc=f"www.{d}", query=new_query))
     except Exception:
@@ -1389,7 +1407,7 @@ def format_product_reply_plain(
     asin: str = "",
     version: str = "",
 ) -> str:
-    """رسالة قصيرة تحت صورة المنتج — بدون سعر ولا وصف طويل."""
+    """رسالة قصيرة تحت صورة المنتج — نص طبيعي بدون حشو تسويقي."""
     _ = version
     if not offer:
         return "❌ ما لقيت المنتج — جرّب رابط ثاني."
@@ -1401,24 +1419,15 @@ def format_product_reply_plain(
     if len(title) > 90:
         title = title[:87] + "…"
 
-    cta_lines = [
-        "✨ لقيته لك بأقل سعر — اضغط «اشتري الآن» 👇",
-        "🏷️ أرخص عرض من الرابط — اضغط الزر تحت 👇",
-        "🔥 جاهز بأقل سعر — اضغط «اشتري الآن» وشوف التفاصيل 👇",
-    ]
-    cta = _random.choice(cta_lines)
     if offer.get("blocked"):
-        cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇"
+        body = "المنتج على أمازون — اضغط الزر وشوف السعر 👇"
+    else:
+        body = "هذا أقل سعر حصلته في أمازون 👇"
 
     seller = (offer.get("seller_name") or "").strip()
-    seller_line = f"🏪 البائع: {seller[:40]}\n" if seller else ""
+    seller_line = f"🏪 {seller[:40]}\n" if seller else ""
 
-    return (
-        f"📦 {title}\n"
-        f"{seller_line}\n"
-        f"{cta}\n"
-        f"🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
-    )
+    return f"📦 {title}\n{seller_line}\n{body}"
 
 
 def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:
