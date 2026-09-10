@@ -73,7 +73,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.0"
+BOT_VERSION = "5.1"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -542,9 +542,28 @@ async def _reply_photo(
 # المعالجات
 # =============================================================================
 
+def _track_user(update: Update) -> None:
+    """يسجّل المستخدم لاستقبال تنبيهات أكواد الخصم."""
+    try:
+        import users_db as _users
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or not user:
+            return
+        _users.upsert_user(
+            chat.id,
+            user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+        )
+    except Exception as e:
+        logger.warning("track_user: %s", e)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
     try:
+        _track_user(update)
         user_id = update.effective_user.id if update.effective_user else 0
         _user_history[user_id].clear()   # بداية محادثة جديدة
 
@@ -731,6 +750,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    _track_user(update)
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
         await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
@@ -1277,6 +1297,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    _track_user(update)
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
         await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
@@ -1446,6 +1467,27 @@ async def _post_init(application) -> None:
     else:
         logger.info("✅ AFFILIATE OK | tag=%s | product=%s", get_affiliate_tag(), sample)
         logger.info("✅ STORE TAG OK | %s", store_sample)
+
+    # سجل المستخدمين + استيراد من تنبيهات الأسعار
+    try:
+        import users_db as _users
+        imported = _users.import_from_price_alerts()
+        logger.info("👥 users_db: استيراد %d من تنبيهات الأسعار | نشط=%s", imported, _users.count_users())
+    except Exception as e:
+        logger.warning("users_db import: %s", e)
+
+    # بث أكواد الخصم + داشبورد سري
+    try:
+        import broadcast as _bc
+        from dashboard import start_dashboard_server
+        _bc.set_application(application)
+        asyncio.create_task(_bc.scheduler_loop())
+        loop = asyncio.get_running_loop()
+        dash_path = start_dashboard_server(loop)
+        if dash_path:
+            logger.info("🔒 افتح الداشبورد السري على المسار %s (بعد إدخال السر فقط)", dash_path)
+    except Exception as e:
+        logger.warning("dashboard/broadcast init: %s", e)
 
     cleared = clear_offer_cache()
     if cleared:

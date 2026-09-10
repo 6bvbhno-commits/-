@@ -145,3 +145,11 @@ SKIP_AI_CHAT_UNDER_LOAD = _env_bool("SKIP_AI_CHAT_UNDER_LOAD", HIGH_LOAD_MODE)
 
 # عدد المستخدمين النشطين الذي يُفعّل وضع تخفيف الحمل
 LOAD_SHED_ACTIVE_USERS = _env_int("LOAD_SHED_ACTIVE_USERS", 80, minimum=20, maximum=500)
+
+# ── داشبورد سري (أكواد الخصم) — لا يُفعَّل بدون سر قوي ─────────────────────
+# مثال: DASHBOARD_SECRET=خيط-طويل-عشوائي-جداً
+DASHBOARD_SECRET = (os.getenv("DASHBOARD_SECRET") or "").strip()
+# مسار مخفي — لا تشاركه؛ الافتراضي عشوائي ثابت مشتق من السر عند التشغيل
+DASHBOARD_PATH = (os.getenv("DASHBOARD_PATH") or "").strip().strip("/")
+# منفذ الداشبورد (Railway يستخدم PORT عادةً)
+DASHBOARD_PORT = _env_int("PORT", _env_int("DASHBOARD_PORT", 8080, minimum=1, maximum=65535), minimum=1, maximum=65535)
