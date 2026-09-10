@@ -29,3 +29,25 @@
 - `bot/run.sh` يشغّل البوت **فقط على Railway** (`RAILWAY_ENVIRONMENT` يُضبط تلقائياً)
 - على Render يُضبط `RAILWAY_ENVIRONMENT` يدوياً أو عدّل `run.sh`
 - لا تحتاج Replit بعد الآن
+
+## ظهور البوت في بحث تيليجرام
+
+بعد النشر، البوت يضبط تلقائياً: الاسم + الوصف القصير + الأوامر.
+
+فعّل الوضع المضمّن مرة واحدة من @BotFather (يزيد الانتشار جداً):
+
+1. افتح @BotFather → `/mybots` → اختر البوت
+2. `Bot Settings` → `Inline Mode` → `Turn on`
+3. Placeholder مقترح: `ابحث عن منتج في أمازون...`
+4. (اختياري) `/setuserpic` — ضع صورة واضحة للبوت
+5. (اختياري) `/setabouttext` — نفس نص الوصف القصير
+
+تأكد في Logs من:
+```
+✅ AFFILIATE OK | tag=rashedalhano-21
+📣 short_description OK
+```
+
+## تاق العمولة
+
+الافتراضي `AFFILIATE_TAG=rashedalhano-21` — كل روابط المنتجات والمتاجر والبحث تُوسَم بهذا التاق.
