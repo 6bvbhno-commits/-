@@ -44,11 +44,33 @@ def get_openai_vision_config() -> tuple[str, str]:
 # توكن البوت — تحصل عليه من @BotFather في تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# تاق الأفلييت الخاص بك
-AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "rashedalhano-21")
+# تاق الأفلييت الخاص بك — افتراضي ثابت: rashedalhano-21
+# لا تغيّره إلا عبر AFFILIATE_TAG في Railway إذا احتجت حساباً آخر
+_DEFAULT_AFFILIATE_TAG = "rashedalhano-21"
+AFFILIATE_TAG = (os.getenv("AFFILIATE_TAG") or _DEFAULT_AFFILIATE_TAG).strip() or _DEFAULT_AFFILIATE_TAG
 
 # نطاق أمازون المستهدف (بدون www — مطلوب لصحة عنوان PAAPI)
 AMAZON_DOMAIN = os.getenv("AMAZON_DOMAIN", "amazon.sa")
+
+# هوية البوت في تيليجرام (تظهر في البحث وملف البوت)
+BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "بوت أسعار أمازون")
+BOT_SHORT_DESCRIPTION = os.getenv(
+    "BOT_SHORT_DESCRIPTION",
+    "أرخص أسعار أمازون السعودية 🔥 أرسل رابط أو اسم منتج — صورة + سعر + تنبيه انخفاض. وفّر فلوسك!",
+)
+BOT_DESCRIPTION = os.getenv(
+    "BOT_DESCRIPTION",
+    (
+        "بوت أسعار أمازون السعودية — اكتشف أرخص سعر قبل ما تشتري.\n\n"
+        "✨ أرسل رابط منتج أمازون ← صورة + أقل سعر + زر شراء بعمولة\n"
+        "🔍 اكتب اسم المنتج ← بحث فوري في أمازون.sa\n"
+        "🔔 نبّهني عند انخفاض السعر — إشعار تلقائي\n"
+        "🏪 يدعم روابط المتاجر (Stores) وصفحات العروض\n\n"
+        "كلمات مفتاحية: أسعار أمازون، أرخص سعر، عروض أمازون السعودية، "
+        "تنبيه انخفاض السعر، مقارنة أسعار، أمازون.sa\n\n"
+        "روابط الشراء تحتوي على تاق تسويق بالعمولة (Associates)."
+    ),
+)
 
 # مفاتيح الوصول لـ PA API v5 الرسمي
 # LWA (Login with Amazon) — من ملف credentials CSV (Credential Id + Secret)
