@@ -48,6 +48,19 @@
 📣 short_description OK
 ```
 
+## ترقية v6.1 (تشغيل من الجوال + نمو عضوي)
+
+- `/broadcast كود|عنوان|تفاصيل` للمدير فقط (`ADMIN_IDS`)
+- `/mute` و `/unmute` + زر إيقاف على رسائل البث
+- أزرار سريعة في `/start` + مشاركة بطاقة المنتج
+- شارة خصم % على البطاقة + ملخص يومي 21:00 الرياض (`DAILY_DIGEST_ENABLED`)
+
+```
+ADMIN_IDS=123456789
+DAILY_DIGEST_ENABLED=true
+DAILY_DIGEST_HOUR=21
+```
+
 ## ترقية v6 (أداء وموثوقية)
 
 - قاطع دائرة SerpAPI + جلسة HTTP مشتركة (Keep-Alive)
