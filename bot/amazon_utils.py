@@ -13,7 +13,14 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
-from config import AFFILIATE_TAG, AMAZON_DOMAIN
+from config import (
+    AFFILIATE_TAG,
+    AMAZON_DOMAIN,
+    OFFER_CACHE_MAX,
+    SCRAPE_CONCURRENCY,
+    CACHE_TTL_FULL,
+    CACHE_TTL_WEAK,
+)
 
 # هل نعمل على Railway؟ — Amazon يحجب scraping من سيرفراتهم
 _ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
@@ -22,13 +29,18 @@ logger = logging.getLogger(__name__)
 
 # ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
 _CACHE: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL  = 3 * 60 * 60  # 3 ساعات للعروض الكاملة
-_CACHE_TTL_WEAK = 10 * 60  # 10 دقائق إذا الاسم أو الصورة ناقصين
-_CACHE_MAX  = 500
+_CACHE_TTL  = CACHE_TTL_FULL
+_CACHE_TTL_WEAK = CACHE_TTL_WEAK
+_CACHE_MAX  = OFFER_CACHE_MAX
 _CACHE_LOCK = threading.Lock()
 
+# ---- دمج الطلبات المتزامنة لنفس ASIN (viral links) ----
+_INFLIGHT: dict[str, tuple[threading.Event, list]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_WAIT = 55  # ثوانٍ انتظار الطلبات المتابعة
+
 # ---- حد الطلبات المتزامنة لأمازون ----
-_SCRAPE_SEMAPHORE = threading.Semaphore(10)  # رُفع من 6 → 10 لاستيعاب الضغط العالي
+_SCRAPE_SEMAPHORE = threading.Semaphore(SCRAPE_CONCURRENCY)
 
 # ---- خريطة الأرقام العربية (13 حرف مصدر ↔ 13 هدف) ----
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
@@ -494,15 +506,53 @@ def _normalize_domain(domain: str) -> str:
     return d or AMAZON_DOMAIN
 
 
+def get_affiliate_tag() -> str:
+    """تاق العمولة الحالي — دائماً من config (افتراضي rashedalhano-21)."""
+    return (AFFILIATE_TAG or "rashedalhano-21").strip() or "rashedalhano-21"
+
+
+def url_has_our_tag(url: str) -> bool:
+    """هل الرابط يحمل تاق العمولة الخاص بنا؟"""
+    if not url:
+        return False
+    tag = get_affiliate_tag().lower()
+    return f"tag={tag}" in url.lower().replace(" ", "")
+
+
+def is_amazon_url(url: str) -> bool:
+    """هل الرابط يخص أمازون (منتج / متجر / بحث)؟"""
+    if not url:
+        return False
+    return bool(re.search(r"(?:^|://|www\.)(?:amazon\.|amzn\.|a\.co\b)", url, re.I))
+
+
+def is_amazon_store_url(url: str) -> bool:
+    """رابط متجر/صفحة عروض أمازون (Stores) بدون ASIN."""
+    if not url:
+        return False
+    return bool(
+        re.search(
+            r"amazon\.[^/\s]+/(?:stores|shop|b|browse)/",
+            url,
+            re.I,
+        )
+    )
+
+
 def build_affiliate_link(asin: str, domain: str = AMAZON_DOMAIN) -> str:
     """
     صيغة Associates الرسمية لـ amazon.sa:
-    https://www.amazon.sa/dp/ASIN/ref=nosim?tag=YOURTAG-21
+    https://www.amazon.sa/dp/ASIN/ref=nosim?tag=rashedalhano-21
     """
     asin = (asin or "").upper().strip()
     d = _normalize_domain(domain)
-    url = f"https://www.{d}/dp/{asin}/ref=nosim?tag={AFFILIATE_TAG}"
-    logger.info("🔗 AFFILIATE_LINK | ASIN=%s | tag=%s | url=%s", asin, AFFILIATE_TAG, url)
+    tag = get_affiliate_tag()
+    # ref=nosim يمنع Amazon من استبدال التاق؛ linkCode=ogi لتتبع Associates
+    url = (
+        f"https://www.{d}/dp/{asin}/ref=nosim"
+        f"?tag={tag}&linkCode=ogi&th=1&psc=1"
+    )
+    logger.info("🔗 AFFILIATE_LINK | ASIN=%s | tag=%s | url=%s", asin, tag, url)
     return url
 
 
@@ -520,14 +570,27 @@ def build_affiliate_search_link(keyword: str, domain: str = AMAZON_DOMAIN) -> st
     import urllib.parse
 
     d = _normalize_domain(domain)
-    k = urllib.parse.quote_plus(keyword.strip())
-    return f"https://www.{d}/s?k={k}&tag={AFFILIATE_TAG}"
+    tag = get_affiliate_tag()
+    k = urllib.parse.quote_plus((keyword or "").strip())
+    if k:
+        return f"https://www.{d}/s?k={k}&tag={tag}&linkCode=ogi"
+    return f"https://www.{d}/?tag={tag}"
+
+
+def build_affiliate_store_link(store_url: str, domain: str = AMAZON_DOMAIN) -> str:
+    """
+    يضيف تاق العمولة لرابط متجر/صفحة عروض.
+    مثال الناتج:
+    https://www.amazon.sa/stores/page/A0A6...?_encoding=UTF8&tag=rashedalhano-21
+    """
+    return tag_amazon_url(store_url, domain)
 
 
 def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
-    """يضيف أو يستبدل tag= على رابط أمازون موجود."""
+    """يضيف أو يستبدل tag= على أي رابط أمازون (منتج / متجر / بحث)."""
     from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+    tag = get_affiliate_tag()
     if not raw_link:
         return build_affiliate_search_link("", domain)
 
@@ -537,17 +600,28 @@ def tag_amazon_url(raw_link: str, domain: str = AMAZON_DOMAIN) -> str:
 
     try:
         parsed = urlparse(raw_link if "://" in raw_link else f"https://{raw_link.lstrip('/')}")
-        if "amazon." not in (parsed.netloc or "").lower():
+        host = (parsed.netloc or "").lower()
+        if "amazon." not in host and not host.endswith(".amazon"):
             return build_affiliate_search_link("", domain)
 
         d = _normalize_domain(extract_domain(raw_link) or domain)
         params = parse_qs(parsed.query, keep_blank_values=True)
-        for bad in ("tag", "linkCode", "ref_", "ref"):
+        # أزل تاقات منافسة أو قديمة ثم ثبّت تاجنا
+        for bad in ("tag", "ascsubtag", "linkCode", "ref_", "ref", "camp", "creative"):
             params.pop(bad, None)
-        params["tag"] = [AFFILIATE_TAG]
+        params["tag"] = [tag]
+        # احتفظ بـ _encoding إن وُجد (مهم لصفحات المتاجر العربية)
+        if "_encoding" not in params and is_amazon_store_url(raw_link):
+            params["_encoding"] = ["UTF8"]
         new_query = urlencode({k: v[0] for k, v in params.items() if v})
-        return urlunparse(parsed._replace(netloc=f"www.{d}", query=new_query))
-    except Exception:
+        netloc = parsed.netloc or f"www.{d}"
+        if not netloc.startswith("www.") and "amazon." in netloc:
+            netloc = f"www.{netloc.removeprefix('www.')}"
+        tagged = urlunparse(parsed._replace(netloc=netloc, query=new_query))
+        logger.info("🔗 TAGGED_URL | tag=%s | url=%s", tag, tagged[:160])
+        return tagged
+    except Exception as e:
+        logger.warning("tag_amazon_url فشل: %s", e)
         return build_affiliate_search_link("", domain)
 
 
@@ -610,28 +684,86 @@ def get_lowest_offer(
 ) -> dict | None:
     """
     يجلب أرخص سعر متاح للمنتج.
+    يدمج الطلبات المتزامنة لنفس ASIN — مفيد عند انتشار رابط واحد لآلاف المستخدمين.
+    """
+    cache_key = f"{domain}:{asin.upper()}"
+
+    cached = _read_cache(cache_key, asin, domain)
+    if cached is not None:
+        return cached
+
+    leader = False
+    holder: list = [None, None]  # [result, exception]
+    event: threading.Event | None = None
+
+    with _INFLIGHT_LOCK:
+        entry = _INFLIGHT.get(cache_key)
+        if entry is None:
+            event = threading.Event()
+            _INFLIGHT[cache_key] = (event, holder)
+            leader = True
+        else:
+            event, holder = entry
+
+    if not leader:
+        logger.info("Coalesce wait ASIN %s — طلب متزامن ينتظر النتيجة", asin)
+        if not event.wait(timeout=_INFLIGHT_WAIT):
+            logger.warning("Coalesce timeout ASIN %s — إعادة جلب مستقل", asin)
+            return _fetch_lowest_offer(asin, domain, source_url)
+        if holder[1] is not None:
+            raise holder[1]
+        result = holder[0]
+        if result is None:
+            return _fetch_lowest_offer(asin, domain, source_url)
+        return _attach_cdn_image(
+            _with_fresh_affiliate_link(dict(result), asin, domain), asin, domain
+        )
+
+    try:
+        result = _fetch_lowest_offer(asin, domain, source_url)
+        holder[0] = result
+        return result
+    except Exception as exc:
+        holder[1] = exc
+        raise
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.pop(cache_key, None)
+        if event is not None:
+            event.set()
+
+
+def _read_cache(cache_key: str, asin: str, domain: str) -> dict | None:
+    """يرجع عرضاً من الكاش إن وُجد وصلاحيته سارية."""
+    with _CACHE_LOCK:
+        if cache_key not in _CACHE:
+            return None
+        ts, cached = _CACHE[cache_key]
+        ttl = _CACHE_TTL_WEAK if _offer_is_weak(cached) else _CACHE_TTL
+        if time.time() - ts >= ttl:
+            _CACHE.pop(cache_key, None)
+            return None
+        if _offer_is_weak(cached) and not (cached.get("title") or cached.get("image")):
+            logger.info("Cache miss قسري (عرض فاضي) للـ ASIN %s", asin)
+            return None
+        logger.info("Cache hit للـ ASIN %s", asin)
+        return _attach_cdn_image(
+            _with_fresh_affiliate_link(cached, asin, domain), asin, domain
+        )
+
+
+def _fetch_lowest_offer(
+    asin: str,
+    domain: str = AMAZON_DOMAIN,
+    source_url: str = "",
+) -> dict | None:
+    """
+    يجلب أرخص سعر متاح للمنتج.
     الأولوية:
       1. SerpAPI ثم PA API ثم كشط/preview
     نتيجة ناجحة تُخزَّن في الـ cache (TTL أقصر للعروض الناقصة).
     """
-    cache_key = f"{domain}:{asin}"
-
-    # ── تحقق من الـ cache ─────────────────────────────────────────────────────
-    with _CACHE_LOCK:
-        if cache_key in _CACHE:
-            ts, cached = _CACHE[cache_key]
-            ttl = _CACHE_TTL_WEAK if _offer_is_weak(cached) else _CACHE_TTL
-            if time.time() - ts < ttl:
-                # لا نعيد عروض فاضية من الكاش — نجبر إعادة الجلب
-                if _offer_is_weak(cached) and not (cached.get("title") or cached.get("image")):
-                    logger.info("Cache miss قسري (عرض فاضي) للـ ASIN %s", asin)
-                else:
-                    logger.info("Cache hit للـ ASIN %s", asin)
-                    return _attach_cdn_image(
-                        _with_fresh_affiliate_link(cached, asin, domain), asin, domain
-                    )
-            else:
-                _CACHE.pop(cache_key, None)
+    cache_key = f"{domain}:{asin.upper()}"
 
     # ── دالة مساعدة: تسجيل + cache + إعادة ─────────────────────────────────
     def _record_and_return(res: dict) -> dict:
@@ -1305,7 +1437,8 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
         if "amazon" in url.lower() or "ssl-images-amazon" in url.lower() or "media-amazon" in url.lower():
             headers["Referer"] = f"https://www.{AMAZON_DOMAIN}/"
             headers["Origin"] = f"https://www.{AMAZON_DOMAIN}"
-        resp = requests.get(
+        from http_client import get_http_session
+        resp = get_http_session().get(
             url,
             timeout=timeout,
             allow_redirects=True,
@@ -1388,8 +1521,9 @@ def format_product_reply_plain(
     fallback_title: str = "",
     asin: str = "",
     version: str = "",
+    domain: str = "",
 ) -> str:
-    """رسالة قصيرة تحت صورة المنتج — بدون سعر ولا وصف طويل."""
+    """بطاقة منتج قصيرة تحت الصورة — مع السعر ونسبة الخصم إن وُجدت."""
     _ = version
     if not offer:
         return "❌ ما لقيت المنتج — جرّب رابط ثاني."
@@ -1401,24 +1535,52 @@ def format_product_reply_plain(
     if len(title) > 90:
         title = title[:87] + "…"
 
+    price = (offer.get("price") or "").strip()
+    price_val = offer.get("price_val")
+    if not price and price_val:
+        cur = (offer.get("currency") or "SAR").strip()
+        price = f"{float(price_val):.2f} {cur}"
+
+    seller = (offer.get("seller_name") or "").strip()
+    prime = " · ⭐ Prime" if offer.get("is_prime") else ""
+    use_domain = (domain or offer.get("domain") or AMAZON_DOMAIN).strip()
+
+    lines = [f"📦 {title}"]
+
+    # شارة خصم من سعر القائمة إن وُجد
+    list_val = offer.get("list_price_val") or offer.get("was_price_val")
+    try:
+        if price_val and list_val and float(list_val) > float(price_val) * 1.02:
+            pct = (float(list_val) - float(price_val)) / float(list_val) * 100
+            if pct >= 3:
+                lines.append(f"🔥 خصم {pct:.0f}% — كان {float(list_val):.2f}")
+    except (TypeError, ValueError):
+        pass
+
+    if price and not offer.get("blocked"):
+        lines.append(f"💰 {price}{prime}")
+        try:
+            from price_history import price_drop_line
+            drop = price_drop_line(asin, use_domain, float(price_val) if price_val else None)
+            if drop:
+                lines.append(drop)
+        except Exception:
+            pass
+    elif offer.get("blocked"):
+        lines.append("💰 السعر يظهر على أمازون بعد فتح الرابط")
+    if seller:
+        lines.append(f"🏪 {seller[:40]}")
+
     cta_lines = [
         "✨ لقيته لك بأقل سعر — اضغط «اشتري الآن» 👇",
         "🏷️ أرخص عرض من الرابط — اضغط الزر تحت 👇",
         "🔥 جاهز بأقل سعر — اضغط «اشتري الآن» وشوف التفاصيل 👇",
     ]
-    cta = _random.choice(cta_lines)
-    if offer.get("blocked"):
-        cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» وشوف السعر 👇"
-
-    seller = (offer.get("seller_name") or "").strip()
-    seller_line = f"🏪 البائع: {seller[:40]}\n" if seller else ""
-
-    return (
-        f"📦 {title}\n"
-        f"{seller_line}\n"
-        f"{cta}\n"
-        f"🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»"
-    )
+    cta = "🔗 المنتج جاهز — اضغط «اشتري الآن» 👇" if offer.get("blocked") else _random.choice(cta_lines)
+    lines.append("")
+    lines.append(cta)
+    lines.append("🔔 انخفض السعر؟ اضغط «نبّهني عند انخفاض السعر»")
+    return "\n".join(lines)
 
 
 def format_offer_message(offer: dict | None, *, include_alert_hint: bool = True, fallback_title: str = "") -> str:
