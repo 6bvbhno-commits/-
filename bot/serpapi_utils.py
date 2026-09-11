@@ -11,15 +11,54 @@ import os
 import re
 from urllib.parse import urlencode, urlparse, parse_qs, urljoin
 
-import requests
-
 from amazon_utils import build_affiliate_link, build_affiliate_search_link, tag_amazon_url
-from config import AFFILIATE_TAG, AMAZON_DOMAIN, SERPAPI_KEY
+from circuit_breaker import CircuitBreaker
+from config import (
+    AFFILIATE_TAG,
+    AMAZON_DOMAIN,
+    SERPAPI_KEY,
+    SERPAPI_CIRCUIT_FAILS,
+    SERPAPI_CIRCUIT_COOLDOWN,
+)
+from http_client import get_http_session
 
 logger = logging.getLogger(__name__)
 
 _BASE    = "https://serpapi.com/search.json"
 _TIMEOUT = 15
+
+_SERP_CIRCUIT = CircuitBreaker(
+    "serpapi",
+    fail_threshold=SERPAPI_CIRCUIT_FAILS,
+    cooldown_sec=float(SERPAPI_CIRCUIT_COOLDOWN),
+)
+
+
+def serpapi_circuit_status() -> dict:
+    return _SERP_CIRCUIT.status()
+
+
+def _serp_get(params: dict):
+    """طلب SerpAPI عبر الجلسة المشتركة + قاطع الدائرة."""
+    if not _SERP_CIRCUIT.allow():
+        logger.warning("SerpAPI: circuit open — تخطّي الطلب")
+        return None
+    try:
+        resp = get_http_session().get(_BASE, params=params, timeout=_TIMEOUT)
+    except Exception as e:
+        _SERP_CIRCUIT.record_failure()
+        logger.warning("SerpAPI network: %s", e)
+        return None
+
+    if resp.status_code == 429 or resp.status_code >= 500:
+        _SERP_CIRCUIT.record_failure()
+        logger.warning("SerpAPI HTTP %s — failure recorded", resp.status_code)
+        return resp
+    if resp.status_code == 401:
+        _SERP_CIRCUIT.record_failure()
+        return resp
+    _SERP_CIRCUIT.record_success()
+    return resp
 
 # خريطة الأرقام العربية (نفسها في amazon_utils)
 _AR_NUM_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،", "0123456789.,,")
@@ -140,18 +179,16 @@ def fetch_title_via_google(asin: str, domain: str = AMAZON_DOMAIN) -> tuple[str,
         return "", ""
     q = f"{asin} site:{domain}"
     try:
-        resp = requests.get(
-            _BASE,
-            params={
+        resp = _serp_get({
                 "engine": "google",
                 "q": q,
                 "hl": "ar",
                 "gl": "sa" if domain.endswith(".sa") else "us",
                 "api_key": _serpapi_key(),
                 "num": 8,
-            },
-            timeout=_TIMEOUT,
-        )
+            })
+        if resp is None:
+            return "", ""
         if resp.status_code != 200:
             logger.warning("Google title HTTP %s", resp.status_code)
             return "", ""
@@ -216,12 +253,10 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         if domain in ("amazon.sa", "amazon.ae", "amazon.eg"):
             params["language"] = "ar_AE"
 
-        resp = requests.get(
-            _BASE,
-            params=params,
-            timeout=_TIMEOUT,
-        )
+        resp = _serp_get(params)
 
+        if resp is None:
+            return None
         if resp.status_code == 401:
             logger.error("SerpAPI: مفتاح غير صالح (401)")
             return None
@@ -363,17 +398,15 @@ def search_items(keywords: str, domain: str = AMAZON_DOMAIN, max_results: int = 
     currency = _currency(domain)
 
     try:
-        resp = requests.get(
-            _BASE,
-            params={
+        resp = _serp_get({
                 "engine":        "amazon",
                 "k":             keywords,
                 "amazon_domain": domain,
                 "api_key":       _serpapi_key(),
-            },
-            timeout=_TIMEOUT,
-        )
+            })
 
+        if resp is None:
+            return []
         if resp.status_code == 401:
             logger.error("SerpAPI: مفتاح غير صالح (401)")
             return []

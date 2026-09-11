@@ -134,13 +134,20 @@ def count_users() -> dict:
         return {"total": 0, "active": 0, "blocked": 0}
 
 
-def get_broadcast_chat_ids() -> list[int]:
-    """كل chat_id مؤهّل لاستقبال تنبيهات أكواد الخصم."""
+def get_broadcast_chat_ids(*, after_chat_id: int = 0) -> list[int]:
+    """كل chat_id مؤهّل — مع إمكانية الاستئناف بعد after_chat_id."""
     try:
         with _DB_LOCK, _get_conn() as conn:
-            rows = conn.execute(
-                "SELECT chat_id FROM bot_users WHERE blocked=0 AND opt_out=0"
-            ).fetchall()
+            if after_chat_id:
+                rows = conn.execute(
+                    "SELECT chat_id FROM bot_users "
+                    "WHERE blocked=0 AND opt_out=0 AND chat_id>? ORDER BY chat_id",
+                    (after_chat_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chat_id FROM bot_users WHERE blocked=0 AND opt_out=0 ORDER BY chat_id"
+                ).fetchall()
         return [int(r[0]) for r in rows]
     except Exception as e:
         logger.warning("users_db.get_broadcast_chat_ids: %s", e)
@@ -233,6 +240,22 @@ def update_broadcast_log(
             )
     except Exception as e:
         logger.warning("users_db.update_broadcast_log: %s", e)
+
+
+def set_broadcast_checkpoint(log_id: int, last_chat_id: int, sent_ok: int, sent_fail: int) -> None:
+    """يحفظ نقطة استئناف للإرسال الجماعي."""
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            # عمود اختياري — نضيفه إن لم يوجد
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(broadcast_log)").fetchall()}
+            if "last_chat_id" not in cols:
+                conn.execute("ALTER TABLE broadcast_log ADD COLUMN last_chat_id INTEGER DEFAULT 0")
+            conn.execute(
+                "UPDATE broadcast_log SET last_chat_id=?, sent_ok=?, sent_fail=?, status=? WHERE id=?",
+                (last_chat_id, sent_ok, sent_fail, "sending", log_id),
+            )
+    except Exception as e:
+        logger.warning("users_db.set_broadcast_checkpoint: %s", e)
 
 
 def recent_broadcasts(limit: int = 10) -> list[dict]:

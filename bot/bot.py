@@ -1,6 +1,6 @@
 """
 البوت الرئيسي — يستقبل روابط منتجات وصور، ويرد بأقل سعر أو حالة التوفر.
-يستخدم مكتبة python-telegram-bot (الإصدار 20+) + Claude AI.
+يستخدم مكتبة python-telegram-bot (الإصدار 20+) + أحدث طبقات الأداء (v6).
 """
 import asyncio
 import json as _json
@@ -8,6 +8,7 @@ import logging
 import re as _re
 import threading as _threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 import requests as _req
 from collections import defaultdict
 from io import BytesIO
@@ -38,7 +39,17 @@ from config import (
     LOAD_SHED_ACTIVE_USERS,
     HIGH_LOAD_MODE,
     OFFER_CACHE_MAX,
+    CLEAR_CACHE_ON_BOOT,
+    HEAVY_POOL_SIZE,
+    JSON_LOGS,
+    USE_WEBHOOK,
+    WEBHOOK_PATH,
+    WEBHOOK_SECRET,
+    DASHBOARD_PORT,
 )
+from logutil import setup_logging
+
+setup_logging(json_logs=JSON_LOGS)
 from amazon_utils import (
     build_affiliate_link,
     build_affiliate_search_link,
@@ -67,13 +78,7 @@ from vision_utils import (
     format_search_results,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-BOT_VERSION = "5.1"
+BOT_VERSION = "6.0"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -85,8 +90,23 @@ _RATE_MAX    = RATE_MAX_PER_USER
 # ─── Global backpressure — يحد الطلبات الثقيلة المتزامنة (LLM + scraping) ──
 # يُهيَّأ في _post_init بعد بدء event loop
 _GLOBAL_SEM: asyncio.Semaphore | None = None
+_HEAVY_POOL: ThreadPoolExecutor | None = None
+_BG_TASKS: list[asyncio.Task] = []
 _user_times: dict[int, list[float]] = defaultdict(list)
 _user_last_seen: dict[int, float]   = {}   # آخر نشاط — للتنظيف الدوري
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_heavy_pool() -> ThreadPoolExecutor:
+    global _HEAVY_POOL
+    if _HEAVY_POOL is None:
+        _HEAVY_POOL = ThreadPoolExecutor(
+            max_workers=HEAVY_POOL_SIZE,
+            thread_name_prefix="heavy",
+        )
+        logging.getLogger(__name__).info("🧵 heavy pool size=%d", HEAVY_POOL_SIZE)
+    return _HEAVY_POOL
 
 def _is_rate_limited(user_id: int) -> bool:
     now  = _time.monotonic()
@@ -609,6 +629,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🆘 *المساعدة*\n\n"
             "• 🔗 *رابط أمازون / متجر* ← صورة + أقل سعر + زر شراء\n"
             "• 💬 *اسم منتج* ← بحث فوري\n"
+            f"• 🔥 /deals ← الأكثر طلباً الآن\n"
             f"• 🔎 اكتب `@{bot_user}` في أي شات وابحث\n"
             f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n\n"
             "📋 *الأوامر:* /start · /myalerts · /share · /version\n\n"
@@ -642,6 +663,36 @@ async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("فتح البوت", url=link)],
     ])
     await _reply(update, text, reply_markup=kb)
+
+
+async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعرض أكثر المنتجات طلباً الآن داخل البوت."""
+    from deals_tracker import top_deals
+
+    _track_user(update)
+    deals = top_deals(8)
+    if not deals:
+        await _reply(
+            update,
+            "🔥 ما فيه عروض رائجة مسجّلة للحين.\n"
+            "أرسل رابط أو اسم منتج — وبصير قائمة /deals تتعبّى تلقائياً.",
+            parse_mode=None,
+        )
+        return
+
+    lines = ["🔥 *الأكثر طلباً الآن*\n"]
+    rows = []
+    for i, d in enumerate(deals, 1):
+        title = (d.get("title") or d["asin"])[:50]
+        price = d.get("price") or ""
+        link = build_affiliate_link(d["asin"], d.get("domain") or AMAZON_DOMAIN)
+        lines.append(f"*{i}.* {title}")
+        if price:
+            lines.append(f"   💰 {price}")
+        lines.append("")
+        rows.append([InlineKeyboardButton(f"🛒 {i}. اشتري", url=link)])
+
+    await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def _send_product_offer(
@@ -742,6 +793,18 @@ async def _send_product_offer(
         caption=message,
         reply_markup=kb,
     )
+    try:
+        from deals_tracker import record_deal
+        record_deal(
+            asin=asin,
+            title=str(offer.get("title") or fallback_title or ""),
+            price=str(offer.get("price") or ""),
+            price_val=offer.get("price_val"),
+            domain=domain,
+            image=str(offer.get("image") or ""),
+        )
+    except Exception:
+        pass
     _stat("requests_ok")
 
 
@@ -1443,12 +1506,16 @@ async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     global _GLOBAL_SEM
     _GLOBAL_SEM = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+    loop = asyncio.get_running_loop()
+    pool = _ensure_heavy_pool()
+    loop.set_default_executor(pool)
     logger.info(
-        "🚀 وضع الضغط: HIGH_LOAD=%s | concurrency=%d | rate/user=%d | cache=%d",
+        "🚀 وضع الضغط: HIGH_LOAD=%s | concurrency=%d | rate/user=%d | cache=%d | pool=%d",
         HIGH_LOAD_MODE,
         GLOBAL_CONCURRENCY,
         RATE_MAX_PER_USER,
         OFFER_CACHE_MAX,
+        HEAVY_POOL_SIZE,
     )
     # ملف تيليجرام — وصف قصير + أوامر → ظهور أقوى في البحث
     try:
@@ -1480,35 +1547,65 @@ async def _post_init(application) -> None:
     try:
         import broadcast as _bc
         from dashboard import start_dashboard_server
+        from config import USE_WEBHOOK as _uw
         _bc.set_application(application)
-        asyncio.create_task(_bc.scheduler_loop())
+        _BG_TASKS.append(asyncio.create_task(_bc.scheduler_loop()))
         loop = asyncio.get_running_loop()
-        dash_path = start_dashboard_server(loop)
-        if dash_path:
-            logger.info("🔒 افتح الداشبورد السري على المسار %s (بعد إدخال السر فقط)", dash_path)
+        if _uw:
+            logger.warning("🔒 الداشبورد متوقف مؤقتاً لأن USE_WEBHOOK=true (نفس المنفذ)")
+        else:
+            dash_path = start_dashboard_server(loop)
+            if dash_path:
+                logger.info("🔒 افتح الداشبورد السري على المسار %s (بعد إدخال السر فقط)", dash_path)
     except Exception as e:
         logger.warning("dashboard/broadcast init: %s", e)
 
-    cleared = clear_offer_cache()
-    if cleared:
-        logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
+    cleared = 0
+    if CLEAR_CACHE_ON_BOOT:
+        cleared = clear_offer_cache()
+        if cleared:
+            logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
+    else:
+        logger.info("🧊 الكاش محفوظ بين إعادة التشغيل (CLEAR_CACHE_ON_BOOT=false)")
     try:
-        from serpapi_utils import serpapi_available
+        from serpapi_utils import serpapi_available, serpapi_circuit_status
         if not serpapi_available():
             logger.error(
                 "⚠️ SERPAPI_KEY غير موجود — الاسم/الصورة/السعر قد يضعفون على Railway"
             )
         else:
-            logger.info("✅ SerpAPI جاهز — مسار الاسم والصورة مفعّل")
+            logger.info("✅ SerpAPI جاهز + قاطع دائرة %s", serpapi_circuit_status())
     except Exception as e:
         logger.warning("فحص SerpAPI عند الإقلاع فشل: %s", e)
     logger.info("🛡️ حماية البطاقة: عنوان إلزامي + CDN صورة + TTL قصير للعروض الناقصة")
     _start_stats_server()
-    asyncio.create_task(_memory_cleanup_loop())
-    asyncio.create_task(_health_monitor_loop())
-    asyncio.create_task(_price_alert_check_loop(application))
-    asyncio.create_task(_keep_alive_loop())
-    logger.info("✅ مهام الخلفية بدأت: تنظيف الذاكرة + مراقبة الصحة + تنبيهات الأسعار + keep-alive")
+    for coro in (
+        _memory_cleanup_loop(),
+        _health_monitor_loop(),
+        _price_alert_check_loop(application),
+        _keep_alive_loop(),
+    ):
+        _BG_TASKS.append(asyncio.create_task(coro))
+    logger.info("✅ مهام الخلفية بدأت: تنظيف + صحة + تنبيهات + keep-alive + heavy pool")
+
+
+async def _post_shutdown(application) -> None:
+    """إيقاف نظيف — يلغي المهام ويغلق الـ pools."""
+    logger.info("🛑 إيقاف نظيف...")
+    for t in _BG_TASKS:
+        t.cancel()
+    if _BG_TASKS:
+        await asyncio.gather(*_BG_TASKS, return_exceptions=True)
+    global _HEAVY_POOL
+    if _HEAVY_POOL is not None:
+        _HEAVY_POOL.shutdown(wait=False, cancel_futures=True)
+        _HEAVY_POOL = None
+    try:
+        from http_client import close_http_session
+        close_http_session()
+    except Exception:
+        pass
+    logger.info("🛑 تم الإيقاف")
 
 
 def main():
@@ -1579,12 +1676,14 @@ def main():
         .request(_req_general)
         .get_updates_request(_req_updates)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
 
     app.add_handler(CommandHandler("start",     start_command))
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("share",     share_command))
+    app.add_handler(CommandHandler("deals",     deals_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
     app.add_handler(CommandHandler("debug",     debug_command))
     app.add_handler(CommandHandler("version",   version_command))
@@ -1608,9 +1707,30 @@ def main():
 
     print("🚀 البوت شغّال الآن...")
 
+    import os as _os2
+    _public = (
+        _os2.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or _os2.getenv("RAILWAY_STATIC_URL")
+        or ""
+    ).strip().removeprefix("https://").removeprefix("http://")
+
+    if USE_WEBHOOK and _public:
+        # Webhook أحدث وأسرع من long-polling — يحتاج نطاقاً عاماً
+        wh_url = f"https://{_public}/{WEBHOOK_PATH}"
+        print(f"🌐 Webhook mode → {wh_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=DASHBOARD_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=wh_url,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=False,
+            allowed_updates=Update.ALL_TYPES,
+            bootstrap_retries=-1,
+        )
+        return
+
     # ── طرد أي جلسة polling منافسة (Railway وغيرها) ──────────────────────────
-    # setWebhook يقطع أي polling نشط فوراً، deleteWebhook يعيد الحالة نظيفة.
-    # drop_pending_updates=False ← Telegram يحتفظ بالرسائل خلال الانقطاع ويسلمها عند العودة.
     _kick_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     _dummy    = "https://example.com/kick"
     try:
@@ -1626,11 +1746,14 @@ def main():
     except Exception as _ke:
         print(f"⚠️  تعذّر الطرد: {_ke}")
 
+    if USE_WEBHOOK and not _public:
+        print("⚠️  USE_WEBHOOK=true لكن لا يوجد RAILWAY_PUBLIC_DOMAIN — الرجوع لـ polling")
+
     app.run_polling(
         poll_interval=1.0,
-        timeout=30,                   # long-polling — أقل من read_timeout (40s)
-        bootstrap_retries=-1,         # محاولات لا نهائية وقت الإقلاع — لا يستسلم عند تذبذب الشبكة
-        drop_pending_updates=False,   # ← لا نحذف رسائل — Telegram يحتفظ بها ويسلمها فور عودتنا
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=False,
         allowed_updates=Update.ALL_TYPES,
     )
 

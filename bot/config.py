@@ -146,6 +146,27 @@ SKIP_AI_CHAT_UNDER_LOAD = _env_bool("SKIP_AI_CHAT_UNDER_LOAD", HIGH_LOAD_MODE)
 # عدد المستخدمين النشطين الذي يُفعّل وضع تخفيف الحمل
 LOAD_SHED_ACTIVE_USERS = _env_int("LOAD_SHED_ACTIVE_USERS", 80, minimum=20, maximum=500)
 
+# ── ترقية v6: أداء وموثوقية ────────────────────────────────────────────────
+# TTL كاش العروض (ثوانٍ)
+CACHE_TTL_FULL = _env_int("CACHE_TTL_FULL", 3 * 3600, minimum=60, maximum=24 * 3600)
+CACHE_TTL_WEAK = _env_int("CACHE_TTL_WEAK", 10 * 60, minimum=30, maximum=3600)
+CLEAR_CACHE_ON_BOOT = _env_bool("CLEAR_CACHE_ON_BOOT", False)
+
+# حجم مجمع الخيوط للأعمال الثقيلة (SerpAPI / scrape / LLM)
+HEAVY_POOL_SIZE = _env_int("HEAVY_POOL_SIZE", 24 if HIGH_LOAD_MODE else 12, minimum=4, maximum=64)
+
+# قاطع دائرة SerpAPI
+SERPAPI_CIRCUIT_FAILS = _env_int("SERPAPI_CIRCUIT_FAILS", 5, minimum=2, maximum=30)
+SERPAPI_CIRCUIT_COOLDOWN = _env_int("SERPAPI_CIRCUIT_COOLDOWN", 90, minimum=15, maximum=600)
+
+# سجلات JSON لـ Railway
+JSON_LOGS = _env_bool("JSON_LOGS", True)
+
+# Webhook اختياري (أحدث من long-polling) — يحتاج Public Networking
+USE_WEBHOOK = _env_bool("USE_WEBHOOK", False)
+WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "tgwh").strip().strip("/") or "tgwh"
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+
 # ── داشبورد سري (أكواد الخصم) — لا يُفعَّل بدون سر قوي ─────────────────────
 # مثال: DASHBOARD_SECRET=خيط-طويل-عشوائي-جداً
 DASHBOARD_SECRET = (os.getenv("DASHBOARD_SECRET") or "").strip()

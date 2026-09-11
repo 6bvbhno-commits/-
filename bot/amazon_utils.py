@@ -13,7 +13,14 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
-from config import AFFILIATE_TAG, AMAZON_DOMAIN, OFFER_CACHE_MAX, SCRAPE_CONCURRENCY
+from config import (
+    AFFILIATE_TAG,
+    AMAZON_DOMAIN,
+    OFFER_CACHE_MAX,
+    SCRAPE_CONCURRENCY,
+    CACHE_TTL_FULL,
+    CACHE_TTL_WEAK,
+)
 
 # هل نعمل على Railway؟ — Amazon يحجب scraping من سيرفراتهم
 _ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_NAME"))
@@ -22,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 # ---- كاش الأسعار: ASIN → (timestamp, offer_dict) ----
 _CACHE: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL  = 3 * 60 * 60  # 3 ساعات للعروض الكاملة
-_CACHE_TTL_WEAK = 10 * 60  # 10 دقائق إذا الاسم أو الصورة ناقصين
+_CACHE_TTL  = CACHE_TTL_FULL
+_CACHE_TTL_WEAK = CACHE_TTL_WEAK
 _CACHE_MAX  = OFFER_CACHE_MAX
 _CACHE_LOCK = threading.Lock()
 
@@ -1430,7 +1437,8 @@ def download_image_bytes(url: str, timeout: float = 15.0) -> bytes | None:
         if "amazon" in url.lower() or "ssl-images-amazon" in url.lower() or "media-amazon" in url.lower():
             headers["Referer"] = f"https://www.{AMAZON_DOMAIN}/"
             headers["Origin"] = f"https://www.{AMAZON_DOMAIN}"
-        resp = requests.get(
+        from http_client import get_http_session
+        resp = get_http_session().get(
             url,
             timeout=timeout,
             allow_redirects=True,
@@ -1538,6 +1546,14 @@ def format_product_reply_plain(
     lines = [f"📦 {title}"]
     if price and not offer.get("blocked"):
         lines.append(f"💰 {price}{prime}")
+        # مقارنة مع التاريخ إن وُجدت
+        try:
+            from price_history import price_drop_line
+            drop = price_drop_line(asin, AMAZON_DOMAIN, float(price_val) if price_val else None)
+            if drop:
+                lines.append(drop)
+        except Exception:
+            pass
     elif offer.get("blocked"):
         lines.append("💰 السعر يظهر على أمازون بعد فتح الرابط")
     if seller:

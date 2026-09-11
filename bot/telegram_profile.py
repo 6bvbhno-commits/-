@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # أوامر عربية — تحسّن تجربة القائمة والبحث الداخلي
 _COMMANDS = [
     BotCommand("start", "ابدأ — أرخص أسعار أمازون"),
+    BotCommand("deals", "العروض الأكثر طلباً الآن"),
     BotCommand("help", "طريقة الاستخدام"),
     BotCommand("myalerts", "تنبيهات انخفاض السعر"),
     BotCommand("share", "شارك البوت مع أصحابك"),

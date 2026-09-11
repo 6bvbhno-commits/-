@@ -105,6 +105,39 @@ def record_price(asin: str, domain: str, price_val: float, seller_name: str = ""
 
 # ── الجلب والتحليل ──────────────────────────────────────────────────────────
 
+def get_previous_price(asin: str, domain: str) -> float | None:
+    """آخر سعر مسجّل قبل الأحدث — للمقارنة على بطاقة المنتج."""
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            rows = conn.execute(
+                "SELECT price_val FROM price_history "
+                "WHERE asin=? AND domain=? ORDER BY ts DESC LIMIT 2",
+                (asin, domain),
+            ).fetchall()
+        if len(rows) >= 2:
+            return float(rows[1][0])
+        return None
+    except Exception as e:
+        logger.warning("price_history.get_previous_price: %s", e)
+        return None
+
+
+def price_drop_line(asin: str, domain: str, current: float | None) -> str:
+    """سطر قصير: انخفض / ارتفع مقارنة بآخر تسجيل."""
+    if not current or current <= 0:
+        return ""
+    prev = get_previous_price(asin, domain)
+    if not prev or prev <= 0:
+        return ""
+    if abs(prev - current) < 0.05:
+        return ""
+    if current < prev:
+        saving = prev - current
+        pct = saving / prev * 100
+        return f"📉 كان {prev:.2f} · وفّرت {saving:.2f} ({pct:.0f}%)"
+    return f"📈 كان {prev:.2f} SAR"
+
+
 def get_history(asin: str, domain: str, days: int = 30) -> list[dict]:
     """يُعيد سجلات السعر للأيام الماضية مرتبةً من الأقدم للأحدث."""
     cutoff = int(time.time()) - days * 86400

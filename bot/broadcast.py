@@ -188,7 +188,9 @@ async def send_discount_broadcast(
         }
 
     ok = fail = 0
+    last_cid = 0
     for i, cid in enumerate(chat_ids):
+        last_cid = cid
         try:
             await app.bot.send_message(
                 chat_id=cid,
@@ -231,9 +233,10 @@ async def send_discount_broadcast(
             logger.warning("broadcast fail chat=%s: %s", cid, e)
             fail += 1
 
-        # تهدئة بسيطة لتفادي FloodWait
-        if (i + 1) % 20 == 0:
-            await asyncio.sleep(1.0)
+        # تهدئة + checkpoint كل 25 رسالة
+        if (i + 1) % 25 == 0:
+            _users.set_broadcast_checkpoint(log_id, last_cid, ok, fail)
+            await asyncio.sleep(1.2)
         else:
             await asyncio.sleep(0.05)
 
