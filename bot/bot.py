@@ -46,6 +46,9 @@ from config import (
     WEBHOOK_PATH,
     WEBHOOK_SECRET,
     DASHBOARD_PORT,
+    ADMIN_IDS,
+    DAILY_DIGEST_ENABLED,
+    DAILY_DIGEST_HOUR,
 )
 from logutil import setup_logging
 
@@ -78,7 +81,7 @@ from vision_utils import (
     format_search_results,
 )
 
-BOT_VERSION = "6.0"
+BOT_VERSION = "6.1"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -428,14 +431,15 @@ async def _reply(
     parse_mode: str | None = "Markdown",
     reply_markup=None,
 ) -> None:
-    """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً."""
-    if not update.message:
+    """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً (يدعم callback أيضاً)."""
+    msg = update.effective_message
+    if not msg:
         return
     if len(text) > _MAX_MSG:
         text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة)_"
     for attempt in range(4):
         try:
-            await update.message.reply_text(
+            await msg.reply_text(
                 text, parse_mode=parse_mode, reply_markup=reply_markup
             )
             return
@@ -454,7 +458,7 @@ async def _reply(
             if parse_mode:
                 plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
                 try:
-                    await update.message.reply_text(plain[:_MAX_MSG], reply_markup=reply_markup)
+                    await msg.reply_text(plain[:_MAX_MSG], reply_markup=reply_markup)
                 except TelegramError as e2:
                     logger.error("فشل إرسال الرسالة: %s", e2)
             return
@@ -581,11 +585,28 @@ def _track_user(update: Update) -> None:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
+    """رسالة الترحيب مع إفصاح الأفلييت الإلزامي + أزرار سريعة."""
     try:
         _track_user(update)
         user_id = update.effective_user.id if update.effective_user else 0
-        _user_history[user_id].clear()   # بداية محادثة جديدة
+        _user_history[user_id].clear()
+
+        # deep-link: /start p_ASIN
+        args = context.args or []
+        if args and str(args[0]).startswith("p_") and len(args[0]) >= 12:
+            asin = str(args[0])[2:12].upper()
+            if _re.fullmatch(r"[A-Z0-9]{10}", asin):
+                await _typing(update, context)
+                offer = None
+                try:
+                    loop = asyncio.get_running_loop()
+                    offer = await loop.run_in_executor(
+                        None, lambda: get_lowest_offer(asin, AMAZON_DOMAIN, "")
+                    )
+                except Exception as e:
+                    logger.warning("deep-link offer: %s", e)
+                await _send_product_offer(update, context, asin, AMAZON_DOMAIN, offer, "")
+                return
 
         bot_user = context.bot.username or ""
         share_url = (
@@ -609,7 +630,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if MOCK_MODE:
             welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
 
-        rows = []
+        rows = [
+            [
+                InlineKeyboardButton("🔥 عروض الآن", callback_data="q:deals"),
+                InlineKeyboardButton("🔔 تنبيهاتي", callback_data="q:alerts"),
+            ],
+            [
+                InlineKeyboardButton("🆘 مساعدة", callback_data="q:help"),
+                InlineKeyboardButton("🔕 إيقاف التنبيهات", callback_data="q:mute"),
+            ],
+        ]
         if share_url:
             rows.append([InlineKeyboardButton("📤 شارك البوت", url=share_url)])
         rows.append([InlineKeyboardButton(
@@ -639,6 +669,150 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, help_text)
     except Exception as _e:
         logger.error("help_command فشل: %s", _e, exc_info=True)
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
+
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إيقاف رسائل أكواد الخصم والملخص اليومي."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    import users_db as _users
+    _users.set_opt_out(chat.id, True)
+    await _reply(
+        update,
+        "🔕 تم إيقاف تنبيهات العروض وأكواد الخصم.\n"
+        "تقدر ترجعها بأي وقت: /unmute",
+        parse_mode=None,
+    )
+
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    import users_db as _users
+    _users.set_opt_out(chat.id, False)
+    await _reply(
+        update,
+        "🔔 رجّعنا تنبيهات العروض وأكواد الخصم.\n"
+        "لإيقافها: /mute",
+        parse_mode=None,
+    )
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    للمدير فقط من الجوال:
+      /broadcast كود|عنوان|تفاصيل
+    مثال:
+      /broadcast SAVE20|كود خصم اليوم|على الإلكترونيات حتى منتصف الليل
+    """
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await _reply(update, "⛔ هذا الأمر للمدير فقط.", parse_mode=None)
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw or "|" not in raw:
+        await _reply(
+            update,
+            "📢 الصيغة:\n"
+            "`/broadcast الكود|العنوان|تفاصيل اختيارية`\n\n"
+            "مثال:\n"
+            "`/broadcast SAVE20|كود خصم أمازون|ينتهي الليلة`",
+        )
+        return
+    parts = [p.strip() for p in raw.split("|")]
+    code = parts[0]
+    title = parts[1] if len(parts) > 1 else "كود خصم أمازون اليوم"
+    extra = parts[2] if len(parts) > 2 else ""
+    await _reply(update, f"⏳ جاري إرسال الكود `{code}` للجميع…", parse_mode="Markdown")
+    import broadcast as _bc
+    result = await _bc.send_discount_broadcast(
+        code=code, title=title, extra=extra, when_label="الحين"
+    )
+    if result.get("ok"):
+        await _reply(
+            update,
+            f"✅ تم الإرسال\n"
+            f"نجاح: {result.get('sent_ok', 0)}\n"
+            f"فشل: {result.get('sent_fail', 0)}\n"
+            f"الإجمالي: {result.get('total', 0)}",
+            parse_mode=None,
+        )
+    else:
+        await _reply(update, f"❌ فشل: {result.get('error', 'unknown')}", parse_mode=None)
+
+
+async def handle_quick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أزرار شاشة /start السريعة."""
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    await query.answer()
+
+    # نعيد استخدام نفس Update مع message للرد
+    if data == "q:deals":
+        await deals_command(update, context)
+        return
+    if data == "q:alerts":
+        await myalerts_command(update, context)
+        return
+    if data == "q:help":
+        await help_command(update, context)
+        return
+    if data == "q:mute":
+        chat_id = query.message.chat_id if query.message else 0
+        import users_db as _users
+        _users.set_opt_out(chat_id, True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            await query.message.reply_text(
+                "🔕 تم إيقاف تنبيهات العروض.\nللتفعيل مرة ثانية: /unmute",
+            )
+        return
+    if data == "q:unmute":
+        chat_id = query.message.chat_id if query.message else 0
+        import users_db as _users
+        _users.set_opt_out(chat_id, False)
+        if query.message:
+            await query.message.reply_text("🔔 تم تفعيل تنبيهات العروض من جديد.")
+        return
+
+
+async def handle_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """زر إيقاف التنبيهات من رسائل البث."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    data = query.data or ""
+    chat_id = query.message.chat_id
+    import users_db as _users
+    if data == "bc:mute":
+        _users.set_opt_out(chat_id, True)
+        await query.answer("تم إيقاف التنبيهات", show_alert=False)
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔔 تفعيل التنبيهات", callback_data="bc:unmute")],
+            ]))
+        except Exception:
+            pass
+    elif data == "bc:unmute":
+        _users.set_opt_out(chat_id, False)
+        await query.answer("تم التفعيل", show_alert=False)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    else:
+        await query.answer()
 
 
 async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -737,9 +911,27 @@ async def _send_product_offer(
     price_int = int(float(price_val) * 100) if price_val else 0
     cb_data = f"al:{asin}:{price_int}"
     context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
+
+    bot_user = context.bot.username or ""
+    title_q = _re.sub(r"\s+", " ", str(offer.get("title") or asin)[:80])
+    share_text = f"{title_q}\n{affiliate_url}"
+    from urllib.parse import quote
+    share_url = (
+        f"https://t.me/share/url?url={quote(affiliate_url, safe='')}"
+        f"&text={quote(title_q, safe='')}"
+    )
+    if bot_user:
+        # يفتح البوت مباشرة على المنتج لمن يضغط المشاركة داخل التيليجرام
+        deep = f"https://t.me/{bot_user}?start=p_{asin}"
+        share_url = (
+            f"https://t.me/share/url?url={quote(deep, safe='')}"
+            f"&text={quote(share_text[:180], safe='')}"
+        )
+
     kb = InlineKeyboardMarkup([
         [buy_btn],
         [InlineKeyboardButton(ALERT_BTN_LABEL, callback_data=cb_data)],
+        [InlineKeyboardButton("📤 شارك العرض", url=share_url)],
     ])
 
     message = format_product_reply_plain(
@@ -747,6 +939,7 @@ async def _send_product_offer(
         fallback_title=fallback_title,
         asin=asin,
         version=BOT_VERSION,
+        domain=domain,
     )
     # حماية نهائية: لا تعرض كود ASIN كاسم أبداً
     display_title = (offer.get("title") or "").strip()
@@ -763,6 +956,7 @@ async def _send_product_offer(
             fallback_title=fallback_title,
             asin=asin,
             version=BOT_VERSION,
+            domain=domain,
         )
         logger.error("CARD_GUARD: استُبدل كود/عنوان ضعيف للـ ASIN %s → %s", asin, display_title)
 
@@ -1148,7 +1342,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
     )
-    from serpapi_utils import serpapi_available
+    from serpapi_utils import serpapi_available, serpapi_circuit_status
     from paapi_utils import paapi_available
 
     def _status(val: str) -> str:
@@ -1156,12 +1350,15 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     deepseek_key = get_deepseek_api_key()
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+    circ = serpapi_circuit_status()
 
     msg = (
         f"🔧 *حالة البوت v{BOT_VERSION}*\n\n"
         f"• إصدار الكود: `{BOT_VERSION}`\n"
         f"• خدمة Railway: `{railway_svc}`\n"
         f"• SerpAPI (سعر+صورة): {'✅' if serpapi_available() else '❌'}\n"
+        f"• قاطع SerpAPI: `{'مفتوح ⚡' if circ.get('open') else 'سليم'} "
+        f"({circ.get('cooldown_left', 0)}s)`\n"
         f"• PA API (سعر+صورة): {'✅' if paapi_available() else '❌'}\n"
         f"• DeepSeek (نص): {_status(deepseek_key)}\n"
         f"• Anthropic: {_status(ANTHROPIC_API_KEY)}\n"
@@ -1550,6 +1747,7 @@ async def _post_init(application) -> None:
         from config import USE_WEBHOOK as _uw
         _bc.set_application(application)
         _BG_TASKS.append(asyncio.create_task(_bc.scheduler_loop()))
+        _BG_TASKS.append(asyncio.create_task(_bc.daily_digest_loop()))
         loop = asyncio.get_running_loop()
         if _uw:
             logger.warning("🔒 الداشبورد متوقف مؤقتاً لأن USE_WEBHOOK=true (نفس المنفذ)")
@@ -1685,9 +1883,14 @@ def main():
     app.add_handler(CommandHandler("share",     share_command))
     app.add_handler(CommandHandler("deals",     deals_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
+    app.add_handler(CommandHandler("mute",      mute_command))
+    app.add_handler(CommandHandler("unmute",    unmute_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("debug",     debug_command))
     app.add_handler(CommandHandler("version",   version_command))
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
+    app.add_handler(CallbackQueryHandler(handle_quick_callback, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(handle_mute_callback, pattern=r"^bc:"))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_unsupported_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_unsupported_photo))

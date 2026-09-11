@@ -147,12 +147,7 @@ async def send_discount_broadcast(
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🛒 تسوّق الآن على أمازون ↗", url=url)],
-            [
-                InlineKeyboardButton(
-                    "📋 انسخ الفكرة: افتح أمازون والصق الكود",
-                    url=url,
-                )
-            ],
+            [InlineKeyboardButton("🔕 إيقاف تنبيهات العروض", callback_data="bc:mute")],
         ]
     )
 
@@ -253,6 +248,109 @@ async def send_discount_broadcast(
         "button_url": url,
         "log_id": log_id,
     }
+
+
+async def send_daily_digest() -> dict:
+    """ملخص يومي: أكثر المنتجات طلباً + زر تسوق + إيقاف تنبيهات."""
+    app = _app_ref
+    if app is None:
+        return {"ok": False, "error": "البوت غير جاهز"}
+
+    try:
+        from deals_tracker import top_deals
+        deals = top_deals(5)
+    except Exception:
+        deals = []
+
+    if not deals:
+        logger.info("daily_digest: لا عروض — تخطّي")
+        return {"ok": True, "skipped": True, "total": 0}
+
+    lines = [
+        "🌙 *ملخص عروض اليوم*",
+        "",
+        "أكثر المنتجات بحثاً عند المستخدمين الحين:",
+        "",
+    ]
+    buttons = []
+    for i, d in enumerate(deals, 1):
+        title = (d.get("title") or d["asin"])[:55]
+        price = d.get("price") or ""
+        domain = d.get("domain") or AMAZON_DOMAIN
+        from amazon_utils import build_affiliate_link
+        link = build_affiliate_link(d["asin"], domain)
+        lines.append(f"*{i}.* {title}")
+        if price:
+            lines.append(f"   💰 {price}")
+        lines.append("")
+        buttons.append([InlineKeyboardButton(f"🛒 {i}. اشتري", url=link)])
+
+    lines.append("_أرسال رابط أي منتج عشان أقارن لك السعر._")
+    buttons.append([InlineKeyboardButton("🔕 إيقاف هذه الرسائل", callback_data="bc:mute")])
+    kb = InlineKeyboardMarkup(buttons)
+    message = "\n".join(lines)
+
+    chat_ids = _users.get_broadcast_chat_ids()
+    total = len(chat_ids)
+    log_id = _users.log_broadcast(
+        kind="daily_digest",
+        code="",
+        message=message,
+        scheduled_for=None,
+        status="sending",
+        total=total,
+    )
+    if total == 0:
+        _users.update_broadcast_log(log_id, status="empty", total=0)
+        return {"ok": False, "error": "لا مستخدمين", "total": 0}
+
+    ok = fail = 0
+    for i, cid in enumerate(chat_ids):
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=message,
+                parse_mode="Markdown",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            ok += 1
+        except Forbidden:
+            _users.mark_blocked(cid)
+            fail += 1
+        except Exception:
+            fail += 1
+        if (i + 1) % 25 == 0:
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.05)
+
+    _users.update_broadcast_log(log_id, status="done", sent_ok=ok, sent_fail=fail, total=total)
+    logger.info("🌙 daily_digest done ok=%d fail=%d", ok, fail)
+    return {"ok": True, "sent_ok": ok, "sent_fail": fail, "total": total}
+
+
+async def daily_digest_loop() -> None:
+    """يرسل ملخص يومي مرة واحدة يومياً عند الساعة المحددة بتوقيت الرياض."""
+    from config import DAILY_DIGEST_ENABLED, DAILY_DIGEST_HOUR
+    if not DAILY_DIGEST_ENABLED:
+        logger.info("daily_digest: معطّل عبر الإعدادات")
+        return
+    logger.info("🌙 daily_digest loop بدأ (ساعة %02d:00 الرياض)", DAILY_DIGEST_HOUR)
+    last_day = ""
+    while True:
+        try:
+            now = riyadh_now()
+            day_key = now.strftime("%Y-%m-%d")
+            if now.hour == DAILY_DIGEST_HOUR and now.minute < 5 and last_day != day_key:
+                last_day = day_key
+                await send_daily_digest()
+                await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("daily_digest_loop: %s", e)
+        await asyncio.sleep(30)
 
 
 async def schedule_discount_broadcast(

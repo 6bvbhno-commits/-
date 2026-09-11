@@ -1521,8 +1521,9 @@ def format_product_reply_plain(
     fallback_title: str = "",
     asin: str = "",
     version: str = "",
+    domain: str = "",
 ) -> str:
-    """بطاقة منتج قصيرة تحت الصورة — مع السعر إن وُجد."""
+    """بطاقة منتج قصيرة تحت الصورة — مع السعر ونسبة الخصم إن وُجدت."""
     _ = version
     if not offer:
         return "❌ ما لقيت المنتج — جرّب رابط ثاني."
@@ -1542,14 +1543,25 @@ def format_product_reply_plain(
 
     seller = (offer.get("seller_name") or "").strip()
     prime = " · ⭐ Prime" if offer.get("is_prime") else ""
+    use_domain = (domain or offer.get("domain") or AMAZON_DOMAIN).strip()
 
     lines = [f"📦 {title}"]
+
+    # شارة خصم من سعر القائمة إن وُجد
+    list_val = offer.get("list_price_val") or offer.get("was_price_val")
+    try:
+        if price_val and list_val and float(list_val) > float(price_val) * 1.02:
+            pct = (float(list_val) - float(price_val)) / float(list_val) * 100
+            if pct >= 3:
+                lines.append(f"🔥 خصم {pct:.0f}% — كان {float(list_val):.2f}")
+    except (TypeError, ValueError):
+        pass
+
     if price and not offer.get("blocked"):
         lines.append(f"💰 {price}{prime}")
-        # مقارنة مع التاريخ إن وُجدت
         try:
             from price_history import price_drop_line
-            drop = price_drop_line(asin, AMAZON_DOMAIN, float(price_val) if price_val else None)
+            drop = price_drop_line(asin, use_domain, float(price_val) if price_val else None)
             if drop:
                 lines.append(drop)
         except Exception:

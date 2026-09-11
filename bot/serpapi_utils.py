@@ -338,6 +338,21 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
         if best_text and best_val is not None and currency not in best_text:
             best_text = f"{best_val:.2f} {currency}"
 
+        # سعر القائمة / قبل الخصم — لشارة الخصم على البطاقة
+        list_val = None
+        for key in ("list_price", "rrp", "typical_price", "price_upper"):
+            lv, _ = _parse_price(product.get(key))
+            if lv and (best_val is None or lv > best_val):
+                list_val = lv
+                break
+        if list_val is None:
+            # بعض الردود تضع الخصم كنسبة
+            save = product.get("savings") or product.get("discount")
+            if isinstance(save, dict):
+                lv, _ = _parse_price(save.get("amount") or save.get("price"))
+                if lv and best_val:
+                    list_val = best_val + lv
+
         # إذا ما فيه اسم/صورة — جرّب البحث بالـ ASIN
         if not title or not image:
             fb = _search_fallback_by_asin(asin, domain)
@@ -367,6 +382,7 @@ def get_item_by_asin(asin: str, domain: str = AMAZON_DOMAIN) -> dict | None:
             "description":    description,
             "price":          best_text,
             "price_val":      best_val,
+            "list_price_val": list_val,
             "currency":       currency,
             "seller_name":    best_seller or "Amazon.sa",
             "condition":      "جديد",

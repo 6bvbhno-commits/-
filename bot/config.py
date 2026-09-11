@@ -174,3 +174,14 @@ DASHBOARD_SECRET = (os.getenv("DASHBOARD_SECRET") or "").strip()
 DASHBOARD_PATH = (os.getenv("DASHBOARD_PATH") or "").strip().strip("/")
 # منفذ الداشبورد (Railway يستخدم PORT عادةً)
 DASHBOARD_PORT = _env_int("PORT", _env_int("DASHBOARD_PORT", 8080, minimum=1, maximum=65535), minimum=1, maximum=65535)
+
+# ── إدارة من تيليجرام ─────────────────────────────────────────────────────────
+# أرقام تيليجرام للمدراء (مفصولة بفاصلة) — لتفعيل /broadcast من الجوال
+ADMIN_IDS: set[int] = set()
+for _part in (os.getenv("ADMIN_IDS") or "").replace(" ", "").split(","):
+    if _part.isdigit():
+        ADMIN_IDS.add(int(_part))
+
+# ملخص يومي تلقائي الساعة 21:00 بتوقيت الرياض
+DAILY_DIGEST_ENABLED = _env_bool("DAILY_DIGEST_ENABLED", True)
+DAILY_DIGEST_HOUR = _env_int("DAILY_DIGEST_HOUR", 21, minimum=0, maximum=23)
