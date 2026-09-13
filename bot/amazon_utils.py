@@ -1560,10 +1560,13 @@ def format_product_reply_plain(
     if price and not offer.get("blocked"):
         lines.append(f"💰 {price}{prime}")
         try:
-            from price_history import price_drop_line
+            from price_history import price_drop_line, format_sparkline_plain
             drop = price_drop_line(asin, use_domain, float(price_val) if price_val else None)
             if drop:
                 lines.append(drop)
+            spark = format_sparkline_plain(asin, use_domain)
+            if spark:
+                lines.append(spark)
         except Exception:
             pass
     elif offer.get("blocked"):

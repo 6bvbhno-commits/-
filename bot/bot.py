@@ -79,9 +79,10 @@ from amazon_utils import _clean_product_title  # حماية عنوان البط�
 from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
+    identify_product_from_image,
 )
 
-BOT_VERSION = "6.1"
+BOT_VERSION = "6.2"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -660,6 +661,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 🔗 *رابط أمازون / متجر* ← صورة + أقل سعر + زر شراء\n"
             "• 💬 *اسم منتج* ← بحث فوري\n"
             f"• 🔥 /deals ← الأكثر طلباً الآن\n"
+            f"• ⚖️ /compare رابط1 رابط2 ← مقارنة سعر\n"
+            f"• ⭐ /fav ← مفضلتك\n"
+            f"• 📸 أرسل *صورة منتج* ← أتعرف عليه وأبحث\n"
             f"• 🔎 اكتب `@{bot_user}` في أي شات وابحث\n"
             f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n\n"
             "📋 *الأوامر:* /start · /myalerts · /share · /version\n\n"
@@ -869,6 +873,195 @@ async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
+def _parse_asin_or_link(token: str) -> tuple[str | None, str]:
+    """يستخرج ASIN والنطاق من رابط أو كود ASIN خام."""
+    token = (token or "").strip().rstrip(".,;:!?)\"}'")
+    if not token:
+        return None, AMAZON_DOMAIN
+    if _re.fullmatch(r"[A-Za-z0-9]{10}", token):
+        return token.upper(), AMAZON_DOMAIN
+    asin = extract_asin(token)
+    domain = extract_domain(token) if is_amazon_url(token) else AMAZON_DOMAIN
+    return asin, domain or AMAZON_DOMAIN
+
+
+async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مقارنة منتجين: /compare رابط1 رابط2 أو ASIN1 ASIN2"""
+    _track_user(update)
+    args = context.args or []
+    text = update.effective_message.text if update.effective_message else ""
+    if len(args) < 2:
+        # حاول التقاط رابطين من النص
+        urls = _re.findall(r"https?://\S+", text or "")
+        if len(urls) >= 2:
+            args = urls[:2]
+        else:
+            await _reply(
+                update,
+                "⚖️ *المقارنة*\n\n"
+                "أرسل:\n"
+                "`/compare رابط1 رابط2`\n"
+                "أو:\n"
+                "`/compare ASIN1 ASIN2`\n\n"
+                "مثال:\n"
+                "`/compare B0XXXXXXX1 B0XXXXXXX2`",
+            )
+            return
+
+    a1, d1 = _parse_asin_or_link(args[0])
+    a2, d2 = _parse_asin_or_link(args[1])
+    if not a1 or not a2:
+        await _reply(update, "⚠️ ما قدرت أقرأ المنتجين. أرسل رابطين أو كودين ASIN.", parse_mode=None)
+        return
+
+    await _typing(update, context)
+    loop = asyncio.get_running_loop()
+
+    async with _HeavySlot() as got:
+        if not got:
+            await _reply(update, "⏳ البوت مشغول — حاول بعد ثوانٍ.", parse_mode=None)
+            return
+        try:
+            o1, o2 = await asyncio.wait_for(
+                asyncio.gather(
+                    loop.run_in_executor(None, lambda: get_lowest_offer(a1, d1, "")),
+                    loop.run_in_executor(None, lambda: get_lowest_offer(a2, d2, "")),
+                ),
+                timeout=30.0,
+            )
+        except Exception as e:
+            logger.warning("compare failed: %s", e)
+            await _reply(update, "❌ فشلت المقارنة. حاول مرة ثانية.", parse_mode=None)
+            return
+
+    def _row(label: str, offer: dict | None, asin: str) -> tuple[str, float | None, str]:
+        if not offer:
+            return f"• {label}: غير متاح", None, build_affiliate_link(asin, AMAZON_DOMAIN)
+        title = (offer.get("title") or asin)[:45]
+        price = offer.get("price") or "—"
+        pval = offer.get("price_val")
+        link = offer.get("affiliate_link") or build_affiliate_link(asin, offer.get("domain") or AMAZON_DOMAIN)
+        return f"• *{label}:* {title}\n  💰 {price}", pval, link
+
+    l1, p1, u1 = _row("أ", o1, a1)
+    l2, p2, u2 = _row("ب", o2, a2)
+    verdict = ""
+    if p1 and p2:
+        if p1 < p2:
+            verdict = f"\n✅ الأرخص: *أ* بفرق `{p2 - p1:.2f}` SAR"
+        elif p2 < p1:
+            verdict = f"\n✅ الأرخص: *ب* بفرق `{p1 - p2:.2f}` SAR"
+        else:
+            verdict = "\n⚖️ نفس السعر تقريباً"
+
+    msg = f"⚖️ *مقارنة سريعة*\n\n{l1}\n\n{l2}{verdict}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 اشتري أ", url=u1), InlineKeyboardButton("🛒 اشتري ب", url=u2)],
+    ])
+    await _reply(update, msg, reply_markup=kb)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إحصاءات سريعة للمدير فقط."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await _reply(update, "⛔ هذا الأمر للمدير فقط.", parse_mode=None)
+        return
+    import users_db as _users
+    from deals_tracker import top_deals
+    uc = _users.count_users()
+    try:
+        from serpapi_utils import serpapi_circuit_status
+        circ = serpapi_circuit_status()
+    except Exception:
+        circ = {}
+    deals = top_deals(3)
+    deals_txt = "\n".join(
+        f"  {i}. {(d.get('title') or d['asin'])[:40]}" for i, d in enumerate(deals, 1)
+    ) or "  —"
+    msg = (
+        f"📊 *إحصاءات البوت v{BOT_VERSION}*\n\n"
+        f"• مستخدمون: `{uc.get('total', 0)}` (نشط بث: `{uc.get('active', 0)}`)\n"
+        f"• طلبات: `{_stats.get('requests_total', 0)}` · ✅ `{_stats.get('requests_ok', 0)}` · ❌ `{_stats.get('requests_error', 0)}`\n"
+        f"• صور: ✅ `{_stats.get('photo_ok', 0)}` · ❌ `{_stats.get('photo_miss', 0)}`\n"
+        f"• تخفيف حمل: `{_stats.get('load_shed', 0)}` · FloodWait: `{_stats.get('flood_waits', 0)}`\n"
+        f"• قاطع SerpAPI: `{'مفتوح' if circ.get('open') else 'سليم'}`\n"
+        f"• نشطون الآن: `{len(_user_last_seen)}`\n\n"
+        f"🔥 الأكثر طلباً:\n{deals_txt}"
+    )
+    await _reply(update, msg)
+
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """عرض المفضلة /fav"""
+    import users_db as _users
+    from amazon_utils import build_affiliate_link as _bal
+
+    _track_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    items = _users.list_favorites(uid)
+    if not items:
+        await _reply(
+            update,
+            "⭐ ما عندك منتجات بالمفضلة.\n"
+            "افتح أي منتج واضغط «⭐ للمفضلة».",
+            parse_mode=None,
+        )
+        return
+    lines = [f"⭐ *مفضلتك ({len(items)}/20)*\n"]
+    rows = []
+    for i, it in enumerate(items, 1):
+        title = (it.get("title") or it["asin"])[:45]
+        price = it.get("price") or ""
+        lines.append(f"*{i}.* {title}")
+        if price:
+            lines.append(f"   💰 {price}")
+        lines.append("")
+        link = _bal(it["asin"], it.get("domain") or AMAZON_DOMAIN)
+        rows.append([
+            InlineKeyboardButton(f"🛒 {i}", url=link),
+            InlineKeyboardButton("🗑️", callback_data=f"favdel:{it['asin']}"),
+        ])
+    await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def handle_fav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إضافة/حذف من المفضلة."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    data = query.data or ""
+    uid = query.from_user.id if query.from_user else 0
+    import users_db as _users
+
+    if data.startswith("favdel:"):
+        asin = data.split(":", 1)[1].upper()
+        _users.remove_favorite(uid, asin)
+        await query.answer("تم الحذف من المفضلة", show_alert=False)
+        # أعد رسم القائمة
+        fake = update
+        await favorites_command(fake, context)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if data.startswith("fav:"):
+        asin = data.split(":", 1)[1].upper()
+        domain = (context.user_data or {}).get(f"pdomain_{asin}", AMAZON_DOMAIN)
+        title = (context.user_data or {}).get(f"ptitle_{asin}", asin)
+        result = _users.add_favorite(uid, asin, domain=domain, title=title)
+        if result == "limit":
+            await query.answer("وصلت للحد 20 — احذف من /fav", show_alert=True)
+        elif result in ("added", "updated"):
+            await query.answer("⭐ تمت الإضافة للمفضلة", show_alert=False)
+        else:
+            await query.answer("فشل الحفظ", show_alert=True)
+        return
+    await query.answer()
+
+
 async def _send_product_offer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -928,10 +1121,14 @@ async def _send_product_offer(
             f"&text={quote(share_text[:180], safe='')}"
         )
 
+    fav_cb = f"fav:{asin}"
     kb = InlineKeyboardMarkup([
         [buy_btn],
         [InlineKeyboardButton(ALERT_BTN_LABEL, callback_data=cb_data)],
-        [InlineKeyboardButton("📤 شارك العرض", url=share_url)],
+        [
+            InlineKeyboardButton("⭐ للمفضلة", callback_data=fav_cb),
+            InlineKeyboardButton("📤 شارك", url=share_url),
+        ],
     ])
 
     message = format_product_reply_plain(
@@ -1541,15 +1738,55 @@ async def _price_alert_check_loop(app) -> None:
         await asyncio.sleep(1800)   # كل 30 دقيقة
 
 
-async def handle_unsupported_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يرفض الصور ويوجّه المستخدم للرابط أو اسم المنتج."""
-    if not update.message:
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صورة منتج → تعرّف بالرؤية → بحث أمازون."""
+    if not update.message or not update.message.photo:
         return
-    await _reply(
-        update,
-        "📸 أرسل *رابط منتج أمازون* — أجيبك بالصورة والسعر والأزرار فوراً.",
-        parse_mode=None,
-    )
+
+    _track_user(update)
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _is_rate_limited(user_id):
+        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
+        return
+
+    await _typing(update, context)
+    await _reply(update, "📸 جاري التعرف على المنتج من الصورة…", parse_mode=None)
+
+    photo = update.message.photo[-1]
+    loop = asyncio.get_running_loop()
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        bio = BytesIO()
+        await tg_file.download_to_memory(bio)
+        image_bytes = bio.getvalue()
+    except Exception as e:
+        logger.warning("photo download: %s", e)
+        await _reply(update, "⚠️ ما قدرت أحمّل الصورة. أرسل رابط المنتج بدلها.", parse_mode=None)
+        return
+
+    async with _HeavySlot() as got:
+        if not got:
+            await _reply(update, "⏳ البوت مشغول — حاول بعد لحظات.", parse_mode=None)
+            return
+        try:
+            name = await asyncio.wait_for(
+                loop.run_in_executor(None, identify_product_from_image, image_bytes),
+                timeout=35.0,
+            )
+        except Exception as e:
+            logger.warning("vision identify: %s", e)
+            name = None
+
+    if not name:
+        await _reply(
+            update,
+            "🤔 ما تعرّفت على المنتج بوضوح.\n"
+            "جرّب صورة أوضح أو أرسل *رابط أمازون* / *اسم المنتج*.",
+        )
+        return
+
+    await _reply(update, f"🔎 لقيته شكله: *{name[:80]}*\nجاري البحث في أمازون…")
+    await _search_and_deliver_product(update, context, name)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1882,6 +2119,10 @@ def main():
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("share",     share_command))
     app.add_handler(CommandHandler("deals",     deals_command))
+    app.add_handler(CommandHandler("compare",   compare_command))
+    app.add_handler(CommandHandler("fav",       favorites_command))
+    app.add_handler(CommandHandler("favorites", favorites_command))
+    app.add_handler(CommandHandler("stats",     stats_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
     app.add_handler(CommandHandler("mute",      mute_command))
     app.add_handler(CommandHandler("unmute",    unmute_command))
@@ -1891,9 +2132,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
     app.add_handler(CallbackQueryHandler(handle_quick_callback, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(handle_mute_callback, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_callback, pattern=r"^fav"))
     app.add_handler(InlineQueryHandler(inline_query_handler))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_unsupported_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_unsupported_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,

@@ -59,6 +59,23 @@ def _init() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wishlist (
+                user_id     INTEGER NOT NULL,
+                asin        TEXT    NOT NULL,
+                domain      TEXT    NOT NULL DEFAULT 'amazon.sa',
+                title       TEXT,
+                price       TEXT,
+                price_val   REAL,
+                added_at    INTEGER NOT NULL,
+                PRIMARY KEY (user_id, asin)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wishlist_user ON wishlist(user_id, added_at DESC)"
+        )
 
 
 try:
@@ -284,4 +301,118 @@ def recent_broadcasts(limit: int = 10) -> list[dict]:
         ]
     except Exception as e:
         logger.warning("users_db.recent_broadcasts: %s", e)
+        return []
+
+
+def _ensure_wishlist() -> None:
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wishlist (
+                    user_id     INTEGER NOT NULL,
+                    asin        TEXT    NOT NULL,
+                    domain      TEXT    NOT NULL DEFAULT 'amazon.sa',
+                    title       TEXT,
+                    price       TEXT,
+                    price_val   REAL,
+                    added_at    INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, asin)
+                )
+                """
+            )
+    except Exception as e:
+        logger.warning("users_db._ensure_wishlist: %s", e)
+
+
+def add_favorite(
+    user_id: int,
+    asin: str,
+    *,
+    domain: str = "amazon.sa",
+    title: str = "",
+    price: str = "",
+    price_val: float | None = None,
+) -> str:
+    """يضيف للمفضلة. يرجع: added | updated | limit | error"""
+    _ensure_wishlist()
+    asin = (asin or "").upper().strip()
+    if not user_id or not asin:
+        return "error"
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM wishlist WHERE user_id=?", (user_id,)
+            ).fetchone()[0]
+            exists = conn.execute(
+                "SELECT 1 FROM wishlist WHERE user_id=? AND asin=?",
+                (user_id, asin),
+            ).fetchone()
+            if not exists and count >= 20:
+                return "limit"
+            conn.execute(
+                """
+                INSERT INTO wishlist (user_id, asin, domain, title, price, price_val, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, asin) DO UPDATE SET
+                    title=excluded.title,
+                    price=excluded.price,
+                    price_val=excluded.price_val,
+                    domain=excluded.domain,
+                    added_at=excluded.added_at
+                """,
+                (
+                    user_id,
+                    asin,
+                    domain or "amazon.sa",
+                    (title or "")[:120],
+                    (price or "")[:40],
+                    price_val,
+                    int(time.time()),
+                ),
+            )
+        return "updated" if exists else "added"
+    except Exception as e:
+        logger.warning("users_db.add_favorite: %s", e)
+        return "error"
+
+
+def remove_favorite(user_id: int, asin: str) -> bool:
+    _ensure_wishlist()
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM wishlist WHERE user_id=? AND asin=?",
+                (user_id, (asin or "").upper().strip()),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.warning("users_db.remove_favorite: %s", e)
+        return False
+
+
+def list_favorites(user_id: int) -> list[dict]:
+    _ensure_wishlist()
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT asin, domain, title, price, price_val, added_at
+                FROM wishlist WHERE user_id=? ORDER BY added_at DESC LIMIT 20
+                """,
+                (user_id,),
+            ).fetchall()
+        return [
+            {
+                "asin": r[0],
+                "domain": r[1],
+                "title": r[2],
+                "price": r[3],
+                "price_val": r[4],
+                "added_at": r[5],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning("users_db.list_favorites: %s", e)
         return []

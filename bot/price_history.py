@@ -186,6 +186,24 @@ def _trend_arrow(prices: list[float]) -> str:
 
 # ── الرسالة الجاهزة ─────────────────────────────────────────────────────────
 
+def format_sparkline_plain(asin: str, domain: str) -> str:
+    """سطر رسم بياني قصير بدون Markdown — مناسب لكابشن الصورة."""
+    records = get_history(asin, domain, days=60)
+    if len(records) < 3:
+        return ""
+    prices = [float(r["price_val"]) for r in records if r.get("price_val")]
+    if len(prices) < 3:
+        return ""
+    spark = _sparkline(prices)
+    lo, hi = min(prices), max(prices)
+    trend = _trend_arrow(prices)
+    parts = [f"📊 {spark}"]
+    parts.append(f"أدنى {lo:.0f} · أعلى {hi:.0f}")
+    if trend:
+        parts.append(trend)
+    return " · ".join(parts)
+
+
 def format_history_message(asin: str, domain: str) -> str:
     """
     يُعيد قسم تاريخ السعر جاهزاً للإلحاق برسالة تيليجرام.

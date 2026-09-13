@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 _COMMANDS = [
     BotCommand("start", "ابدأ — أرخص أسعار أمازون"),
     BotCommand("deals", "العروض الأكثر طلباً الآن"),
+    BotCommand("compare", "قارن بين منتجين"),
+    BotCommand("fav", "مفضلتك المحفوظة"),
     BotCommand("help", "طريقة الاستخدام"),
     BotCommand("myalerts", "تنبيهات انخفاض السعر"),
     BotCommand("mute", "إيقاف رسائل العروض"),
