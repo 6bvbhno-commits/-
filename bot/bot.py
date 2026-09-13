@@ -1,6 +1,6 @@
 """
 البوت الرئيسي — يستقبل روابط منتجات وصور، ويرد بأقل سعر أو حالة التوفر.
-يستخدم مكتبة python-telegram-bot (الإصدار 20+) + Claude AI.
+يستخدم مكتبة python-telegram-bot (الإصدار 20+) + أحدث طبقات الأداء (v6).
 """
 import asyncio
 import json as _json
@@ -8,6 +8,7 @@ import logging
 import re as _re
 import threading as _threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 import requests as _req
 from collections import defaultdict
 from io import BytesIO
@@ -20,15 +21,42 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    InlineQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
 import price_alerts as _pa
-from config import TELEGRAM_BOT_TOKEN, MOCK_MODE, AMAZON_DOMAIN, AFFILIATE_TAG
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    MOCK_MODE,
+    AMAZON_DOMAIN,
+    AFFILIATE_TAG,
+    GLOBAL_CONCURRENCY,
+    RATE_MAX_PER_USER,
+    SKIP_AI_CHAT_UNDER_LOAD,
+    LOAD_SHED_ACTIVE_USERS,
+    HIGH_LOAD_MODE,
+    OFFER_CACHE_MAX,
+    CLEAR_CACHE_ON_BOOT,
+    HEAVY_POOL_SIZE,
+    JSON_LOGS,
+    USE_WEBHOOK,
+    WEBHOOK_PATH,
+    WEBHOOK_SECRET,
+    DASHBOARD_PORT,
+    ADMIN_IDS,
+    DAILY_DIGEST_ENABLED,
+    DAILY_DIGEST_HOUR,
+)
+from logutil import setup_logging
+
+setup_logging(json_logs=JSON_LOGS)
 from amazon_utils import (
     build_affiliate_link,
+    build_affiliate_search_link,
+    build_affiliate_store_link,
     build_product_image_url,
     clear_offer_cache,
     download_image_bytes,
@@ -37,37 +65,52 @@ from amazon_utils import (
     extract_domain,
     extract_product_title,
     fetch_product_image_bytes,
+    get_affiliate_tag,
+    is_amazon_store_url,
+    is_amazon_url,
     resolve_short_link,
     get_lowest_offer,
     format_offer_message,
     format_product_reply_plain,
+    tag_amazon_url,
+    url_has_our_tag,
 )
 from amazon_utils import _clean_product_title  # حماية عنوان البطاقة
 from vision_utils import (
     search_amazon_by_keywords,
     format_search_results,
+    identify_product_from_image,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-BOT_VERSION = "3.9"
+BOT_VERSION = "6.2"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 _RATE_WINDOW = 60
-_RATE_MAX    = 30   # رُفع من 20 → 30 لاستيعاب ضغط الحملات التسويقية
+_RATE_MAX    = RATE_MAX_PER_USER
 
 # ─── Global backpressure — يحد الطلبات الثقيلة المتزامنة (LLM + scraping) ──
 # يُهيَّأ في _post_init بعد بدء event loop
 _GLOBAL_SEM: asyncio.Semaphore | None = None
+_HEAVY_POOL: ThreadPoolExecutor | None = None
+_BG_TASKS: list[asyncio.Task] = []
 _user_times: dict[int, list[float]] = defaultdict(list)
 _user_last_seen: dict[int, float]   = {}   # آخر نشاط — للتنظيف الدوري
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_heavy_pool() -> ThreadPoolExecutor:
+    global _HEAVY_POOL
+    if _HEAVY_POOL is None:
+        _HEAVY_POOL = ThreadPoolExecutor(
+            max_workers=HEAVY_POOL_SIZE,
+            thread_name_prefix="heavy",
+        )
+        logging.getLogger(__name__).info("🧵 heavy pool size=%d", HEAVY_POOL_SIZE)
+    return _HEAVY_POOL
 
 def _is_rate_limited(user_id: int) -> bool:
     now  = _time.monotonic()
@@ -78,6 +121,37 @@ def _is_rate_limited(user_id: int) -> bool:
         return True
     buf.append(now)
     return False
+
+
+def _is_under_load() -> bool:
+    """هل عدد المستخدمين النشطين يستدعي تخفيف الحمل؟"""
+    return len(_user_last_seen) >= LOAD_SHED_ACTIVE_USERS
+
+
+class _HeavySlot:
+    """مدير خانة طلب ثقيل — يرفض بسرعة إذا كان النظام ممتلئاً."""
+
+    __slots__ = ("_acquired",)
+
+    def __init__(self) -> None:
+        self._acquired = False
+
+    async def __aenter__(self) -> bool:
+        sem = _GLOBAL_SEM
+        if sem is None:
+            self._acquired = True
+            return True
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=2.0)
+            self._acquired = True
+            return True
+        except asyncio.TimeoutError:
+            _stat("load_shed")
+            return False
+
+    async def __aexit__(self, *_args) -> None:
+        if self._acquired and _GLOBAL_SEM is not None:
+            _GLOBAL_SEM.release()
 
 # ─── سجل المحادثات لكل مستخدم (آخر 8 رسائل للسياق) ─────────────────────────
 _MAX_HISTORY = 8
@@ -102,6 +176,8 @@ _stats: dict = {
     "photo_ok":       0,
     "photo_miss":     0,
     "title_fallback": 0,
+    "load_shed":      0,
+    "coalesce_waits": 0,
     "last_request_ts": 0.0,
 }
 
@@ -112,11 +188,16 @@ class _StatsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/stats":
             payload = _json.dumps({
+                "version":        BOT_VERSION,
+                "high_load_mode": HIGH_LOAD_MODE,
                 "active_users":   len(_user_last_seen),
+                "global_concurrency": GLOBAL_CONCURRENCY,
+                "rate_max_per_user":  _RATE_MAX,
                 "requests_total": _stats.get("requests_total", 0),
                 "requests_ok":    _stats.get("requests_ok",    0),
                 "requests_error": _stats.get("requests_error", 0),
                 "flood_waits":    _stats.get("flood_waits",    0),
+                "load_shed":      _stats.get("load_shed",      0),
                 "photo_ok":       _stats.get("photo_ok", 0),
                 "photo_miss":     _stats.get("photo_miss", 0),
                 "title_fallback": _stats.get("title_fallback", 0),
@@ -266,7 +347,14 @@ async def _search_and_deliver_product(
     await _typing(update, context)
     loop = asyncio.get_running_loop()
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            await _reply(
+                update,
+                "⏳ البوت مشغول بطلبات كثيرة الآن. انتظر ثوانٍ وحاول مرة أخرى.",
+                parse_mode=None,
+            )
+            return
         try:
             offers = await asyncio.wait_for(
                 loop.run_in_executor(None, search_amazon_by_keywords, product_query),
@@ -344,14 +432,15 @@ async def _reply(
     parse_mode: str | None = "Markdown",
     reply_markup=None,
 ) -> None:
-    """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً."""
-    if not update.message:
+    """يرسل رسالة — يعالج FloodWait وMarkdown تلقائياً (يدعم callback أيضاً)."""
+    msg = update.effective_message
+    if not msg:
         return
     if len(text) > _MAX_MSG:
         text = text[: _MAX_MSG - 60] + "\n\n_…(تم اختصار الرسالة)_"
     for attempt in range(4):
         try:
-            await update.message.reply_text(
+            await msg.reply_text(
                 text, parse_mode=parse_mode, reply_markup=reply_markup
             )
             return
@@ -370,7 +459,7 @@ async def _reply(
             if parse_mode:
                 plain = text.replace("*","").replace("`","").replace("_","").replace("\\","")
                 try:
-                    await update.message.reply_text(plain[:_MAX_MSG], reply_markup=reply_markup)
+                    await msg.reply_text(plain[:_MAX_MSG], reply_markup=reply_markup)
                 except TelegramError as e2:
                     logger.error("فشل إرسال الرسالة: %s", e2)
             return
@@ -478,42 +567,499 @@ async def _reply_photo(
 # المعالجات
 # =============================================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """رسالة الترحيب مع إفصاح الأفلييت الإلزامي."""
+def _track_user(update: Update) -> None:
+    """يسجّل المستخدم لاستقبال تنبيهات أكواد الخصم."""
     try:
+        import users_db as _users
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or not user:
+            return
+        _users.upsert_user(
+            chat.id,
+            user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+        )
+    except Exception as e:
+        logger.warning("track_user: %s", e)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رسالة الترحيب مع إفصاح الأفلييت الإلزامي + أزرار سريعة."""
+    try:
+        _track_user(update)
         user_id = update.effective_user.id if update.effective_user else 0
-        _user_history[user_id].clear()   # بداية محادثة جديدة
+        _user_history[user_id].clear()
+
+        # deep-link: /start p_ASIN
+        args = context.args or []
+        if args and str(args[0]).startswith("p_") and len(args[0]) >= 12:
+            asin = str(args[0])[2:12].upper()
+            if _re.fullmatch(r"[A-Z0-9]{10}", asin):
+                await _typing(update, context)
+                offer = None
+                try:
+                    loop = asyncio.get_running_loop()
+                    offer = await loop.run_in_executor(
+                        None, lambda: get_lowest_offer(asin, AMAZON_DOMAIN, "")
+                    )
+                except Exception as e:
+                    logger.warning("deep-link offer: %s", e)
+                await _send_product_offer(update, context, asin, AMAZON_DOMAIN, offer, "")
+                return
+
+        bot_user = context.bot.username or ""
+        share_url = (
+            f"https://t.me/share/url?url=https%3A%2F%2Ft.me%2F{bot_user}"
+            f"&text=%D8%A8%D9%88%D8%AA%20%D8%A3%D8%B3%D8%B9%D8%A7%D8%B1%20%D8%A3%D9%85%D8%A7%D8%B2%D9%88%D9%86"
+            if bot_user else ""
+        )
 
         welcome_text = (
-            "👋 *أهلاً في بوت الأسعار — وفّر فلوسك على أمازون!*\n\n"
+            "👋 *أهلاً في بوت أسعار أمازون السعودية!*\n\n"
+            "🔥 *وفّر فلوسك* — أقل سعر + صورة + زر شراء مباشر\n\n"
             "📌 *كيف تستخدمه؟*\n"
-            "• 🔗 أرسل *رابط منتج* ← صورة + أقل سعر + زر شراء\n"
-            "• 💬 اكتب *اسم منتج* ← أبحث لك فوراً\n\n"
+            "• 🔗 أرسل *رابط منتج* أو *رابط متجر*\n"
+            "• 💬 اكتب *اسم منتج* ← أبحث لك فوراً\n"
+            "• 🔎 في أي محادثة اكتب `@" + (bot_user or "bot") + "` ثم اسم المنتج\n\n"
             "🔔 *تنبيه انخفاض السعر:*\n"
-            f"اضغط زر *{ALERT_BTN_LABEL.replace('🔔 ', '')}* — وأرسلك إشعار أول ما ينزل السعر!\n"
+            f"اضغط *{ALERT_BTN_LABEL.replace('🔔 ', '')}* — وأرسلك إشعار أول ما ينزل!\n"
             "📋 تنبيهاتك: /myalerts\n\n"
-            "ℹ️ _روابط الشراء تحتوي على تاق تسويق بالعمولة._"
+            f"ℹ️ _روابط الشراء بعمولة Associates (`{get_affiliate_tag()}`)._"
         )
         if MOCK_MODE:
             welcome_text += "\n\n⚠️ *وضع تجريبي* — الأسعار وهمية."
-        await _reply(update, welcome_text)
+
+        rows = [
+            [
+                InlineKeyboardButton("🔥 عروض الآن", callback_data="q:deals"),
+                InlineKeyboardButton("🔔 تنبيهاتي", callback_data="q:alerts"),
+            ],
+            [
+                InlineKeyboardButton("🆘 مساعدة", callback_data="q:help"),
+                InlineKeyboardButton("🔕 إيقاف التنبيهات", callback_data="q:mute"),
+            ],
+        ]
+        if share_url:
+            rows.append([InlineKeyboardButton("📤 شارك البوت", url=share_url)])
+        rows.append([InlineKeyboardButton(
+            "🛒 عروض أمازون.sa",
+            url=build_affiliate_search_link("", AMAZON_DOMAIN),
+        )])
+        kb = InlineKeyboardMarkup(rows)
+        await _reply(update, welcome_text, reply_markup=kb)
     except Exception as _e:
         logger.error("start_command فشل: %s", _e, exc_info=True)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        bot_user = context.bot.username or "البوت"
         help_text = (
             "🆘 *المساعدة*\n\n"
-            "• 🔗 *رابط أمازون* ← صورة + أقل سعر + زر شراء\n"
+            "• 🔗 *رابط أمازون / متجر* ← صورة + أقل سعر + زر شراء\n"
             "• 💬 *اسم منتج* ← بحث فوري\n"
+            f"• 🔥 /deals ← الأكثر طلباً الآن\n"
+            f"• ⚖️ /compare رابط1 رابط2 ← مقارنة سعر\n"
+            f"• ⭐ /fav ← مفضلتك\n"
+            f"• 📸 أرسل *صورة منتج* ← أتعرف عليه وأبحث\n"
+            f"• 🔎 اكتب `@{bot_user}` في أي شات وابحث\n"
             f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n\n"
-            "📋 *الأوامر:* /start · /myalerts · /version\n\n"
+            "📋 *الأوامر:* /start · /myalerts · /share · /version\n\n"
+            f"🏷️ تاق العمولة: `{get_affiliate_tag()}`\n"
             "⚠️ _تحقق من السعر على أمازون قبل الشراء._"
         )
         await _reply(update, help_text)
     except Exception as _e:
         logger.error("help_command فشل: %s", _e, exc_info=True)
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
+
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إيقاف رسائل أكواد الخصم والملخص اليومي."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    import users_db as _users
+    _users.set_opt_out(chat.id, True)
+    await _reply(
+        update,
+        "🔕 تم إيقاف تنبيهات العروض وأكواد الخصم.\n"
+        "تقدر ترجعها بأي وقت: /unmute",
+        parse_mode=None,
+    )
+
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    import users_db as _users
+    _users.set_opt_out(chat.id, False)
+    await _reply(
+        update,
+        "🔔 رجّعنا تنبيهات العروض وأكواد الخصم.\n"
+        "لإيقافها: /mute",
+        parse_mode=None,
+    )
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    للمدير فقط من الجوال:
+      /broadcast كود|عنوان|تفاصيل
+    مثال:
+      /broadcast SAVE20|كود خصم اليوم|على الإلكترونيات حتى منتصف الليل
+    """
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await _reply(update, "⛔ هذا الأمر للمدير فقط.", parse_mode=None)
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw or "|" not in raw:
+        await _reply(
+            update,
+            "📢 الصيغة:\n"
+            "`/broadcast الكود|العنوان|تفاصيل اختيارية`\n\n"
+            "مثال:\n"
+            "`/broadcast SAVE20|كود خصم أمازون|ينتهي الليلة`",
+        )
+        return
+    parts = [p.strip() for p in raw.split("|")]
+    code = parts[0]
+    title = parts[1] if len(parts) > 1 else "كود خصم أمازون اليوم"
+    extra = parts[2] if len(parts) > 2 else ""
+    await _reply(update, f"⏳ جاري إرسال الكود `{code}` للجميع…", parse_mode="Markdown")
+    import broadcast as _bc
+    result = await _bc.send_discount_broadcast(
+        code=code, title=title, extra=extra, when_label="الحين"
+    )
+    if result.get("ok"):
+        await _reply(
+            update,
+            f"✅ تم الإرسال\n"
+            f"نجاح: {result.get('sent_ok', 0)}\n"
+            f"فشل: {result.get('sent_fail', 0)}\n"
+            f"الإجمالي: {result.get('total', 0)}",
+            parse_mode=None,
+        )
+    else:
+        await _reply(update, f"❌ فشل: {result.get('error', 'unknown')}", parse_mode=None)
+
+
+async def handle_quick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أزرار شاشة /start السريعة."""
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    await query.answer()
+
+    # نعيد استخدام نفس Update مع message للرد
+    if data == "q:deals":
+        await deals_command(update, context)
+        return
+    if data == "q:alerts":
+        await myalerts_command(update, context)
+        return
+    if data == "q:help":
+        await help_command(update, context)
+        return
+    if data == "q:mute":
+        chat_id = query.message.chat_id if query.message else 0
+        import users_db as _users
+        _users.set_opt_out(chat_id, True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            await query.message.reply_text(
+                "🔕 تم إيقاف تنبيهات العروض.\nللتفعيل مرة ثانية: /unmute",
+            )
+        return
+    if data == "q:unmute":
+        chat_id = query.message.chat_id if query.message else 0
+        import users_db as _users
+        _users.set_opt_out(chat_id, False)
+        if query.message:
+            await query.message.reply_text("🔔 تم تفعيل تنبيهات العروض من جديد.")
+        return
+
+
+async def handle_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """زر إيقاف التنبيهات من رسائل البث."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    data = query.data or ""
+    chat_id = query.message.chat_id
+    import users_db as _users
+    if data == "bc:mute":
+        _users.set_opt_out(chat_id, True)
+        await query.answer("تم إيقاف التنبيهات", show_alert=False)
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔔 تفعيل التنبيهات", callback_data="bc:unmute")],
+            ]))
+        except Exception:
+            pass
+    elif data == "bc:unmute":
+        _users.set_opt_out(chat_id, False)
+        await query.answer("تم التفعيل", show_alert=False)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    else:
+        await query.answer()
+
+
+async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رابط مشاركة البوت — يزيد الانتشار والظهور."""
+    bot_user = context.bot.username or ""
+    if not bot_user:
+        await _reply(update, "⚠️ ما قدرت أجيب يوزر البوت حالياً.", parse_mode=None)
+        return
+    link = f"https://t.me/{bot_user}"
+    share = (
+        f"https://t.me/share/url?url={link}"
+        "&text=%D8%A8%D9%88%D8%AA%20%D8%A3%D8%B3%D8%B9%D8%A7%D8%B1%20%D8%A3%D9%85%D8%A7%D8%B2%D9%88%D9%86%20"
+        "%D8%A7%D9%84%D8%B3%D8%B9%D9%88%D8%AF%D9%8A%D8%A9%20%F0%9F%94%A5"
+    )
+    text = (
+        "📤 *شارك البوت مع أصحابك*\n\n"
+        f"رابط البوت: `{link}`\n\n"
+        "كل مشاركة تساعد يظهر البوت أكثر في بحث تيليجرام 🔍"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 مشاركة سريعة", url=share)],
+        [InlineKeyboardButton("فتح البوت", url=link)],
+    ])
+    await _reply(update, text, reply_markup=kb)
+
+
+async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعرض أكثر المنتجات طلباً الآن داخل البوت."""
+    from deals_tracker import top_deals
+
+    _track_user(update)
+    deals = top_deals(8)
+    if not deals:
+        await _reply(
+            update,
+            "🔥 ما فيه عروض رائجة مسجّلة للحين.\n"
+            "أرسل رابط أو اسم منتج — وبصير قائمة /deals تتعبّى تلقائياً.",
+            parse_mode=None,
+        )
+        return
+
+    lines = ["🔥 *الأكثر طلباً الآن*\n"]
+    rows = []
+    for i, d in enumerate(deals, 1):
+        title = (d.get("title") or d["asin"])[:50]
+        price = d.get("price") or ""
+        link = build_affiliate_link(d["asin"], d.get("domain") or AMAZON_DOMAIN)
+        lines.append(f"*{i}.* {title}")
+        if price:
+            lines.append(f"   💰 {price}")
+        lines.append("")
+        rows.append([InlineKeyboardButton(f"🛒 {i}. اشتري", url=link)])
+
+    await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
+def _parse_asin_or_link(token: str) -> tuple[str | None, str]:
+    """يستخرج ASIN والنطاق من رابط أو كود ASIN خام."""
+    token = (token or "").strip().rstrip(".,;:!?)\"}'")
+    if not token:
+        return None, AMAZON_DOMAIN
+    if _re.fullmatch(r"[A-Za-z0-9]{10}", token):
+        return token.upper(), AMAZON_DOMAIN
+    asin = extract_asin(token)
+    domain = extract_domain(token) if is_amazon_url(token) else AMAZON_DOMAIN
+    return asin, domain or AMAZON_DOMAIN
+
+
+async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مقارنة منتجين: /compare رابط1 رابط2 أو ASIN1 ASIN2"""
+    _track_user(update)
+    args = context.args or []
+    text = update.effective_message.text if update.effective_message else ""
+    if len(args) < 2:
+        # حاول التقاط رابطين من النص
+        urls = _re.findall(r"https?://\S+", text or "")
+        if len(urls) >= 2:
+            args = urls[:2]
+        else:
+            await _reply(
+                update,
+                "⚖️ *المقارنة*\n\n"
+                "أرسل:\n"
+                "`/compare رابط1 رابط2`\n"
+                "أو:\n"
+                "`/compare ASIN1 ASIN2`\n\n"
+                "مثال:\n"
+                "`/compare B0XXXXXXX1 B0XXXXXXX2`",
+            )
+            return
+
+    a1, d1 = _parse_asin_or_link(args[0])
+    a2, d2 = _parse_asin_or_link(args[1])
+    if not a1 or not a2:
+        await _reply(update, "⚠️ ما قدرت أقرأ المنتجين. أرسل رابطين أو كودين ASIN.", parse_mode=None)
+        return
+
+    await _typing(update, context)
+    loop = asyncio.get_running_loop()
+
+    async with _HeavySlot() as got:
+        if not got:
+            await _reply(update, "⏳ البوت مشغول — حاول بعد ثوانٍ.", parse_mode=None)
+            return
+        try:
+            o1, o2 = await asyncio.wait_for(
+                asyncio.gather(
+                    loop.run_in_executor(None, lambda: get_lowest_offer(a1, d1, "")),
+                    loop.run_in_executor(None, lambda: get_lowest_offer(a2, d2, "")),
+                ),
+                timeout=30.0,
+            )
+        except Exception as e:
+            logger.warning("compare failed: %s", e)
+            await _reply(update, "❌ فشلت المقارنة. حاول مرة ثانية.", parse_mode=None)
+            return
+
+    def _row(label: str, offer: dict | None, asin: str) -> tuple[str, float | None, str]:
+        if not offer:
+            return f"• {label}: غير متاح", None, build_affiliate_link(asin, AMAZON_DOMAIN)
+        title = (offer.get("title") or asin)[:45]
+        price = offer.get("price") or "—"
+        pval = offer.get("price_val")
+        link = offer.get("affiliate_link") or build_affiliate_link(asin, offer.get("domain") or AMAZON_DOMAIN)
+        return f"• *{label}:* {title}\n  💰 {price}", pval, link
+
+    l1, p1, u1 = _row("أ", o1, a1)
+    l2, p2, u2 = _row("ب", o2, a2)
+    verdict = ""
+    if p1 and p2:
+        if p1 < p2:
+            verdict = f"\n✅ الأرخص: *أ* بفرق `{p2 - p1:.2f}` SAR"
+        elif p2 < p1:
+            verdict = f"\n✅ الأرخص: *ب* بفرق `{p1 - p2:.2f}` SAR"
+        else:
+            verdict = "\n⚖️ نفس السعر تقريباً"
+
+    msg = f"⚖️ *مقارنة سريعة*\n\n{l1}\n\n{l2}{verdict}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 اشتري أ", url=u1), InlineKeyboardButton("🛒 اشتري ب", url=u2)],
+    ])
+    await _reply(update, msg, reply_markup=kb)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إحصاءات سريعة للمدير فقط."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await _reply(update, "⛔ هذا الأمر للمدير فقط.", parse_mode=None)
+        return
+    import users_db as _users
+    from deals_tracker import top_deals
+    uc = _users.count_users()
+    try:
+        from serpapi_utils import serpapi_circuit_status
+        circ = serpapi_circuit_status()
+    except Exception:
+        circ = {}
+    deals = top_deals(3)
+    deals_txt = "\n".join(
+        f"  {i}. {(d.get('title') or d['asin'])[:40]}" for i, d in enumerate(deals, 1)
+    ) or "  —"
+    msg = (
+        f"📊 *إحصاءات البوت v{BOT_VERSION}*\n\n"
+        f"• مستخدمون: `{uc.get('total', 0)}` (نشط بث: `{uc.get('active', 0)}`)\n"
+        f"• طلبات: `{_stats.get('requests_total', 0)}` · ✅ `{_stats.get('requests_ok', 0)}` · ❌ `{_stats.get('requests_error', 0)}`\n"
+        f"• صور: ✅ `{_stats.get('photo_ok', 0)}` · ❌ `{_stats.get('photo_miss', 0)}`\n"
+        f"• تخفيف حمل: `{_stats.get('load_shed', 0)}` · FloodWait: `{_stats.get('flood_waits', 0)}`\n"
+        f"• قاطع SerpAPI: `{'مفتوح' if circ.get('open') else 'سليم'}`\n"
+        f"• نشطون الآن: `{len(_user_last_seen)}`\n\n"
+        f"🔥 الأكثر طلباً:\n{deals_txt}"
+    )
+    await _reply(update, msg)
+
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """عرض المفضلة /fav"""
+    import users_db as _users
+    from amazon_utils import build_affiliate_link as _bal
+
+    _track_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    items = _users.list_favorites(uid)
+    if not items:
+        await _reply(
+            update,
+            "⭐ ما عندك منتجات بالمفضلة.\n"
+            "افتح أي منتج واضغط «⭐ للمفضلة».",
+            parse_mode=None,
+        )
+        return
+    lines = [f"⭐ *مفضلتك ({len(items)}/20)*\n"]
+    rows = []
+    for i, it in enumerate(items, 1):
+        title = (it.get("title") or it["asin"])[:45]
+        price = it.get("price") or ""
+        lines.append(f"*{i}.* {title}")
+        if price:
+            lines.append(f"   💰 {price}")
+        lines.append("")
+        link = _bal(it["asin"], it.get("domain") or AMAZON_DOMAIN)
+        rows.append([
+            InlineKeyboardButton(f"🛒 {i}", url=link),
+            InlineKeyboardButton("🗑️", callback_data=f"favdel:{it['asin']}"),
+        ])
+    await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def handle_fav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إضافة/حذف من المفضلة."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    data = query.data or ""
+    uid = query.from_user.id if query.from_user else 0
+    import users_db as _users
+
+    if data.startswith("favdel:"):
+        asin = data.split(":", 1)[1].upper()
+        _users.remove_favorite(uid, asin)
+        await query.answer("تم الحذف من المفضلة", show_alert=False)
+        # أعد رسم القائمة
+        fake = update
+        await favorites_command(fake, context)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if data.startswith("fav:"):
+        asin = data.split(":", 1)[1].upper()
+        domain = (context.user_data or {}).get(f"pdomain_{asin}", AMAZON_DOMAIN)
+        title = (context.user_data or {}).get(f"ptitle_{asin}", asin)
+        result = _users.add_favorite(uid, asin, domain=domain, title=title)
+        if result == "limit":
+            await query.answer("وصلت للحد 20 — احذف من /fav", show_alert=True)
+        elif result in ("added", "updated"):
+            await query.answer("⭐ تمت الإضافة للمفضلة", show_alert=False)
+        else:
+            await query.answer("فشل الحفظ", show_alert=True)
+        return
+    await query.answer()
 
 
 async def _send_product_offer(
@@ -549,15 +1095,40 @@ async def _send_product_offer(
     context.user_data[f"pdomain_{asin}"] = domain
 
     affiliate_url = build_affiliate_link(asin, domain)
+    if not url_has_our_tag(affiliate_url):
+        logger.error("AFFILIATE_TAG_MISSING على رابط الشراء: %s", affiliate_url)
+        affiliate_url = build_affiliate_link(asin, domain)
     buy_btn = InlineKeyboardButton("🛒 اشتري الآن ↗", url=affiliate_url)
 
     price_val = offer.get("price_val") if offer else None
     price_int = int(float(price_val) * 100) if price_val else 0
     cb_data = f"al:{asin}:{price_int}"
     context.user_data[f"ptitle_{asin}"] = str(offer.get("title", ""))[:80]
+
+    bot_user = context.bot.username or ""
+    title_q = _re.sub(r"\s+", " ", str(offer.get("title") or asin)[:80])
+    share_text = f"{title_q}\n{affiliate_url}"
+    from urllib.parse import quote
+    share_url = (
+        f"https://t.me/share/url?url={quote(affiliate_url, safe='')}"
+        f"&text={quote(title_q, safe='')}"
+    )
+    if bot_user:
+        # يفتح البوت مباشرة على المنتج لمن يضغط المشاركة داخل التيليجرام
+        deep = f"https://t.me/{bot_user}?start=p_{asin}"
+        share_url = (
+            f"https://t.me/share/url?url={quote(deep, safe='')}"
+            f"&text={quote(share_text[:180], safe='')}"
+        )
+
+    fav_cb = f"fav:{asin}"
     kb = InlineKeyboardMarkup([
         [buy_btn],
         [InlineKeyboardButton(ALERT_BTN_LABEL, callback_data=cb_data)],
+        [
+            InlineKeyboardButton("⭐ للمفضلة", callback_data=fav_cb),
+            InlineKeyboardButton("📤 شارك", url=share_url),
+        ],
     ])
 
     message = format_product_reply_plain(
@@ -565,6 +1136,7 @@ async def _send_product_offer(
         fallback_title=fallback_title,
         asin=asin,
         version=BOT_VERSION,
+        domain=domain,
     )
     # حماية نهائية: لا تعرض كود ASIN كاسم أبداً
     display_title = (offer.get("title") or "").strip()
@@ -581,6 +1153,7 @@ async def _send_product_offer(
             fallback_title=fallback_title,
             asin=asin,
             version=BOT_VERSION,
+            domain=domain,
         )
         logger.error("CARD_GUARD: استُبدل كود/عنوان ضعيف للـ ASIN %s → %s", asin, display_title)
 
@@ -611,6 +1184,18 @@ async def _send_product_offer(
         caption=message,
         reply_markup=kb,
     )
+    try:
+        from deals_tracker import record_deal
+        record_deal(
+            asin=asin,
+            title=str(offer.get("title") or fallback_title or ""),
+            price=str(offer.get("price") or ""),
+            price_val=offer.get("price_val"),
+            domain=domain,
+            image=str(offer.get("image") or ""),
+        )
+    except Exception:
+        pass
     _stat("requests_ok")
 
 
@@ -619,6 +1204,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    _track_user(update)
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
         await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
@@ -648,6 +1234,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = extract_domain(resolved_url)
 
     if not asin:
+        # رابط متجر / صفحة عروض / أي أمازون بدون ASIN → تاق عمولة + زر فتح
+        if is_amazon_url(resolved_url) or is_amazon_store_url(resolved_url):
+            tagged = build_affiliate_store_link(resolved_url, domain)
+            store_title = "متجر / صفحة عروض أمازون"
+            if is_amazon_store_url(resolved_url):
+                store_title = "🏪 متجر أمازون — عروض مختارة"
+            msg = (
+                f"{store_title}\n\n"
+                "✨ فتحت لك الرابط بتاق العمولة الخاص فينا.\n"
+                "اضغط الزر تحت للتصفح والشراء 👇"
+            )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛒 افتح العروض ↗", url=tagged),
+            ]])
+            await _reply(update, msg, parse_mode=None, reply_markup=kb)
+            logger.info("STORE_LINK tagged | tag=%s | %s", get_affiliate_tag(), tagged[:120])
+            _stat("requests_ok")
+            return
+
         await _reply(
             update,
             "⚠️ ما قدرت أستخرج رقم المنتج من هذا الرابط.\n"
@@ -659,7 +1264,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     offer = None
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            await _reply(
+                update,
+                "⏳ البوت مشغول بطلبات كثيرة الآن. انتظر ثوانٍ وحاول مرة أخرى.",
+                parse_mode=None,
+            )
+            return
         try:
             loop = asyncio.get_running_loop()
             try:
@@ -788,6 +1400,102 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
 
 
 # =============================================================================
+# Inline Mode — يظهر البوت عند الكتابة @username في أي محادثة (اكتشاف أقوى)
+# =============================================================================
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """بحث منتجات من الوضع المضمّن — ينشر نتائج بروابط عمولة."""
+    from telegram import (
+        InlineQueryResultArticle,
+        InputTextMessageContent,
+        InlineKeyboardMarkup as _IKM,
+        InlineKeyboardButton as _IKB,
+    )
+    from vision_utils import search_amazon_by_keywords
+
+    iq = update.inline_query
+    if not iq:
+        return
+
+    q = (iq.query or "").strip()
+    results = []
+
+    if len(q) < 2:
+        home = build_affiliate_search_link("", AMAZON_DOMAIN)
+        results.append(
+            InlineQueryResultArticle(
+                id="hint",
+                title="اكتب اسم منتج للبحث في أمازون.sa",
+                description="مثال: سماعات بلوتوث · iPhone · قهوة",
+                input_message_content=InputTextMessageContent(
+                    f"🔍 ابحث في بوت أسعار أمازون\n🛒 {home}"
+                ),
+                reply_markup=_IKM([[_IKB("🛒 أمازون.sa", url=home)]]),
+            )
+        )
+        await iq.answer(results, cache_time=10, is_personal=True)
+        return
+
+    if _is_rate_limited(iq.from_user.id if iq.from_user else 0):
+        await iq.answer([], cache_time=5, is_personal=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    offers = []
+    try:
+        async with _HeavySlot() as got:
+            if got:
+                offers = await asyncio.wait_for(
+                    loop.run_in_executor(None, search_amazon_by_keywords, q),
+                    timeout=12.0,
+                ) or []
+    except Exception as e:
+        logger.warning("inline search فشل: %s", e)
+
+    if not offers:
+        search_url = build_affiliate_search_link(q, AMAZON_DOMAIN)
+        results.append(
+            InlineQueryResultArticle(
+                id="search",
+                title=f"ابحث عن «{q[:40]}» في أمازون",
+                description="اضغط للإرسال — رابط بعمولة",
+                input_message_content=InputTextMessageContent(
+                    f"🔍 نتائج «{q}» على أمازون السعودية\n🛒 {search_url}"
+                ),
+                reply_markup=_IKM([[_IKB("🛒 شوف العروض ↗", url=search_url)]]),
+            )
+        )
+        await iq.answer(results, cache_time=20, is_personal=True)
+        return
+
+    for i, item in enumerate(offers[:8]):
+        asin = (item.get("asin") or "").strip().upper()
+        title = (item.get("title") or q)[:80]
+        price = (item.get("price") or "").strip()
+        if asin:
+            link = build_affiliate_link(asin, AMAZON_DOMAIN)
+        else:
+            link = tag_amazon_url(item.get("link") or "", AMAZON_DOMAIN) or build_affiliate_search_link(q)
+        desc = price or "اضغط للشراء من أمازون.sa"
+        body = f"📦 {title}\n"
+        if price:
+            body += f"💰 {price}\n"
+        body += f"🛒 {link}"
+        results.append(
+            InlineQueryResultArticle(
+                id=f"p{i}-{asin or i}",
+                title=title[:60],
+                description=desc[:80],
+                input_message_content=InputTextMessageContent(body),
+                reply_markup=_IKM([[_IKB("🛒 اشتري الآن ↗", url=link)]]),
+            )
+        )
+
+    await iq.answer(results, cache_time=30, is_personal=True)
+    _stat("requests_ok")
+
+
+# =============================================================================
 # أمر /myalerts
 # =============================================================================
 
@@ -831,7 +1539,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ANTHROPIC_API_KEY,
         TELEGRAM_BOT_TOKEN,
     )
-    from serpapi_utils import serpapi_available
+    from serpapi_utils import serpapi_available, serpapi_circuit_status
     from paapi_utils import paapi_available
 
     def _status(val: str) -> str:
@@ -839,19 +1547,27 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     deepseek_key = get_deepseek_api_key()
     railway_svc = os.getenv("RAILWAY_SERVICE_NAME", "—")
+    circ = serpapi_circuit_status()
 
     msg = (
         f"🔧 *حالة البوت v{BOT_VERSION}*\n\n"
         f"• إصدار الكود: `{BOT_VERSION}`\n"
         f"• خدمة Railway: `{railway_svc}`\n"
         f"• SerpAPI (سعر+صورة): {'✅' if serpapi_available() else '❌'}\n"
+        f"• قاطع SerpAPI: `{'مفتوح ⚡' if circ.get('open') else 'سليم'} "
+        f"({circ.get('cooldown_left', 0)}s)`\n"
         f"• PA API (سعر+صورة): {'✅' if paapi_available() else '❌'}\n"
         f"• DeepSeek (نص): {_status(deepseek_key)}\n"
         f"• Anthropic: {_status(ANTHROPIC_API_KEY)}\n"
         f"• Telegram: {_status(TELEGRAM_BOT_TOKEN)}\n"
+        f"• تاق العمولة: `{get_affiliate_tag()}`\n"
+        f"• عيّنة رابط: `{build_affiliate_link('B0GM947WC5', AMAZON_DOMAIN)}`\n"
         f"• صور ناجحة: `{_stats.get('photo_ok', 0)}`\n"
         f"• صور ناقصة: `{_stats.get('photo_miss', 0)}`\n"
-        f"• عنوان احتياطي: `{_stats.get('title_fallback', 0)}`\n\n"
+        f"• FloodWait: `{_stats.get('flood_waits', 0)}`\n"
+        f"• تخفيف حمل: `{_stats.get('load_shed', 0)}`\n"
+        f"• مستخدمون نشطون: `{len(_user_last_seen)}`\n"
+        f"• concurrency: `{GLOBAL_CONCURRENCY}`\n\n"
         "💡 _بدون SerpAPI أو PA API على Railway يظهر الرابط والصورة فقط بدون سعر حي._"
     )
     await _reply(update, msg)
@@ -1022,15 +1738,55 @@ async def _price_alert_check_loop(app) -> None:
         await asyncio.sleep(1800)   # كل 30 دقيقة
 
 
-async def handle_unsupported_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يرفض الصور ويوجّه المستخدم للرابط أو اسم المنتج."""
-    if not update.message:
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صورة منتج → تعرّف بالرؤية → بحث أمازون."""
+    if not update.message or not update.message.photo:
         return
-    await _reply(
-        update,
-        "📸 أرسل *رابط منتج أمازون* — أجيبك بالصورة والسعر والأزرار فوراً.",
-        parse_mode=None,
-    )
+
+    _track_user(update)
+    user_id = update.effective_user.id if update.effective_user else 0
+    if _is_rate_limited(user_id):
+        await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
+        return
+
+    await _typing(update, context)
+    await _reply(update, "📸 جاري التعرف على المنتج من الصورة…", parse_mode=None)
+
+    photo = update.message.photo[-1]
+    loop = asyncio.get_running_loop()
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        bio = BytesIO()
+        await tg_file.download_to_memory(bio)
+        image_bytes = bio.getvalue()
+    except Exception as e:
+        logger.warning("photo download: %s", e)
+        await _reply(update, "⚠️ ما قدرت أحمّل الصورة. أرسل رابط المنتج بدلها.", parse_mode=None)
+        return
+
+    async with _HeavySlot() as got:
+        if not got:
+            await _reply(update, "⏳ البوت مشغول — حاول بعد لحظات.", parse_mode=None)
+            return
+        try:
+            name = await asyncio.wait_for(
+                loop.run_in_executor(None, identify_product_from_image, image_bytes),
+                timeout=35.0,
+            )
+        except Exception as e:
+            logger.warning("vision identify: %s", e)
+            name = None
+
+    if not name:
+        await _reply(
+            update,
+            "🤔 ما تعرّفت على المنتج بوضوح.\n"
+            "جرّب صورة أوضح أو أرسل *رابط أمازون* / *اسم المنتج*.",
+        )
+        return
+
+    await _reply(update, f"🔎 لقيته شكله: *{name[:80]}*\nجاري البحث في أمازون…")
+    await _search_and_deliver_product(update, context, name)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1038,6 +1794,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    _track_user(update)
     user_id = update.effective_user.id if update.effective_user else 0
     if _is_rate_limited(user_id):
         await _reply(update, "⏳ أرسلت طلبات كثيرة. انتظر قليلاً ثم حاول.", parse_mode=None)
@@ -1056,11 +1813,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_running_loop()
     product_query = None
-    try:
-        from claude_utils import extract_product_intent
-        product_query = await loop.run_in_executor(None, extract_product_intent, text)
-    except Exception as e:
-        logger.warning("extract_product_intent فشل: %s", e)
+    if not (SKIP_AI_CHAT_UNDER_LOAD and _is_under_load()):
+        try:
+            from claude_utils import extract_product_intent
+            product_query = await loop.run_in_executor(None, extract_product_intent, text)
+        except Exception as e:
+            logger.warning("extract_product_intent فشل: %s", e)
+    elif _is_under_load():
+        logger.info("load_shed: تخطّي extract_product_intent — %d مستخدم نشط", len(_user_last_seen))
+        _stat("load_shed")
 
     if not product_query:
         product_query = _guess_product_query(text)
@@ -1070,7 +1831,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _add_to_history(user_id, "assistant", product_query[:200])
         return
 
-    async with (_GLOBAL_SEM or asyncio.Semaphore(8)):
+    if SKIP_AI_CHAT_UNDER_LOAD and _is_under_load():
+        if len(text) >= 3:
+            await _search_and_deliver_product(update, context, text)
+        else:
+            await _reply(update, "📝 اكتب اسم المنتج أو أرسل رابط أمازون.", parse_mode=None)
+        return
+
+    async with _HeavySlot() as got_slot:
+        if not got_slot:
+            if len(text) >= 3:
+                await _search_and_deliver_product(update, context, text)
+            else:
+                await _reply(
+                    update,
+                    "⏳ البوت مشغول. اكتب اسم منتج أو أرسل رابط أمازون.",
+                    parse_mode=None,
+                )
+            return
         try:
             from claude_utils import chat_response
             history  = _user_history[user_id][:-1]
@@ -1161,27 +1939,108 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _post_init(application) -> None:
     """يُشغَّل بعد بدء التطبيق — يبدأ مهام الخلفية."""
     global _GLOBAL_SEM
-    _GLOBAL_SEM = asyncio.Semaphore(8)   # حد أقصى 8 طلب ثقيل متزامن
-    cleared = clear_offer_cache()
-    if cleared:
-        logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
+    _GLOBAL_SEM = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+    loop = asyncio.get_running_loop()
+    pool = _ensure_heavy_pool()
+    loop.set_default_executor(pool)
+    logger.info(
+        "🚀 وضع الضغط: HIGH_LOAD=%s | concurrency=%d | rate/user=%d | cache=%d | pool=%d",
+        HIGH_LOAD_MODE,
+        GLOBAL_CONCURRENCY,
+        RATE_MAX_PER_USER,
+        OFFER_CACHE_MAX,
+        HEAVY_POOL_SIZE,
+    )
+    # ملف تيليجرام — وصف قصير + أوامر → ظهور أقوى في البحث
     try:
-        from serpapi_utils import serpapi_available
+        from telegram_profile import apply_telegram_profile
+        await apply_telegram_profile(application)
+    except Exception as e:
+        logger.warning("تطبيق ملف تيليجرام فشل: %s", e)
+
+    # تحقق تاق العمولة عند الإقلاع
+    sample = build_affiliate_link("B0GM947WC5", AMAZON_DOMAIN)
+    store_sample = tag_amazon_url(
+        "https://www.amazon.sa/stores/page/A0A6CA9D-152E-403D-8AAF-96570B0152AB?_encoding=UTF8&tag=other-21"
+    )
+    if not url_has_our_tag(sample) or not url_has_our_tag(store_sample):
+        logger.error("🔴 AFFILIATE CHECK FAILED — tag=%s sample=%s", get_affiliate_tag(), sample)
+    else:
+        logger.info("✅ AFFILIATE OK | tag=%s | product=%s", get_affiliate_tag(), sample)
+        logger.info("✅ STORE TAG OK | %s", store_sample)
+
+    # سجل المستخدمين + استيراد من تنبيهات الأسعار
+    try:
+        import users_db as _users
+        imported = _users.import_from_price_alerts()
+        logger.info("👥 users_db: استيراد %d من تنبيهات الأسعار | نشط=%s", imported, _users.count_users())
+    except Exception as e:
+        logger.warning("users_db import: %s", e)
+
+    # بث أكواد الخصم + داشبورد سري
+    try:
+        import broadcast as _bc
+        from dashboard import start_dashboard_server
+        from config import USE_WEBHOOK as _uw
+        _bc.set_application(application)
+        _BG_TASKS.append(asyncio.create_task(_bc.scheduler_loop()))
+        _BG_TASKS.append(asyncio.create_task(_bc.daily_digest_loop()))
+        loop = asyncio.get_running_loop()
+        if _uw:
+            logger.warning("🔒 الداشبورد متوقف مؤقتاً لأن USE_WEBHOOK=true (نفس المنفذ)")
+        else:
+            dash_path = start_dashboard_server(loop)
+            if dash_path:
+                logger.info("🔒 افتح الداشبورد السري على المسار %s (بعد إدخال السر فقط)", dash_path)
+    except Exception as e:
+        logger.warning("dashboard/broadcast init: %s", e)
+
+    cleared = 0
+    if CLEAR_CACHE_ON_BOOT:
+        cleared = clear_offer_cache()
+        if cleared:
+            logger.info("🧹 مُسح كاش العروض عند الإقلاع (%d إدخال)", cleared)
+    else:
+        logger.info("🧊 الكاش محفوظ بين إعادة التشغيل (CLEAR_CACHE_ON_BOOT=false)")
+    try:
+        from serpapi_utils import serpapi_available, serpapi_circuit_status
         if not serpapi_available():
             logger.error(
                 "⚠️ SERPAPI_KEY غير موجود — الاسم/الصورة/السعر قد يضعفون على Railway"
             )
         else:
-            logger.info("✅ SerpAPI جاهز — مسار الاسم والصورة مفعّل")
+            logger.info("✅ SerpAPI جاهز + قاطع دائرة %s", serpapi_circuit_status())
     except Exception as e:
         logger.warning("فحص SerpAPI عند الإقلاع فشل: %s", e)
     logger.info("🛡️ حماية البطاقة: عنوان إلزامي + CDN صورة + TTL قصير للعروض الناقصة")
     _start_stats_server()
-    asyncio.create_task(_memory_cleanup_loop())
-    asyncio.create_task(_health_monitor_loop())
-    asyncio.create_task(_price_alert_check_loop(application))
-    asyncio.create_task(_keep_alive_loop())
-    logger.info("✅ مهام الخلفية بدأت: تنظيف الذاكرة + مراقبة الصحة + تنبيهات الأسعار + keep-alive")
+    for coro in (
+        _memory_cleanup_loop(),
+        _health_monitor_loop(),
+        _price_alert_check_loop(application),
+        _keep_alive_loop(),
+    ):
+        _BG_TASKS.append(asyncio.create_task(coro))
+    logger.info("✅ مهام الخلفية بدأت: تنظيف + صحة + تنبيهات + keep-alive + heavy pool")
+
+
+async def _post_shutdown(application) -> None:
+    """إيقاف نظيف — يلغي المهام ويغلق الـ pools."""
+    logger.info("🛑 إيقاف نظيف...")
+    for t in _BG_TASKS:
+        t.cancel()
+    if _BG_TASKS:
+        await asyncio.gather(*_BG_TASKS, return_exceptions=True)
+    global _HEAVY_POOL
+    if _HEAVY_POOL is not None:
+        _HEAVY_POOL.shutdown(wait=False, cancel_futures=True)
+        _HEAVY_POOL = None
+    try:
+        from http_client import close_http_session
+        close_http_session()
+    except Exception:
+        pass
+    logger.info("🛑 تم الإيقاف")
 
 
 def main():
@@ -1204,6 +2063,12 @@ def main():
     print(f"   {'⚠️  أسعار وهمية' if MOCK_MODE else '🔴 أسعار حقيقية'}")
     print(f"🔗 Affiliate tag: {AFFILIATE_TAG}")
     print(f"🔗 Link sample:   {build_affiliate_link('B0GM947WC5', AMAZON_DOMAIN)}")
+    _store_ex = tag_amazon_url(
+        "https://www.amazon.sa/stores/page/A0A6CA9D-152E-403D-8AAF-96570B0152AB?_encoding=UTF8"
+    )
+    print(f"🔗 Store sample:  {_store_ex}")
+    if get_affiliate_tag() != "rashedalhano-21":
+        print(f"⚠️  AFFILIATE_TAG={get_affiliate_tag()} (متوقع rashedalhano-21 إن كان حسابك)")
     print("=" * 50)
 
     import os as _os
@@ -1221,9 +2086,10 @@ def main():
     _URL_PATH    = "/tgwh"
 
     # ── ضبط اتصال قوي يتحمّل تذبذب الشبكة بدون توقف ──────────────────────
-    # طلبات عامة: pool كبير + مهلات متوازنة
+    _pool_size = 512 if HIGH_LOAD_MODE else 256
+    _updates_pool = 64 if HIGH_LOAD_MODE else 32
     _req_general = HTTPXRequest(
-        connection_pool_size=256,   # يتحمّل عدد كبير من الطلبات المتزامنة
+        connection_pool_size=_pool_size,
         connect_timeout=15.0,
         read_timeout=30.0,
         write_timeout=30.0,
@@ -1231,7 +2097,7 @@ def main():
     )
     # طلب get_updates (polling): read_timeout أطول من long-polling نفسه
     _req_updates = HTTPXRequest(
-        connection_pool_size=32,
+        connection_pool_size=_updates_pool,
         connect_timeout=15.0,
         read_timeout=40.0,          # أطول من poll timeout عشان ما يقطع الاتصال
         write_timeout=30.0,
@@ -1245,17 +2111,31 @@ def main():
         .request(_req_general)
         .get_updates_request(_req_updates)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
 
     app.add_handler(CommandHandler("start",     start_command))
     app.add_handler(CommandHandler("help",      help_command))
+    app.add_handler(CommandHandler("share",     share_command))
+    app.add_handler(CommandHandler("deals",     deals_command))
+    app.add_handler(CommandHandler("compare",   compare_command))
+    app.add_handler(CommandHandler("fav",       favorites_command))
+    app.add_handler(CommandHandler("favorites", favorites_command))
+    app.add_handler(CommandHandler("stats",     stats_command))
     app.add_handler(CommandHandler("myalerts",  myalerts_command))
+    app.add_handler(CommandHandler("mute",      mute_command))
+    app.add_handler(CommandHandler("unmute",    unmute_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("debug",     debug_command))
     app.add_handler(CommandHandler("version",   version_command))
     app.add_handler(CallbackQueryHandler(handle_alert_callback, pattern=r"^al[_:]"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_unsupported_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_unsupported_photo))
+    app.add_handler(CallbackQueryHandler(handle_quick_callback, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(handle_mute_callback, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_callback, pattern=r"^fav"))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"https?://\S+") & ~filters.UpdateType.EDITED_MESSAGE,
@@ -1272,9 +2152,30 @@ def main():
 
     print("🚀 البوت شغّال الآن...")
 
+    import os as _os2
+    _public = (
+        _os2.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or _os2.getenv("RAILWAY_STATIC_URL")
+        or ""
+    ).strip().removeprefix("https://").removeprefix("http://")
+
+    if USE_WEBHOOK and _public:
+        # Webhook أحدث وأسرع من long-polling — يحتاج نطاقاً عاماً
+        wh_url = f"https://{_public}/{WEBHOOK_PATH}"
+        print(f"🌐 Webhook mode → {wh_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=DASHBOARD_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=wh_url,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=False,
+            allowed_updates=Update.ALL_TYPES,
+            bootstrap_retries=-1,
+        )
+        return
+
     # ── طرد أي جلسة polling منافسة (Railway وغيرها) ──────────────────────────
-    # setWebhook يقطع أي polling نشط فوراً، deleteWebhook يعيد الحالة نظيفة.
-    # drop_pending_updates=False ← Telegram يحتفظ بالرسائل خلال الانقطاع ويسلمها عند العودة.
     _kick_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     _dummy    = "https://example.com/kick"
     try:
@@ -1290,11 +2191,14 @@ def main():
     except Exception as _ke:
         print(f"⚠️  تعذّر الطرد: {_ke}")
 
+    if USE_WEBHOOK and not _public:
+        print("⚠️  USE_WEBHOOK=true لكن لا يوجد RAILWAY_PUBLIC_DOMAIN — الرجوع لـ polling")
+
     app.run_polling(
         poll_interval=1.0,
-        timeout=30,                   # long-polling — أقل من read_timeout (40s)
-        bootstrap_retries=-1,         # محاولات لا نهائية وقت الإقلاع — لا يستسلم عند تذبذب الشبكة
-        drop_pending_updates=False,   # ← لا نحذف رسائل — Telegram يحتفظ بها ويسلمها فور عودتنا
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=False,
         allowed_updates=Update.ALL_TYPES,
     )
 
