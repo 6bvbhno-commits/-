@@ -105,6 +105,39 @@ def record_price(asin: str, domain: str, price_val: float, seller_name: str = ""
 
 # ── الجلب والتحليل ──────────────────────────────────────────────────────────
 
+def get_previous_price(asin: str, domain: str) -> float | None:
+    """آخر سعر مسجّل قبل الأحدث — للمقارنة على بطاقة المنتج."""
+    try:
+        with _DB_LOCK, _get_conn() as conn:
+            rows = conn.execute(
+                "SELECT price_val FROM price_history "
+                "WHERE asin=? AND domain=? ORDER BY ts DESC LIMIT 2",
+                (asin, domain),
+            ).fetchall()
+        if len(rows) >= 2:
+            return float(rows[1][0])
+        return None
+    except Exception as e:
+        logger.warning("price_history.get_previous_price: %s", e)
+        return None
+
+
+def price_drop_line(asin: str, domain: str, current: float | None) -> str:
+    """سطر قصير: انخفض / ارتفع مقارنة بآخر تسجيل."""
+    if not current or current <= 0:
+        return ""
+    prev = get_previous_price(asin, domain)
+    if not prev or prev <= 0:
+        return ""
+    if abs(prev - current) < 0.05:
+        return ""
+    if current < prev:
+        saving = prev - current
+        pct = saving / prev * 100
+        return f"📉 كان {prev:.2f} · وفّرت {saving:.2f} ({pct:.0f}%)"
+    return f"📈 كان {prev:.2f} SAR"
+
+
 def get_history(asin: str, domain: str, days: int = 30) -> list[dict]:
     """يُعيد سجلات السعر للأيام الماضية مرتبةً من الأقدم للأحدث."""
     cutoff = int(time.time()) - days * 86400
@@ -152,6 +185,48 @@ def _trend_arrow(prices: list[float]) -> str:
 
 
 # ── الرسالة الجاهزة ─────────────────────────────────────────────────────────
+
+def format_sparkline_plain(asin: str, domain: str) -> str:
+    """سطر رسم بياني قصير بدون Markdown — مناسب لكابشن الصورة."""
+    records = get_history(asin, domain, days=60)
+    if len(records) < 3:
+        return ""
+    prices = [float(r["price_val"]) for r in records if r.get("price_val")]
+    if len(prices) < 3:
+        return ""
+    spark = _sparkline(prices)
+    lo, hi = min(prices), max(prices)
+    trend = _trend_arrow(prices)
+    parts = [f"📊 {spark}"]
+    parts.append(f"أدنى {lo:.0f} · أعلى {hi:.0f}")
+    if trend:
+        parts.append(trend)
+    return " · ".join(parts)
+
+
+def format_buy_tip_plain(asin: str, domain: str, current: float | None) -> str:
+    """نصيحة شراء سريعة من التاريخ — بدون LLM (لا تبطّئ البطاقة)."""
+    if not current or current <= 0:
+        return ""
+    records = get_history(asin, domain, days=60)
+    if len(records) < 3:
+        return ""
+    prices = [float(r["price_val"]) for r in records if r.get("price_val")]
+    if len(prices) < 3:
+        return ""
+    lo, hi = min(prices), max(prices)
+    if hi <= lo:
+        return ""
+    # موضع السعر الحالي داخل النطاق التاريخي (0 = أدنى، 1 = أعلى)
+    pos = (float(current) - lo) / (hi - lo)
+    if pos <= 0.15 or abs(float(current) - lo) < 0.5:
+        return "💡 قريب من أدنى سعر سُجّل — وقت ممتاز للشراء"
+    if pos >= 0.85:
+        return "💡 أعلى من المعتاد — فعّل التنبيه وانتظر انخفاض"
+    if pos <= 0.35:
+        return "💡 سعر جيد مقارنة بآخر الأسابيع"
+    return ""
+
 
 def format_history_message(asin: str, domain: str) -> str:
     """

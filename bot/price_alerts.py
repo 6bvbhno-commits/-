@@ -19,8 +19,10 @@ _MIN_DROP_PCT         = 0.5         # نسبة الانخفاض الدنيا ل�
 # ── إعداد الجدول ─────────────────────────────────────────────────────────────
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -45,7 +47,7 @@ def _init_alerts_table() -> None:
             "CREATE INDEX IF NOT EXISTS idx_alerts_active ON price_alerts(active)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_alerts_user ON price_alerts(user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_alerts_asin ON price_alerts(asin, domain, active)"
         )
 
 
