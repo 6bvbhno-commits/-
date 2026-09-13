@@ -82,7 +82,7 @@ from vision_utils import (
     identify_product_from_image,
 )
 
-BOT_VERSION = "6.2"
+BOT_VERSION = "6.3"
 
 # نص زر تنبيه السعر — واضح للمستخدم
 ALERT_BTN_LABEL = "🔔 نبّهني عند انخفاض السعر"
@@ -638,7 +638,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
             [
                 InlineKeyboardButton("🆘 مساعدة", callback_data="q:help"),
-                InlineKeyboardButton("🔕 إيقاف التنبيهات", callback_data="q:mute"),
+                InlineKeyboardButton("🔕 إيقاف العروض", callback_data="q:mute"),
             ],
         ]
         if share_url:
@@ -662,11 +662,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 💬 *اسم منتج* ← بحث فوري\n"
             f"• 🔥 /deals ← الأكثر طلباً الآن\n"
             f"• ⚖️ /compare رابط1 رابط2 ← مقارنة سعر\n"
-            f"• ⭐ /fav ← مفضلتك\n"
+            f"• ⭐ /fav ← مفضلتك (ومنها تنبيه سعر)\n"
             f"• 📸 أرسل *صورة منتج* ← أتعرف عليه وأبحث\n"
             f"• 🔎 اكتب `@{bot_user}` في أي شات وابحث\n"
-            f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n\n"
-            "📋 *الأوامر:* /start · /myalerts · /share · /version\n\n"
+            f"• {ALERT_BTN_LABEL} ← إشعار عند نزول السعر\n"
+            f"• /mute ← إيقاف *رسائل العروض* فقط (التنبيهات تبقى)\n\n"
+            "📋 *الأوامر:* /start · /myalerts · /fav · /share · /version\n\n"
             f"🏷️ تاق العمولة: `{get_affiliate_tag()}`\n"
             "⚠️ _تحقق من السعر على أمازون قبل الشراء._"
         )
@@ -688,8 +689,9 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _users.set_opt_out(chat.id, True)
     await _reply(
         update,
-        "🔕 تم إيقاف تنبيهات العروض وأكواد الخصم.\n"
-        "تقدر ترجعها بأي وقت: /unmute",
+        "🔕 تم إيقاف رسائل العروض وأكواد الخصم فقط.\n"
+        "تنبيهات انخفاض السعر تبقى شغّالة.\n"
+        "ترجع العروض بأي وقت: /unmute",
         parse_mode=None,
     )
 
@@ -779,7 +781,9 @@ async def handle_quick_callback(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         if query.message:
             await query.message.reply_text(
-                "🔕 تم إيقاف تنبيهات العروض.\nللتفعيل مرة ثانية: /unmute",
+                "🔕 تم إيقاف رسائل العروض وأكواد الخصم.\n"
+                "تنبيهات انخفاض السعر تبقى شغّالة.\n"
+                "للتفعيل: /unmute",
             )
         return
     if data == "q:unmute":
@@ -787,12 +791,12 @@ async def handle_quick_callback(update: Update, context: ContextTypes.DEFAULT_TY
         import users_db as _users
         _users.set_opt_out(chat_id, False)
         if query.message:
-            await query.message.reply_text("🔔 تم تفعيل تنبيهات العروض من جديد.")
+            await query.message.reply_text("🔔 تم تفعيل رسائل العروض من جديد.")
         return
 
 
 async def handle_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """زر إيقاف التنبيهات من رسائل البث."""
+    """زر إيقاف رسائل العروض من رسائل البث."""
     query = update.callback_query
     if not query or not query.message:
         return
@@ -801,7 +805,7 @@ async def handle_mute_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     import users_db as _users
     if data == "bc:mute":
         _users.set_opt_out(chat_id, True)
-        await query.answer("تم إيقاف التنبيهات", show_alert=False)
+        await query.answer("تم إيقاف رسائل العروض", show_alert=False)
         try:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔔 تفعيل التنبيهات", callback_data="bc:unmute")],
@@ -934,17 +938,29 @@ async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _reply(update, "❌ فشلت المقارنة. حاول مرة ثانية.", parse_mode=None)
             return
 
-    def _row(label: str, offer: dict | None, asin: str) -> tuple[str, float | None, str]:
+    def _row(label: str, offer: dict | None, asin: str, domain: str) -> tuple[str, float | None, str]:
         if not offer:
-            return f"• {label}: غير متاح", None, build_affiliate_link(asin, AMAZON_DOMAIN)
+            return f"• {label}: غير متاح", None, build_affiliate_link(asin, domain)
         title = (offer.get("title") or asin)[:45]
         price = offer.get("price") or "—"
         pval = offer.get("price_val")
-        link = offer.get("affiliate_link") or build_affiliate_link(asin, offer.get("domain") or AMAZON_DOMAIN)
-        return f"• *{label}:* {title}\n  💰 {price}", pval, link
+        use_d = offer.get("domain") or domain
+        link = offer.get("affiliate_link") or build_affiliate_link(asin, use_d)
+        extra = ""
+        try:
+            from price_history import format_sparkline_plain, format_buy_tip_plain
+            spark = format_sparkline_plain(asin, use_d)
+            if spark:
+                extra += f"\n  {spark}"
+            tip = format_buy_tip_plain(asin, use_d, float(pval) if pval else None)
+            if tip:
+                extra += f"\n  {tip}"
+        except Exception:
+            pass
+        return f"• *{label}:* {title}\n  💰 {price}{extra}", pval, link
 
-    l1, p1, u1 = _row("أ", o1, a1)
-    l2, p2, u2 = _row("ب", o2, a2)
+    l1, p1, u1 = _row("أ", o1, a1, d1)
+    l2, p2, u2 = _row("ب", o2, a2, d2)
     verdict = ""
     if p1 and p2:
         if p1 < p2:
@@ -954,9 +970,44 @@ async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             verdict = "\n⚖️ نفس السعر تقريباً"
 
+    # خزّن عناوين للمفضلة/التنبيه من المقارنة
+    if context.user_data is None:
+        context.user_data = {}
+    for asin, offer, domain in ((a1, o1, d1), (a2, o2, d2)):
+        context.user_data[f"pdomain_{asin}"] = (offer or {}).get("domain") or domain
+        context.user_data[f"ptitle_{asin}"] = str((offer or {}).get("title") or asin)[:80]
+        try:
+            from deals_tracker import record_deal
+            if offer:
+                record_deal(
+                    asin=asin,
+                    title=str(offer.get("title") or ""),
+                    price=str(offer.get("price") or ""),
+                    price_val=offer.get("price_val"),
+                    domain=(offer.get("domain") or domain),
+                    image=str(offer.get("image") or ""),
+                )
+        except Exception:
+            pass
+
+    def _price_cents(offer: dict | None) -> int:
+        try:
+            pv = (offer or {}).get("price_val")
+            return int(float(pv) * 100) if pv else 0
+        except (TypeError, ValueError):
+            return 0
+
     msg = f"⚖️ *مقارنة سريعة*\n\n{l1}\n\n{l2}{verdict}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛒 اشتري أ", url=u1), InlineKeyboardButton("🛒 اشتري ب", url=u2)],
+        [
+            InlineKeyboardButton("🔔 تنبيه أ", callback_data=f"al:{a1}:{_price_cents(o1)}"),
+            InlineKeyboardButton("🔔 تنبيه ب", callback_data=f"al:{a2}:{_price_cents(o2)}"),
+        ],
+        [
+            InlineKeyboardButton("⭐ أ", callback_data=f"fav:{a1}"),
+            InlineKeyboardButton("⭐ ب", callback_data=f"fav:{a2}"),
+        ],
     ])
     await _reply(update, msg, reply_markup=kb)
 
@@ -1018,8 +1069,21 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             lines.append(f"   💰 {price}")
         lines.append("")
         link = _bal(it["asin"], it.get("domain") or AMAZON_DOMAIN)
+        # خزّن بيانات للتنبيه السريع
+        if context.user_data is None:
+            context.user_data = {}
+        context.user_data[f"pdomain_{it['asin']}"] = it.get("domain") or AMAZON_DOMAIN
+        context.user_data[f"ptitle_{it['asin']}"] = title
+        price_cents = 0
+        try:
+            raw = (price or "").replace(",", "").split()
+            if raw:
+                price_cents = int(float(raw[0]) * 100)
+        except (TypeError, ValueError):
+            price_cents = 0
         rows.append([
             InlineKeyboardButton(f"🛒 {i}", url=link),
+            InlineKeyboardButton("🔔", callback_data=f"al:{it['asin']}:{price_cents}"),
             InlineKeyboardButton("🗑️", callback_data=f"favdel:{it['asin']}"),
         ])
     await _reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
@@ -1370,9 +1434,23 @@ async def _handle_alert_callback_inner(update: Update, context: ContextTypes.DEF
         product_name = context.user_data.get(f"ptitle_{req_asin}", "")
         result = _pa.add_alert(uid, cid, req_asin, req_domain, product_name, current_price)
 
-        # أزل الزر من الرسالة الأصلية
+        # أبقِ أزرار الشراء/المفضلة — فقط حدّث زر التنبيه
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            old_kb = query.message.reply_markup
+            if old_kb and old_kb.inline_keyboard:
+                new_rows = []
+                for row in old_kb.inline_keyboard:
+                    new_row = []
+                    for btn in row:
+                        cb = getattr(btn, "callback_data", None) or ""
+                        if isinstance(cb, str) and cb.startswith(f"al:{req_asin}:"):
+                            new_row.append(InlineKeyboardButton("✅ تنبيه مفعّل", callback_data=cb))
+                        else:
+                            new_row.append(btn)
+                    new_rows.append(new_row)
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(new_rows)
+                )
         except Exception:
             pass
 
@@ -1531,7 +1609,11 @@ def _build_myalerts_content(alerts: list[dict]) -> tuple[str, list]:
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعرض حالة مفاتيح API المتاحة — للتشخيص فقط (لا يكشف القيم)."""
+    """يعرض حالة مفاتيح API — للمدير فقط."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not _is_admin(uid):
+        await _reply(update, "⛔ هذا الأمر للمدير فقط.", parse_mode=None)
+        return
     import os
     from config import (
         get_deepseek_api_key,
@@ -1739,8 +1821,16 @@ async def _price_alert_check_loop(app) -> None:
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """صورة منتج → تعرّف بالرؤية → بحث أمازون."""
-    if not update.message or not update.message.photo:
+    """صورة منتج (photo أو document) → تعرّف بالرؤية → بحث أمازون."""
+    if not update.message:
+        return
+
+    photo_file_id = None
+    if update.message.photo:
+        photo_file_id = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        photo_file_id = update.message.document.file_id
+    if not photo_file_id:
         return
 
     _track_user(update)
@@ -1752,10 +1842,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     await _reply(update, "📸 جاري التعرف على المنتج من الصورة…", parse_mode=None)
 
-    photo = update.message.photo[-1]
     loop = asyncio.get_running_loop()
     try:
-        tg_file = await context.bot.get_file(photo.file_id)
+        tg_file = await context.bot.get_file(photo_file_id)
         bio = BytesIO()
         await tg_file.download_to_memory(bio)
         image_bytes = bio.getvalue()

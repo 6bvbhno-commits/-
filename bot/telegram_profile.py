@@ -30,7 +30,7 @@ _COMMANDS = [
     BotCommand("fav", "مفضلتك المحفوظة"),
     BotCommand("help", "طريقة الاستخدام"),
     BotCommand("myalerts", "تنبيهات انخفاض السعر"),
-    BotCommand("mute", "إيقاف رسائل العروض"),
+    BotCommand("mute", "إيقاف رسائل العروض (التنبيهات تبقى)"),
     BotCommand("unmute", "تفعيل رسائل العروض"),
     BotCommand("share", "شارك البوت مع أصحابك"),
     BotCommand("version", "إصدار البوت"),

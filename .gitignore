@@ -48,3 +48,7 @@ Thumbs.db
 .cache/
 .local/
 __pycache__/
+*.pyc
+*.db
+bot/price_data.db
+bot/users.db

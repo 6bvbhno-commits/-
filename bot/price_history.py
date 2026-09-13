@@ -204,6 +204,30 @@ def format_sparkline_plain(asin: str, domain: str) -> str:
     return " · ".join(parts)
 
 
+def format_buy_tip_plain(asin: str, domain: str, current: float | None) -> str:
+    """نصيحة شراء سريعة من التاريخ — بدون LLM (لا تبطّئ البطاقة)."""
+    if not current or current <= 0:
+        return ""
+    records = get_history(asin, domain, days=60)
+    if len(records) < 3:
+        return ""
+    prices = [float(r["price_val"]) for r in records if r.get("price_val")]
+    if len(prices) < 3:
+        return ""
+    lo, hi = min(prices), max(prices)
+    if hi <= lo:
+        return ""
+    # موضع السعر الحالي داخل النطاق التاريخي (0 = أدنى، 1 = أعلى)
+    pos = (float(current) - lo) / (hi - lo)
+    if pos <= 0.15 or abs(float(current) - lo) < 0.5:
+        return "💡 قريب من أدنى سعر سُجّل — وقت ممتاز للشراء"
+    if pos >= 0.85:
+        return "💡 أعلى من المعتاد — فعّل التنبيه وانتظر انخفاض"
+    if pos <= 0.35:
+        return "💡 سعر جيد مقارنة بآخر الأسابيع"
+    return ""
+
+
 def format_history_message(asin: str, domain: str) -> str:
     """
     يُعيد قسم تاريخ السعر جاهزاً للإلحاق برسالة تيليجرام.
